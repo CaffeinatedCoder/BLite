@@ -94,6 +94,20 @@ public class NearAntimeridianPoleTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Radii equal to the distance to the pole where lat ± r in degrees rounds just short of the
+    /// pole while sin(r)/cos(lat) rounds to 1 + ε, so asin returned NaN before the ratio check.
+    /// </summary>
+    [Theory]
+    [InlineData(-2.1702, 9766.228168206266)]
+    [InlineData(2.1702, 9766.228168206266)]
+    public void NearQueryBoxes_AtThePoleBoundary_KnownRoundingCase_HasNoNaN(double lat, double radiusKm)
+    {
+        foreach (var box in SpatialMath.NearQueryBoxes(lat, 10.0, radiusKm))
+            Assert.False(double.IsNaN(box.MinLat) || double.IsNaN(box.MaxLat) || double.IsNaN(box.MinLon) || double.IsNaN(box.MaxLon),
+                $"NaN box {box}");
+    }
+
     [Fact]
     public async Task Near_WithAnUnnormalisedCentreLongitude_MatchesTheNormalisedOne()
     {
