@@ -158,7 +158,8 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
     /// Handles <c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>, <c>SingleOrDefault</c> and
     /// <c>Any</c>, with or without a predicate. A predicate on the entities themselves is folded
     /// into the WHERE clause (<c>First(p)</c> is <c>Where(p).First()</c>), so the index planner
-    /// sees it. Overloads taking a default value are left to the fallback pipeline.
+    /// sees it, but only where <see cref="CanFoldPredicate"/> allows it. Overloads taking a
+    /// default value are left to the fallback pipeline.
     /// </summary>
     private void VisitElementTerminal(MethodCallExpression node)
     {
@@ -170,7 +171,7 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
         }
         else if (node.Arguments.Count == 2
                  && node.Arguments[1] is UnaryExpression { NodeType: ExpressionType.Quote, Operand: LambdaExpression predicate }
-                 && _model.SelectClause == null && !_model.Take.HasValue && !_model.Skip.HasValue)
+                 && CanFoldPredicate(node.Arguments[0], predicate))
         {
             AddPredicate(predicate);
             _model.ElementTerminal = node.Method.Name;
@@ -194,16 +195,56 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
             // Count() with no predicate — fast O(log n) + k BTree scan.
             _model.IsCountOnly = true;
         }
-        else if (_model.SelectClause == null && !_model.Take.HasValue && !_model.Skip.HasValue)
+        else if (node.Arguments[1] is UnaryExpression { NodeType: ExpressionType.Quote, Operand: LambdaExpression predicate }
+                 && CanFoldPredicate(node.Arguments[0], predicate))
         {
             // Count(predicate) on the entities themselves is Where(predicate).Count().
-            AddPredicate((LambdaExpression)((UnaryExpression)node.Arguments[1]).Operand);
+            AddPredicate(predicate);
             _model.IsCountOnly = true;
         }
         else
         {
-            // Count(predicate) after a projection or Take/Skip — treat as a complex operator.
+            // Count(predicate) after any other operator — treat as a complex operator.
             _model.HasComplexOperators = true;
         }
+    }
+
+    /// <summary>
+    /// True when a terminal's <paramref name="predicate"/> may be folded into the WHERE clause,
+    /// i.e. when <c>source.Terminal(p)</c> equals <c>source.Where(p).Terminal()</c> evaluated with
+    /// the filter applied first. That holds only when every operator between the root and the
+    /// terminal is a plain <c>Where</c> or an ordering (<c>OrderBy*</c> / <c>ThenBy*</c>): those keep
+    /// the element type and commute with a filter. Anything else, such as <c>GroupBy</c>,
+    /// <c>OfType</c>, <c>Select</c> or the order-dependent <c>Take</c>, <c>Skip</c>,
+    /// <c>SkipWhile</c> and <c>TakeWhile</c>, either changes what the predicate is applied to or
+    /// gives a different result when the predicate runs first.
+    /// </summary>
+    private static bool CanFoldPredicate(Expression source, LambdaExpression predicate)
+    {
+        var current = source;
+        while (current is MethodCallExpression call)
+        {
+            if (call.Method.DeclaringType != typeof(Queryable))
+                return false;
+
+            switch (call.Method.Name)
+            {
+                case "Where" when call.Arguments[1] is UnaryExpression { Operand: LambdaExpression { Parameters.Count: 1 } }:
+                case "OrderBy":
+                case "OrderByDescending":
+                case "ThenBy":
+                case "ThenByDescending":
+                    current = call.Arguments[0];
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        // Only element-type-preserving operators were skipped, so the predicate must take the
+        // root collection's own element type (the entity type).
+        return current is ConstantExpression { Value: IQueryable root }
+               && predicate.Parameters.Count == 1
+               && predicate.Parameters[0].Type == root.ElementType;
     }
 }

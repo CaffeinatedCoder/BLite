@@ -50,8 +50,9 @@ public sealed class Transaction : ITransaction
 
     /// <summary>
     /// Adds a write operation to the transaction's write set.
-    /// NOTE: Makes a defensive copy of the data to ensure memory safety.
-    /// This allocation is necessary because the caller may return the buffer to a pool.
+    /// The page is copied into the transaction's own buffer by <see cref="StorageEngine.WritePage"/>,
+    /// so <see cref="WriteOperation.NewValue"/> only has to stay valid for the duration of this call
+    /// and the caller may return a pooled buffer right afterwards.
     /// </summary>
     public void AddWrite(WriteOperation operation)
     {

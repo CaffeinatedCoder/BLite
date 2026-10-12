@@ -121,6 +121,74 @@ public class QueryAndWritePathTests : IDisposable
         Assert.Same(fallback, Q.FirstOrDefault(p => p.Age == 999, fallback));
     }
 
+    [Fact]
+    public void Terminals_AfterGroupBy_PredicateIsOverGroups()
+    {
+        // The predicate takes an IGrouping, not a PersonV2, so it must not reach FetchAsync.
+        Assert.Equal(_people.GroupBy(p => p.Age).Count(g => g.Count() > 5), Q.GroupBy(p => p.Age).Count(g => g.Count() > 5));
+        Assert.True(Q.GroupBy(p => p.Age).Any(g => g.Key == 3));
+        Assert.Equal(3, Q.GroupBy(p => p.Age).First(g => g.Key == 3).Key);
+    }
+
+    [Fact]
+    public void Terminals_AfterSkipWhile_PredicateIsNotPushedBelowIt()
+    {
+        // SkipWhile/TakeWhile depend on the order the collection yields its documents in.
+        var scan = Q.ToList();
+        Assert.Equal(scan.SkipWhile(p => p.Age < 10).FirstOrDefault(p => p.Age == 5)?.Name,
+                     Q.SkipWhile(p => p.Age < 10).FirstOrDefault(p => p.Age == 5)?.Name);
+        Assert.Equal(scan.SkipWhile(p => p.Age < 10).Count(p => p.Age == 5),
+                     Q.SkipWhile(p => p.Age < 10).Count(p => p.Age == 5));
+    }
+
+    [Fact]
+    public void Terminals_AfterTakeWhile_PredicateIsNotPushedBelowIt()
+    {
+        var scan = Q.ToList();
+        Assert.Equal(scan.TakeWhile(p => p.Age < 10).Count(p => p.Age == 5),
+                     Q.TakeWhile(p => p.Age < 10).Count(p => p.Age == 5));
+        Assert.Equal(scan.TakeWhile(p => p.Age < 10).Any(p => p.Age == 5),
+                     Q.TakeWhile(p => p.Age < 10).Any(p => p.Age == 5));
+    }
+
+    [Fact]
+    public void Terminals_AfterOfTypeOrCast_PredicateIsOverTheNewElementType()
+    {
+        Assert.Equal(_people.Count, Q.OfType<object>().Count(o => o != null));
+        Assert.True(Q.Cast<object>().Any(o => o is PersonV2));
+        Assert.Equal(_people.Count(p => p.Age == 3), Q.OfType<PersonV2>().Count(p => p.Age == 3));
+    }
+
+    [Fact]
+    public void Model_PredicateIsFoldedOnlyAfterWhereAndOrdering()
+    {
+        Expression<Func<PersonV2, bool>> pred = p => p.Age == 3;
+
+        var afterOrdering = Model(Expression.Call(typeof(Queryable), "First", [typeof(PersonV2)],
+            Q.Where(p => p.Age > 1).OrderBy(p => p.Name).ThenByDescending(p => p.Age).Expression, Expression.Quote(pred)));
+        Assert.NotNull(afterOrdering.WhereClause);
+        Assert.Equal("First", afterOrdering.ElementTerminal);
+
+        var afterSkipWhile = Model(Expression.Call(typeof(Queryable), "Count", [typeof(PersonV2)],
+            Q.SkipWhile(p => p.Age < 10).Expression, Expression.Quote(pred)));
+        Assert.True(afterSkipWhile.HasComplexOperators);
+        Assert.Null(afterSkipWhile.WhereClause);
+
+        var afterIndexedWhere = Model(Expression.Call(typeof(Queryable), "Any", [typeof(PersonV2)],
+            Q.Where((p, i) => i > 10).Expression, Expression.Quote(pred)));
+        Assert.True(afterIndexedWhere.HasComplexOperators);
+    }
+
+    [Fact]
+    public async Task Count_WithVectorSearchPredicate_CountsTheNearestK()
+    {
+        for (int i = 0; i < 20; i++)
+            await _db.VectorItems.InsertAsync(new VectorEntity { Title = $"v{i}", Embedding = [i, 0f, 0f] });
+
+        float[] query = [0f, 0f, 0f];
+        Assert.Equal(3, _db.VectorItems.AsQueryable().Count(x => x.Embedding.VectorSearch(query, 3)));
+    }
+
     // ── Write path ──────────────────────────────────────────────────────────
 
     [Fact]
