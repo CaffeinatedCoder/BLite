@@ -58,10 +58,9 @@ public sealed class Transaction : ITransaction
         if (_state != TransactionState.Active)
             throw new InvalidOperationException($"Cannot add writes to transaction in state {_state}");
 
-        // Defensive copy: necessary to prevent use-after-return if caller uses pooled buffers
-        byte[] ownedCopy = operation.NewValue.ToArray();
-        // StorageEngine gestisce tutte le scritture transazionali
-        _storage.WritePage(operation.PageId, _transactionId, ownedCopy);
+        // StorageEngine.WritePage copies the page into the transaction's own buffer, so a caller
+        // may return a pooled buffer as soon as this call returns.
+        _storage.WritePage(operation.PageId, _transactionId, operation.NewValue.Span);
     }
 
     /// <summary>

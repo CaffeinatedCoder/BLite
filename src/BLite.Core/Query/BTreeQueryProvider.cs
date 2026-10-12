@@ -214,6 +214,33 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         visitor.Visit(expression);
         var model = visitor.GetModel();
 
+        // ── Element terminals: First / FirstOrDefault / Single / SingleOrDefault / Any ──
+        // With only a WHERE in front, at most one (Single*: two) matching document decides the
+        // result, so fetch just that many through the index-aware FetchAsync. Anything else in
+        // front (OrderBy, Select, Take, ...) goes through the general fallback as before.
+        if (model.ElementTerminal is { } terminal)
+        {
+            if (!model.HasComplexOperators && model.SelectClause == null && model.OrderByClause == null
+                && !model.Take.HasValue && !model.Skip.HasValue && model.AggregateOp == null && !model.IsCountOnly)
+            {
+                bool single = terminal is "Single" or "SingleOrDefault";
+                var found = new List<T>(single ? 2 : 1);
+                await foreach (var item in _collection.FetchAsync(model.WhereClause, single ? 2 : 1, cancellationToken))
+                    found.Add(item);
+
+                return terminal switch
+                {
+                    "First"           => (TResult)(object)found.First()!,
+                    "FirstOrDefault"  => (TResult)(object?)found.FirstOrDefault()!,
+                    "Single"          => (TResult)(object)found.Single()!,
+                    "SingleOrDefault" => (TResult)(object?)found.SingleOrDefault()!,
+                    _                 => (TResult)(object)(found.Count > 0),
+                };
+            }
+
+            model.HasComplexOperators = true;
+        }
+
         // ── Fast path: Count() / LongCount() terminal with no WHERE ─────────────
         // Uses the primary BTree key scan (O(n) key reads, zero document reads).
         // Disabled when Take/Skip are present — those shaping operators reduce the

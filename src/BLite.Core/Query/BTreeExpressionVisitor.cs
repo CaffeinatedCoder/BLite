@@ -44,6 +44,13 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
                 case "LongCount":
                     VisitCount(node);
                     return node;
+                case "First":
+                case "FirstOrDefault":
+                case "Single":
+                case "SingleOrDefault":
+                case "Any":
+                    VisitElementTerminal(node);
+                    return node;
                 default:
                     // GroupBy, Join, etc. — operators the direct pipeline cannot model.
                     _model.HasComplexOperators = true;
@@ -60,8 +67,11 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
         Visit(node.Arguments[0]);
 
         var predicate = (UnaryExpression)node.Arguments[1];
-        var lambda = (LambdaExpression)predicate.Operand;
+        AddPredicate((LambdaExpression)predicate.Operand);
+    }
 
+    private void AddPredicate(LambdaExpression lambda)
+    {
         if (_model.WhereClause == null)
         {
             _model.WhereClause = lambda;
@@ -145,6 +155,33 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
     }
 
     /// <summary>
+    /// Handles <c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>, <c>SingleOrDefault</c> and
+    /// <c>Any</c>, with or without a predicate. A predicate on the entities themselves is folded
+    /// into the WHERE clause (<c>First(p)</c> is <c>Where(p).First()</c>), so the index planner
+    /// sees it. Overloads taking a default value are left to the fallback pipeline.
+    /// </summary>
+    private void VisitElementTerminal(MethodCallExpression node)
+    {
+        Visit(node.Arguments[0]); // recurse into source
+
+        if (node.Arguments.Count == 1)
+        {
+            _model.ElementTerminal = node.Method.Name;
+        }
+        else if (node.Arguments.Count == 2
+                 && node.Arguments[1] is UnaryExpression { NodeType: ExpressionType.Quote, Operand: LambdaExpression predicate }
+                 && _model.SelectClause == null && !_model.Take.HasValue && !_model.Skip.HasValue)
+        {
+            AddPredicate(predicate);
+            _model.ElementTerminal = node.Method.Name;
+        }
+        else
+        {
+            _model.HasComplexOperators = true;
+        }
+    }
+
+    /// <summary>
     /// Handles <c>Count()</c> / <c>LongCount()</c> as a push-down scalar.
     /// When there is no predicate, the provider can use the primary BTree key count instead
     /// of materialising all documents.
@@ -157,9 +194,15 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
             // Count() with no predicate — fast O(log n) + k BTree scan.
             _model.IsCountOnly = true;
         }
+        else if (_model.SelectClause == null && !_model.Take.HasValue && !_model.Skip.HasValue)
+        {
+            // Count(predicate) on the entities themselves is Where(predicate).Count().
+            AddPredicate((LambdaExpression)((UnaryExpression)node.Arguments[1]).Operand);
+            _model.IsCountOnly = true;
+        }
         else
         {
-            // Count(predicate) — treat as a complex operator.
+            // Count(predicate) after a projection or Take/Skip — treat as a complex operator.
             _model.HasComplexOperators = true;
         }
     }

@@ -34,4 +34,11 @@ internal class QueryModel
     /// Enables an O(n) primary-BTree key scan instead of full document deserialisation.
     /// </summary>
     public bool IsCountOnly { get; set; }
+
+    /// <summary>
+    /// Element terminal (<c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>,
+    /// <c>SingleOrDefault</c> or <c>Any</c>) ending the query, or null. A predicate passed to it
+    /// has already been folded into <see cref="WhereClause"/>.
+    /// </summary>
+    public string? ElementTerminal { get; set; }
 }
