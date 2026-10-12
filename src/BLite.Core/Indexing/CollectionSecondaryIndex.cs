@@ -409,41 +409,65 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     }
 
     /// <summary>
-    /// Throws if this is a unique BTree index and another document already holds
-    /// <paramref name="document"/>'s key. The document's own entry (same id) is ignored,
-    /// so the check also applies to the new key of an update.
-    /// Entries are stored as <c>[user key][document id]</c>, so the BTree's own unique
-    /// check never sees two equal keys; the collection calls this before writing anything.
+    /// True for a unique BTree index, the only kind <see cref="EnsureUnique"/> checks.
     /// </summary>
-    internal void EnsureUnique(T document, ITransaction? transaction)
+    internal bool IsUniqueBTree => _definition.IsUnique && _btreeIndex != null;
+
+    /// <summary>
+    /// Throws if this is a unique BTree index and another document already holds
+    /// <paramref name="document"/>'s key. The document's own entry (same id) is ignored.
+    /// On update, <paramref name="oldDocument"/> is the stored version: if its key equals the
+    /// new one, <see cref="Update"/> keeps the existing entry and nothing is checked, so a
+    /// document that already shares its value with another can still be updated.
+    /// Entries are stored as <c>[user key][document id]</c>, so the BTree's own unique
+    /// check never sees two equal keys; the collection calls this before writing any page.
+    /// </summary>
+    internal void EnsureUnique(T document, T? oldDocument, ITransaction? transaction)
     {
-        if (!_definition.IsUnique || _btreeIndex == null)
+        if (!IsUniqueBTree)
             return;
 
         if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
             return; // null keys are not indexed, so they never conflict
 
         var userKey = ConvertToIndexKey(keyValue);
-        var ownIdKey = _mapper.ToIndexKey(_mapper.GetId(document));
-        var minComposite = CreateCompositeKeyBoundary(userKey, useMinObjectId: true);
-        var maxComposite = CreateCompositeKeyBoundary(userKey, useMinObjectId: false);
 
-        foreach (var entry in _btreeIndex.Range(minComposite, maxComposite, IndexDirection.Forward, transaction?.TransactionId))
+        if (oldDocument != null
+            && _definition.TryGetKey(oldDocument, out var oldKeyValue) && oldKeyValue != null
+            && (Equals(oldKeyValue, keyValue) || ConvertToIndexKey(oldKeyValue).Data.SequenceEqual(userKey.Data)))
+            return; // key unchanged
+
+        // Every id key starts with its type's prefix byte, so the entries of this value lie in
+        // [user key][prefix] .. [user key][prefix + 1]. Bounding the scan there skips the entries
+        // of longer values starting with this one (e.g. "10", "11", ... when checking "1").
+        var ownIdKey = _mapper.ToIndexKey(_mapper.GetId(document));
+        var idPrefix = ownIdKey.Data[0];
+        var minComposite = CreateIdPrefixBoundary(userKey, idPrefix);
+        var maxComposite = CreateIdPrefixBoundary(userKey, (byte)(idPrefix + 1));
+
+        foreach (var entry in _btreeIndex!.Range(minComposite, maxComposite, IndexDirection.Forward, transaction?.TransactionId))
         {
             var idPart = entry.Key.Data.Slice(userKey.Data.Length);
             if (idPart.SequenceEqual(ownIdKey.Data))
                 continue; // this document's own entry
 
-            // The range also covers longer user keys that start with this one (e.g. "ab" and "abc").
-            // Every id key begins with the same prefix byte, and fixed-size ids have a known length.
-            if (idPart.Length == 0 || (ownIdKey.Data.Length > 0 && idPart[0] != ownIdKey.Data[0]))
-                continue;
+            // A longer value whose next byte is the prefix byte itself still falls in the range
+            // (e.g. "ab\u0002c" when checking "ab"); for fixed-size ids its id part has the wrong length.
             if (s_fixedSizeId && idPart.Length != ownIdKey.Data.Length)
                 continue;
 
             throw new InvalidOperationException(
                 $"Duplicate key violation for unique index '{_definition.Name}'");
         }
+    }
+
+    // [user key][one byte]: a range bound between the entries of user key and those of longer values.
+    private static IndexKey CreateIdPrefixBoundary(IndexKey userKey, byte idPrefixBound)
+    {
+        var bytes = new byte[userKey.Data.Length + 1];
+        userKey.Data.CopyTo(bytes);
+        bytes[^1] = idPrefixBound;
+        return IndexKey.FromOwnedArray(bytes);
     }
 
     #region Composite Key Support (SQLite-style for Duplicate Keys)

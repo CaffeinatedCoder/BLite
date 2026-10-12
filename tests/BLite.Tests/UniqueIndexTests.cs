@@ -63,6 +63,20 @@ public class UniqueIndexTests : IDisposable
     }
 
     [Fact]
+    public async Task Dynamic_Unique_Index_Rejects_A_Second_Explicit_Null()
+    {
+        // Documented difference: DynamicCollection indexes an explicit BSON null, typed collections
+        // do not index null keys (see Typed_Unique_Index_Ignores_Null_Values).
+        using var engine = new BLiteEngine(_dynamicDbPath);
+        var col = engine.GetOrCreateCollection("people");
+        await col.CreateIndexAsync("name", unique: true);
+        await col.InsertAsync(col.CreateDocument(["name"], b => b.AddNull("name")));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => col.InsertAsync(col.CreateDocument(["name"], b => b.AddNull("name"))).AsTask());
+    }
+
+    [Fact]
     public async Task Typed_Unique_Index_Rejects_Update_Onto_Existing_Value()
     {
         await _db.PeopleV2.CreateIndexAsync(p => p.Name, "idx_name", unique: true);
@@ -99,6 +113,54 @@ public class UniqueIndexTests : IDisposable
         await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "alice", Age = 2 });
 
         Assert.Equal(2, await _db.PeopleV2.CountAsync());
+    }
+
+    [Fact]
+    public async Task Typed_Unique_Index_Allows_Updates_Of_Documents_That_Already_Share_A_Value()
+    {
+        // Duplicates written before the unique index existed: the backfill does not reject them.
+        var firstId = await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "dup", Age = 1 });
+        var secondId = await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "dup", Age = 2 });
+        await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "carol", Age = 3 });
+        await _db.PeopleV2.CreateIndexAsync(p => p.Name, "idx_name", unique: true);
+
+        // No-op update and upsert.
+        var first = (await _db.PeopleV2.FindByIdAsync(firstId))!;
+        Assert.True(await _db.PeopleV2.UpdateAsync(first));
+        await _db.PeopleV2.UpsertAsync(first);
+
+        // Update of another field.
+        var second = (await _db.PeopleV2.FindByIdAsync(secondId))!;
+        second.Age = 42;
+        Assert.True(await _db.PeopleV2.UpdateAsync(second));
+        Assert.Equal(42, (await _db.PeopleV2.FindByIdAsync(secondId))!.Age);
+
+        // Changing the key onto a value another document holds is still rejected.
+        second.Name = "carol";
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _db.PeopleV2.UpdateAsync(second).AsTask());
+        Assert.Equal("dup", (await _db.PeopleV2.FindByIdAsync(secondId))!.Name);
+
+        Assert.Equal(2, (await _db.PeopleV2.AsQueryable().Where(p => p.Name == "dup").ToListAsync()).Count);
+    }
+
+    [Fact]
+    public async Task Typed_Unique_Index_Separates_Values_Followed_By_Low_Control_Characters()
+    {
+        // The check scans [value][id prefix byte] .. [value][id prefix byte + 1]; longer values
+        // whose next byte is just below, at or above the prefix (0x02) sit right at those bounds.
+        await _db.PeopleV2.CreateIndexAsync(p => p.Name, "idx_name", unique: true);
+        string[] names = ["ab\u0001", "ab\u0002", "ab\u0002x", "ab\u0003", "abc", "a", "ab"];
+        foreach (var name in names)
+            await _db.PeopleV2.InsertAsync(new PersonV2 { Name = name, Age = 1 });
+
+        foreach (var name in names)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => _db.PeopleV2.InsertAsync(new PersonV2 { Name = name, Age = 2 }).AsTask());
+        }
+
+        Assert.Equal(names.Length, await _db.PeopleV2.CountAsync());
     }
 
     [Fact]
