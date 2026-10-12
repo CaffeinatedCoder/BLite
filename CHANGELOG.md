@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. See [versionize](https://github.com/versionize/versionize) for commit guidelines.
 
+<a name="5.2.3"></a>
+## [5.2.3](https://www.github.com/EntglDb/BLite/releases/tag/v5.2.3) (2026-10-12)
+
+<a name="5.2.2"></a>
+## [5.2.2](https://www.github.com/EntglDb/BLite/releases/tag/v5.2.2) (2026-10-12)
+
+### Bug Fixes
+
+* **storage:** survive a corrupt free-list head instead of faulting the process ([#178](https://www.github.com/EntglDb/BLite/issues/178)) ([31cacf3](https://www.github.com/EntglDb/BLite/commit/31cacf33faa86c7acb696072beb7db34ade41b59))
+
 <a name="5.2.1"></a>
 ## [5.2.1](https://www.github.com/EntglDb/BLite/releases/tag/v5.2.1) (2026-10-04)
 
