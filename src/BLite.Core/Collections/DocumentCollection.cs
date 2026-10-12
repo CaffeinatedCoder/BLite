@@ -2194,6 +2194,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             : default;
         // ────────────────────────────────────────────────────────────────────
 
+        // Unique secondary indexes are checked before any page is written.
+        _indexManager.EnsureUniqueInAll(entity, transaction);
+
         DocumentLocation location;
         if (_isTimeSeries)
         {
@@ -2781,6 +2784,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         // Retrieve old version for index updates
         var oldEntity = await FindByLocation(oldLocation, transaction);
         if (oldEntity == null) return false;
+
+        // Unique secondary indexes are checked before any page is written.
+        _indexManager.EnsureUniqueInAll(entity, transaction);
 
         // Read old page
         var pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);

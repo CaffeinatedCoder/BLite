@@ -26,6 +26,11 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     private static readonly IndexKey s_maxBoundaryKey;
     // 16 bytes of 0xFF covers any GUID or ObjectId suffix in composite keys.
     private static readonly IndexKey s_maxIdBoundaryKey;
+    // Id types whose index key always has the same length (used by EnsureUnique).
+    private static readonly bool s_fixedSizeId =
+        typeof(TId) == typeof(ObjectId) || typeof(TId) == typeof(Guid) ||
+        typeof(TId) == typeof(int) || typeof(TId) == typeof(long) ||
+        typeof(TId) == typeof(double) || typeof(TId) == typeof(decimal);
 
     static CollectionSecondaryIndex()
     {
@@ -401,6 +406,44 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             EstimatedDocumentCount = count,
             EstimatedSizeBytes = estimatedSize
         };
+    }
+
+    /// <summary>
+    /// Throws if this is a unique BTree index and another document already holds
+    /// <paramref name="document"/>'s key. The document's own entry (same id) is ignored,
+    /// so the check also applies to the new key of an update.
+    /// Entries are stored as <c>[user key][document id]</c>, so the BTree's own unique
+    /// check never sees two equal keys; the collection calls this before writing anything.
+    /// </summary>
+    internal void EnsureUnique(T document, ITransaction? transaction)
+    {
+        if (!_definition.IsUnique || _btreeIndex == null)
+            return;
+
+        if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
+            return; // null keys are not indexed, so they never conflict
+
+        var userKey = ConvertToIndexKey(keyValue);
+        var ownIdKey = _mapper.ToIndexKey(_mapper.GetId(document));
+        var minComposite = CreateCompositeKeyBoundary(userKey, useMinObjectId: true);
+        var maxComposite = CreateCompositeKeyBoundary(userKey, useMinObjectId: false);
+
+        foreach (var entry in _btreeIndex.Range(minComposite, maxComposite, IndexDirection.Forward, transaction?.TransactionId))
+        {
+            var idPart = entry.Key.Data.Slice(userKey.Data.Length);
+            if (idPart.SequenceEqual(ownIdKey.Data))
+                continue; // this document's own entry
+
+            // The range also covers longer user keys that start with this one (e.g. "ab" and "abc").
+            // Every id key begins with the same prefix byte, and fixed-size ids have a known length.
+            if (idPart.Length == 0 || (ownIdKey.Data.Length > 0 && idPart[0] != ownIdKey.Data[0]))
+                continue;
+            if (s_fixedSizeId && idPart.Length != ownIdKey.Data.Length)
+                continue;
+
+            throw new InvalidOperationException(
+                $"Duplicate key violation for unique index '{_definition.Name}'");
+        }
     }
 
     #region Composite Key Support (SQLite-style for Duplicate Keys)

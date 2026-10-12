@@ -454,6 +454,26 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     }
 
     /// <summary>
+    /// Throws if <paramref name="document"/> would violate any unique index.
+    /// Call before writing the document so a rejected write leaves nothing behind.
+    /// </summary>
+    /// <param name="document">Document about to be inserted or written by an update</param>
+    /// <param name="transaction">Transaction context</param>
+    public void EnsureUniqueInAll(T document, ITransaction transaction)
+    {
+        if (document == null)
+            throw new ArgumentNullException(nameof(document));
+
+        lock (_lock)
+        {
+            foreach (var index in _indexes.Values)
+            {
+                index.EnsureUnique(document, transaction);
+            }
+        }
+    }
+
+    /// <summary>
     /// Updates a document in all indexes
     /// </summary>
     /// <param name="oldDocument">Old version of document</param>
