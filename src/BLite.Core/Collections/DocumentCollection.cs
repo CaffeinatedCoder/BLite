@@ -3522,8 +3522,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 if (indexOpt.IsVectorSearch)
                 {
+                    // The index satisfied the VectorSearch term; the post-filter checks the rest.
+                    var residual = indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact
+                        ? null
+                        : ((System.Linq.Expressions.Expression<Func<T, bool>>)Query.IndexOptimizer.WithoutCall(whereClause, indexOpt.VectorSearchCall!)).Compile();
                     await foreach (var item in VectorSearchAsync(indexOpt.IndexName, indexOpt.VectorQuery!, indexOpt.K, ct: ct))
-                        if (indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact || GetCompiled()(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
+                        if (residual == null || residual(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
                 }
                 else if (indexOpt.IsSpatialSearch)
                 {

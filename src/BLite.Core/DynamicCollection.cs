@@ -957,8 +957,7 @@ public sealed class DynamicCollection : IDisposable
         if (!_secondaryIndexes.TryGetValue(indexName, out var entry) || entry.Kind != DynamicIndexKind.Spatial || entry.Spatial == null)
             throw new ArgumentException($"Spatial index '{indexName}' not found on collection '{_collectionName}'");
 
-        var queryBox = SpatialMath.BoundingBox(center.Latitude, center.Longitude, radiusKm);
-        foreach (var loc in entry.Spatial.Search(queryBox, null))
+        foreach (var loc in entry.Spatial.SearchNear(center.Latitude, center.Longitude, radiusKm, null))
         {
             var doc = ReadDocumentAt(loc, 0UL);
             if (doc != null) yield return doc;

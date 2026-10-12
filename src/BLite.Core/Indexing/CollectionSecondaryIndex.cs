@@ -255,11 +255,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         if (_spatialIndex == null)
             throw new InvalidOperationException("This index is not a spatial index.");
 
-        var queryBox = SpatialMath.BoundingBox(center.Latitude, center.Longitude, radiusKm);
-        foreach (var loc in _spatialIndex.Search(queryBox, transaction))
-        {
-            yield return loc;
-        }
+        return _spatialIndex.SearchNear(center.Latitude, center.Longitude, radiusKm, transaction);
     }
 
     /// <summary>
