@@ -240,6 +240,100 @@ public class MultiProcessWalTruncationTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task TornBatchOfACrashedWriter_IsCutOff_SoTheNextCommitIsReplayed()
+    {
+        using var a = new StorageEngine(_dbPath, Config);
+        using var b = new StorageEngine(_dbPath, Config);
+        var p1 = a.AllocatePage();
+        var p2 = a.AllocatePage();
+        var p3 = a.AllocatePage();
+
+        await WriteAndCommitAsync(a, p1, 0x11);
+        using (b.BeginTransaction()) { }
+
+        // A writer dies part-way through a batch: its bytes are in the file, but it never
+        // published a new WAL end.
+        long published = WalLength;
+        AppendToWal(TornWriteRecord());
+        Assert.True(WalLength > published);
+
+        // The next commit appends at the published end, so no reader meets the torn bytes.
+        await WriteAndCommitAsync(a, p2, 0x22);
+
+        // B replays A's commit, checkpoints it and can truncate the WAL. Had the commit been
+        // appended after the torn bytes, B's replay would stop there on every attempt, and B could
+        // never truncate the WAL again.
+        using (b.BeginTransaction()) { }
+        await b.CheckpointAsync();
+        Assert.Equal(0, WalLength);
+
+        await WriteAndCommitAsync(b, p3, 0x33);
+        using (a.BeginTransaction()) { }
+        await a.CheckpointAsync();
+
+        AssertFreshEngineReads(p1, 0x11);
+        AssertFreshEngineReads(p2, 0x22);
+        AssertFreshEngineReads(p3, 0x33);
+    }
+
+    [Fact]
+    public async Task UnreadableRecordInsideTheWal_StopsTheReplay_WithoutLettingTheReaderTruncate()
+    {
+        using var a = new StorageEngine(_dbPath, Config);
+        using var b = new StorageEngine(_dbPath, Config);
+        var p1 = a.AllocatePage();
+        var p2 = a.AllocatePage();
+        var p3 = a.AllocatePage();
+
+        using (b.BeginTransaction()) { } // B's bookmark: the empty WAL
+        await WriteAndCommitAsync(a, p1, 0x11);
+        long secondRecord = WalLength;
+        await WriteAndCommitAsync(a, p2, 0x22);
+
+        // The first of A's records becomes unreadable for B.
+        CorruptWalByte(0);
+
+        // B's replay stops at it, so it must not count A's records as replayed: committing and
+        // checkpointing its own page must leave the WAL, and with it A's records, in place.
+        await WriteAndCommitAsync(b, p3, 0x33);
+        long walBeforeCheckpoint = WalLength;
+        await b.CheckpointAsync();
+        Assert.Equal(walBeforeCheckpoint, WalLength);
+        Assert.True(walBeforeCheckpoint > secondRecord);
+
+        // A still holds its pages and checkpoints them, together with B's.
+        await a.CheckpointAsync();
+        AssertFreshEngineReads(p1, 0x11);
+        AssertFreshEngineReads(p2, 0x22);
+        AssertFreshEngineReads(p3, 0x33);
+    }
+
+    /// <summary>The start of a Write record whose page data never made it to disk.</summary>
+    private static byte[] TornWriteRecord()
+    {
+        var record = new byte[1 + 16 + 100];
+        record[0] = 2; // WalRecordType.Write
+        BitConverter.GetBytes(999_999UL).CopyTo(record, 1);   // transaction id
+        BitConverter.GetBytes(12345u).CopyTo(record, 9);      // page id
+        BitConverter.GetBytes(16384).CopyTo(record, 13);      // data length; only 100 bytes follow
+        return record;
+    }
+
+    private void AppendToWal(byte[] bytes)
+    {
+        using var stream = new FileStream(Path.ChangeExtension(_dbPath, ".wal"), FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+        stream.Seek(0, SeekOrigin.End);
+        stream.Write(bytes);
+    }
+
+    private void CorruptWalByte(long offset)
+    {
+        using var stream = new FileStream(Path.ChangeExtension(_dbPath, ".wal"), FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+        stream.Position = offset;
+        stream.WriteByte(0xFF); // not a record type
+    }
+
     private void AssertFreshEngineReads(uint page, byte fill)
     {
         using var c = new StorageEngine(_dbPath, Config);

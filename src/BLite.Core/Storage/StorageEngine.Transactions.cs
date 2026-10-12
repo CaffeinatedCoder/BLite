@@ -94,15 +94,23 @@ public sealed partial class StorageEngine
         if (shmEnd > lastKnown)
         {
             List<(uint pageId, byte[] data, long walOffset)> newPages;
+            bool complete;
             try
             {
-                newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd);
+                newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd, out complete);
             }
             catch
             {
                 // Stale reads until the next catch-up retries, never a skipped record.
                 return false;
             }
+
+            // A record that could not be read ends the scan early: the records after it were not
+            // replayed. Moving the bookmark past them would let this engine skip them and truncate
+            // the WAL that still holds them (#198). Keep it, and with it the WAL, until a replay
+            // gets through.
+            if (!complete)
+                return false;
 
             // Without the SHM writer lock (BeginTransaction), the WAL can be truncated and
             // rewritten while it is read; the bytes read then belong to neither generation.
