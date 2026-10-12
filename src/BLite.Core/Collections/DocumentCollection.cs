@@ -997,7 +997,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// collection, or returns the existing index of that name. Query it with
     /// <see cref="FullTextExtensions.FullTextMatch"/> in LINQ or rank with
     /// <see cref="FullTextSearchAsync"/>. The default name is <c>idx_fts_{property}</c>.
+    /// <para>
+    /// Each document touches one index page per distinct term, so single-document writes cost
+    /// noticeably more than without the index; insert and update in batches
+    /// (<c>InsertBulkAsync</c> or one explicit transaction) where possible.
+    /// </para>
     /// </summary>
+    /// <exception cref="InvalidOperationException">An index of that name exists and is not a full-text index.</exception>
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     public async Task<ICollectionIndex<TId, T>> CreateFullTextIndexAsync(
         System.Linq.Expressions.Expression<Func<T, string?>> keySelector,
