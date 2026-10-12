@@ -1,4 +1,6 @@
+using BLite.Bson;
 using BLite.Core;
+using BLite.Core.Indexing;
 using BLite.Core.Storage;
 using BLite.Shared;
 
@@ -114,6 +116,109 @@ public class FreePageReuseTests : IDisposable
 
         // Releasing the stale free would have put the live page on the new file's free list.
         Assert.NotEqual(livePage, storage.AllocateCollectionPage("items"));
+    }
+
+    [Fact]
+    public async Task FreedPage_WrittenByAnOpenTransaction_IsNotReleasedBeforeThatCommitIsCheckpointed()
+    {
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+        var page = storage.AllocatePage();
+
+        using (var txn = storage.BeginTransaction())
+        {
+            storage.WritePage(page, txn.TransactionId, Filled(storage.PageSize, 0xAA));
+            storage.FreePage(page);
+
+            // A truncation while the transaction is open must not release the page: its image
+            // only reaches the WAL when the transaction commits.
+            await storage.CheckpointAsync();
+            Assert.NotEqual(page, storage.AllocatePage());
+
+            await txn.CommitAsync();
+        }
+        Assert.NotEqual(page, storage.AllocatePage());
+
+        // The checkpoint after the commit flushes that image and truncates; now the page is free.
+        await storage.CheckpointAsync();
+        Assert.Equal(page, storage.AllocatePage());
+
+        var fresh = Filled(storage.PageSize, 0xBB);
+        storage.WritePageImmediate(page, fresh);
+        var read = new byte[storage.PageSize];
+        storage.ReadPage(page, null, read);
+        Assert.Equal(fresh, read);
+    }
+
+    [Fact]
+    public async Task BTreeMergesInAnOpenTransaction_SurviveACheckpointBeforeTheCommit()
+    {
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+        var tree = new BTreeIndex(storage, IndexOptions.CreateUnique("_id"));
+        var keys = Enumerable.Range(0, 400).Select(_ => new IndexKey(ObjectId.NewObjectId())).OrderBy(k => k).ToArray();
+        using (var txn = storage.BeginTransaction())
+        {
+            for (int i = 0; i < keys.Length; i++)
+                tree.Insert(keys[i], new DocumentLocation((uint)(i + 1), 0), txn.TransactionId);
+            await txn.CommitAsync();
+        }
+
+        // Deleting most keys merges leaves, which frees their pages inside the transaction.
+        using (var txn = storage.BeginTransaction())
+        {
+            for (int i = 0; i < 350; i++)
+                tree.Delete(keys[i], new DocumentLocation((uint)(i + 1), 0), txn.TransactionId);
+            await storage.CheckpointAsync();
+            await txn.CommitAsync();
+        }
+
+        // A second tree allocates pages; none of them may still belong to the first one.
+        var other = new BTreeIndex(storage, IndexOptions.CreateUnique("_id"));
+        var otherKeys = Enumerable.Range(0, 400).Select(_ => new IndexKey(ObjectId.NewObjectId())).ToArray();
+        using (var txn = storage.BeginTransaction())
+        {
+            for (int i = 0; i < otherKeys.Length; i++)
+                other.Insert(otherKeys[i], new DocumentLocation((uint)(i + 1000), 0), txn.TransactionId);
+            await txn.CommitAsync();
+        }
+        await storage.CheckpointAsync();
+
+        Assert.Equal(keys.Skip(350), tree.Range(IndexKey.MinKey, IndexKey.MaxKey).Select(e => e.Key));
+        Assert.Equal(400, other.Range(IndexKey.MinKey, IndexKey.MaxKey).Count());
+    }
+
+    [Fact]
+    public async Task MultiProcess_Truncation_KeepsRecordsAnotherProcessHasNotReplayed()
+    {
+        var dir = _dbPath + "_mp";
+        Directory.CreateDirectory(dir);
+        var dbPath = Path.Combine(dir, "shared.db");
+        var walPath = Path.ChangeExtension(dbPath, ".wal");
+        var cfg = PageFileConfig.Default with { AllowMultiProcessAccess = true };
+        try
+        {
+            using var engineA = new StorageEngine(dbPath, cfg);
+            using var engineB = new StorageEngine(dbPath, cfg);
+
+            // A queues a free (every free is queued in multi-process mode) without replaying B.
+            engineA.FreePage(engineA.AllocatePage());
+
+            using (var txB = engineB.BeginTransaction())
+            {
+                var page = engineB.AllocatePage();
+                engineB.WritePage(page, txB.TransactionId, Filled(engineB.PageSize, 0xCC));
+                await txB.CommitAsync();
+            }
+            long walAfterB = new FileInfo(walPath).Length;
+            Assert.True(walAfterB > 0);
+
+            // A's WAL index is empty, but B's committed records must stay in the shared WAL.
+            await engineA.CheckpointAsync();
+            Assert.Equal(walAfterB, new FileInfo(walPath).Length);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+        }
     }
 
     private static async Task<uint> AllocateAndCommitAsync(StorageEngine storage, byte fill)
