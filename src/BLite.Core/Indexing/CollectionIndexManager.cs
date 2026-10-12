@@ -128,9 +128,18 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         }
     }
 
-    /// <summary>The name an index on <paramref name="keySelector"/> gets when none is given.</summary>
-    internal static string ResolveIndexName(LambdaExpression keySelector, string? name)
-        => name ?? GenerateIndexName(ExpressionAnalyzer.ExtractPropertyPaths(keySelector));
+    /// <summary>
+    /// The name an index on <paramref name="keySelector"/> gets when none is given. Full-text
+    /// indexes get their own prefix, so they can sit next to a B-Tree index on the same property.
+    /// </summary>
+    internal static string ResolveIndexName(LambdaExpression keySelector, string? name, IndexType type = IndexType.BTree)
+    {
+        if (name != null) return name;
+        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
+        return type == IndexType.FullText
+            ? $"idx_fts_{string.Join("_", propertyPaths)}"
+            : GenerateIndexName(propertyPaths);
+    }
 
     /// <summary>
     /// Builds an index definition from an untyped key selector, as declared in the model.

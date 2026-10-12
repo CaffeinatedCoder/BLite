@@ -47,6 +47,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     private readonly BTreeIndex? _btreeIndex;
     private readonly VectorSearchIndex? _vectorIndex;
     private readonly RTreeIndex? _spatialIndex;
+    private readonly FullTextIndex? _fullTextIndex;
     private readonly IDocumentMapper<TId, T> _mapper;
     private bool _disposed;
     private long _documentCount;
@@ -61,7 +62,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     /// </summary>
     public BTreeIndex? BTreeIndex => _btreeIndex;
 
-    public uint RootPageId => _btreeIndex?.RootPageId ?? _vectorIndex?.RootPageId ?? _spatialIndex?.RootPageId ?? 0;
+    public uint RootPageId => _btreeIndex?.RootPageId ?? _vectorIndex?.RootPageId ?? _spatialIndex?.RootPageId ?? _fullTextIndex?.RootPageId ?? 0;
 
     public CollectionSecondaryIndex(
         CollectionIndexDefinition<T> definition,
@@ -85,6 +86,13 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             _spatialIndex = new RTreeIndex(storage, indexOptions, rootPageId);
             _btreeIndex = null;
             _vectorIndex = null;
+        }
+        else if (indexOptions.Type == IndexType.FullText)
+        {
+            _fullTextIndex = new FullTextIndex(storage, indexOptions, rootPageId);
+            _btreeIndex = null;
+            _vectorIndex = null;
+            _spatialIndex = null;
         }
         else
         {
@@ -214,6 +222,13 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
                 _spatialIndex.Insert(GeoBox.FromPoint(new GeoPoint(t.Item1, t.Item2)), location, transaction);
             }
         }
+        else if (_fullTextIndex != null)
+        {
+            if (keyValue is string text)
+            {
+                _fullTextIndex.Insert(text, location, transaction);
+            }
+        }
         else if (_btreeIndex != null)
         {
             // BTree Index logic
@@ -262,6 +277,13 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             if (keyValue is ValueTuple<double, double> t)
             {
                 _spatialIndex.Delete(GeoBox.FromPoint(new GeoPoint(t.Item1, t.Item2)), location, transaction);
+            }
+        }
+        else if (_fullTextIndex != null)
+        {
+            if (keyValue is string text)
+            {
+                _fullTextIndex.Delete(text, location, transaction);
             }
         }
         else if (_btreeIndex != null)
@@ -357,6 +379,28 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
 
         var area = new GeoBox(min.Latitude, min.Longitude, max.Latitude, max.Longitude);
         return _spatialIndex.Search(area, transaction);
+    }
+
+    /// <summary>
+    /// Locations of the documents whose indexed text contains every term of <paramref name="query"/>.
+    /// </summary>
+    public IReadOnlyList<DocumentLocation> FullTextMatch(string query, ITransaction? transaction = null)
+    {
+        if (_fullTextIndex == null)
+            throw new InvalidOperationException("This index is not a full-text index.");
+
+        return _fullTextIndex.Match(query, transaction);
+    }
+
+    /// <summary>
+    /// The <paramref name="k"/> best BM25 matches for <paramref name="query"/>, best first.
+    /// </summary>
+    public IReadOnlyList<(DocumentLocation Location, double Score)> FullTextSearch(string query, int k, bool matchAllTerms = true, ITransaction? transaction = null)
+    {
+        if (_fullTextIndex == null)
+            throw new InvalidOperationException("This index is not a full-text index.");
+
+        return _fullTextIndex.Search(query, k, matchAllTerms, transaction);
     }
 
     /// <summary>
@@ -800,6 +844,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         if (_btreeIndex != null) return _btreeIndex.CollectAllPages(transactionId);
         if (_vectorIndex != null) return _vectorIndex.CollectAllPages(transactionId);
         if (_spatialIndex != null) return _spatialIndex.CollectAllPages(transactionId);
+        if (_fullTextIndex != null) return _fullTextIndex.CollectAllPages(transactionId);
         return Array.Empty<uint>();
     }
 }

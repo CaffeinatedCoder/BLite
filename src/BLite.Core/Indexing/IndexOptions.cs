@@ -18,7 +18,10 @@ public enum IndexType : byte
     Vector = 4,
 
     /// <summary>Geospatial index (R-Tree) for spatial queries</summary>
-    Spatial = 5
+    Spatial = 5,
+
+    /// <summary>Inverted index for full-text search over a string property</summary>
+    FullText = 6
 }
 
 /// <summary>
