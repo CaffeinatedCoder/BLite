@@ -2097,7 +2097,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             catch
             {
-                await transaction.RollbackAsync();
+                if (autoCommit) await transaction.RollbackAsync();
                 throw;
             }
         }
@@ -2153,7 +2153,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             catch
             {
-                await transaction.RollbackAsync();
+                if (autoCommit) await transaction.RollbackAsync();
                 throw;
             }
         }
@@ -2957,7 +2957,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             catch
             {
-                await transaction.RollbackAsync();
+                if (autoCommit) await transaction.RollbackAsync();
                 throw;
             }
         }
@@ -3023,7 +3023,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             catch
             {
-                await transaction.RollbackAsync();
+                if (autoCommit) await transaction.RollbackAsync();
                 throw;
             }
         }

@@ -723,7 +723,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -814,7 +814,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -1031,7 +1031,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -1136,7 +1136,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -1226,7 +1226,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -1321,7 +1321,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -1375,7 +1375,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
@@ -1438,7 +1438,7 @@ public sealed class DynamicCollection : IDisposable
         }
         catch
         {
-            await transaction.RollbackAsync();
+            if (autoCommit) await transaction.RollbackAsync();
             throw;
         }
         finally
