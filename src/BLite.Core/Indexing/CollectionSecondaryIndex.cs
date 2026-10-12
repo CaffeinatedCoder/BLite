@@ -638,12 +638,18 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     /// </summary>
     internal void FreeAllPages(StorageEngine storage)
     {
-        if (_btreeIndex != null)
-            foreach (var pageId in _btreeIndex.CollectAllPages())
-                storage.FreePage(pageId);
-        else if (_vectorIndex != null)
-            foreach (var pageId in _vectorIndex.CollectAllPages())
-                storage.FreePage(pageId);
-        // RTreeIndex page freeing: not yet implemented (no CollectAllPages on RTree).
+        foreach (var pageId in CollectAllPages(0))
+            storage.FreePage(pageId);
+    }
+
+    /// <summary>
+    /// The pages of this index as <paramref name="transactionId"/> sees them (0: committed state).
+    /// Empty for a spatial index: <c>RTreeIndex</c> cannot enumerate its pages yet.
+    /// </summary>
+    internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
+    {
+        if (_btreeIndex != null) return _btreeIndex.CollectAllPages(transactionId);
+        if (_vectorIndex != null) return _vectorIndex.CollectAllPages(transactionId);
+        return Array.Empty<uint>();
     }
 }

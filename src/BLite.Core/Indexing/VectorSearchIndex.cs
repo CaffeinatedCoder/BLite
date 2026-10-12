@@ -566,7 +566,13 @@ public sealed class VectorSearchIndex
     /// Returns all physical page IDs owned by this vector index.
     /// Used when dropping an index to free storage.
     /// </summary>
-    public IReadOnlyList<uint> CollectAllPages()
+    public IReadOnlyList<uint> CollectAllPages() => CollectAllPages(0);
+
+    /// <summary>
+    /// Like <see cref="CollectAllPages()"/>, but follows the page chain as
+    /// <paramref name="transactionId"/> sees it, including pages it has linked but not committed.
+    /// </summary>
+    internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
     {
         // Multi-page vector graphs store all pages starting from _rootPageId;
         // follow NextPageId chain to collect the full set.
@@ -578,7 +584,7 @@ public sealed class VectorSearchIndex
             while (current != 0)
             {
                 pages.Add(current);
-                _storage.ReadPage(current, null, buffer);
+                _storage.ReadPage(current, transactionId == 0 ? null : transactionId, buffer);
                 var header = PageHeader.ReadFrom(buffer);
                 current = header.NextPageId;
             }
