@@ -1967,30 +1967,36 @@ public sealed class BTreeIndex
     /// Returns all physical page IDs owned by this B+Tree.
     /// Used when dropping an index to free storage space.
     /// </summary>
-    public IReadOnlyList<uint> CollectAllPages()
+    public IReadOnlyList<uint> CollectAllPages() => CollectAllPages(0);
+
+    /// <summary>
+    /// Like <see cref="CollectAllPages()"/>, but walks the tree as <paramref name="transactionId"/>
+    /// sees it, including nodes that transaction has written but not committed.
+    /// </summary>
+    internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
     {
         var result = new List<uint>();
         var root = RootPageId;
         if (root != 0)
-            CollectPagesRecursive(root, result);
+            CollectPagesRecursive(root, result, transactionId);
         return result;
     }
 
-    private void CollectPagesRecursive(uint pageId, List<uint> result)
+    private void CollectPagesRecursive(uint pageId, List<uint> result, ulong transactionId)
     {
         if (pageId == 0) return;
         result.Add(pageId);
         var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
         {
-            ReadPage(pageId, 0, pageBuffer);
+            ReadPage(pageId, transactionId, pageBuffer);
             var header = BTreeNodeHeader.ReadFrom(pageBuffer.AsSpan(32));
             if (!header.IsLeaf)
             {
                 var (p0, entries) = ReadInternalEntries(pageBuffer, header.EntryCount);
-                CollectPagesRecursive(p0, result);
+                CollectPagesRecursive(p0, result, transactionId);
                 foreach (var entry in entries)
-                    CollectPagesRecursive(entry.PageId, result);
+                    CollectPagesRecursive(entry.PageId, result, transactionId);
             }
         }
         finally

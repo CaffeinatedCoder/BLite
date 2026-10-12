@@ -35,6 +35,14 @@ public sealed class VacuumOptions
     /// that accumulates over time as documents are inserted, updated, and deleted.
     /// Defaults to <c>false</c> because index rebuilds are expensive for large
     /// collections; set to <c>true</c> only when index fragmentation is a concern.
+    /// <para>
+    /// On a typed collection each index is rebuilt into a new tree that replaces the old one once
+    /// the rebuild has committed; if a document cannot be loaded or indexed, the vacuum throws and
+    /// the existing index is kept. Index handles obtained earlier (for example from
+    /// <c>GetIndexAsync</c> or <c>CreateIndexAsync</c>) refer to the replaced tree afterwards and
+    /// must be fetched again. A query already running on the old tree while it is replaced may read
+    /// pages that are being freed. Spatial indexes are not rebuilt.
+    /// </para>
     /// </summary>
     public bool RebuildIndexes { get; init; } = false;
 
