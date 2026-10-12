@@ -1658,9 +1658,8 @@ public sealed class BTreeIndex
         WriteInternalNode(parentId, p0, parentEntries, transactionId);
 
         // Free the empty Right Node
-        _storage.FreePage(rightNodeId); // Need to verify this works safely with Txn logic?
-                                         // Actually, FreePage is immediate in current impl. Might need TransactionalFreePage.
-                                         // Or just leave it allocated but unused for now.
+        _storage.FreePage(rightNodeId); // Not transactional: the page is released even if this
+                                         // transaction rolls back. Might need TransactionalFreePage.
 
         // Recursive Underflow Check on Parent
         int minInternal = MaxEntriesPerNode / 2;
