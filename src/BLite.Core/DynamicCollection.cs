@@ -1060,16 +1060,20 @@ public sealed class DynamicCollection : IDisposable
         if (!_secondaryIndexes.TryGetValue(indexName, out var entry) || entry.Kind != DynamicIndexKind.FullText || entry.FullText == null)
             throw new ArgumentException($"Full-text index '{indexName}' not found on collection '{_collectionName}'");
 
-        foreach (var (location, score) in entry.FullText.Search(query, k, matchAllTerms, null))
+        int returned = 0;
+        foreach (var (location, score) in entry.FullText.SearchExpanding(query, k, matchAllTerms, null))
         {
             ct.ThrowIfCancellationRequested();
             var doc = ReadDocumentAt(location, 0UL);
             if (doc == null) continue;
 
-            // Re-check the hit, so a stale posting can never surface another document.
+            // Re-check the hit, so a stale posting can never surface another document; candidates
+            // past the first k are taken until k hits survive the re-check.
             var text = TryGetNestedValue(doc, entry.FieldPath, out var val) && val.IsString ? val.AsString : null;
-            if (matchAllTerms ? FullTextAnalyzer.Matches(text, query) : FullTextAnalyzer.MatchesAny(text, query))
-                yield return new FullTextSearchResult<BsonDocument>(doc, score);
+            if (!(matchAllTerms ? FullTextAnalyzer.Matches(text, query) : FullTextAnalyzer.MatchesAny(text, query))) continue;
+
+            yield return new FullTextSearchResult<BsonDocument>(doc, score);
+            if (++returned == k) yield break;
         }
     }
 

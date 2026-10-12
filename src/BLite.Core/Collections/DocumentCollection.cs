@@ -3939,12 +3939,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         if (index == null)
             throw new ArgumentException($"Index '{indexName}' not found.", nameof(indexName));
 
-        foreach (var (location, score) in index.FullTextSearch(query, k, matchAllTerms))
+        // Hits are re-checked against the document, so a stale posting can never surface another
+        // document; candidates past the first k are taken until k hits survive the re-check.
+        int returned = 0;
+        foreach (var (location, score) in index.FullTextSearchExpanding(query, k, matchAllTerms))
         {
             ct.ThrowIfCancellationRequested();
             var doc = await FindByLocationAsync(location, 0UL, ct);
-            if (doc != null && index.FullTextContains(doc, query, matchAllTerms))
-                yield return new FullTextSearchResult<T>(doc, score);
+            if (doc == null || !index.FullTextContains(doc, query, matchAllTerms)) continue;
+
+            yield return new FullTextSearchResult<T>(doc, score);
+            if (++returned == k) yield break;
         }
     }
 

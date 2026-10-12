@@ -552,6 +552,41 @@ public class FullTextSearchTests : IDisposable
     }
 
     [Fact]
+    public async Task StaleHitsInTheTopK_AreReplacedByTheNextCandidates()
+    {
+        using var db = new FullTextDbContext(_dbPath);
+        await SeedAsync(db);
+        // A stale posting that outranks every document really containing "quick".
+        var dog = Assert.Single(BodyIndex(db).FullTextMatch("sleeps"));
+        await AddPostingsAsync(db, "quick quick quick quick quick", dog);
+        Assert.Equal(dog, BodyIndex(db).FullTextSearch("quick", 1)[0].Location);
+
+        var top1 = await db.Articles.FullTextSearchAsync("idx_fts_Body", "quick", 1).ToListAsync();
+        var top2 = await db.Articles.FullTextSearchAsync("idx_fts_Body", "quick", 2).ToListAsync();
+        var top5 = await db.Articles.FullTextSearchAsync("idx_fts_Body", "quick", 5).ToListAsync();
+
+        Assert.Equal("fox again", Assert.Single(top1).Document.Title);
+        Assert.Equal(new[] { "fox again", "fox" }, top2.Select(r => r.Document.Title));
+        Assert.Equal(new[] { "fox again", "fox" }, top5.Select(r => r.Document.Title));
+    }
+
+    [Fact]
+    public async Task StalePostingAtTheLocationOfADocumentWithTheSameTerm_IsCountedOnce()
+    {
+        using var db = new FullTextDbContext(_dbPath);
+        await SeedAsync(db);
+        var dog = Assert.Single(BodyIndex(db).FullTextMatch("sleeps"));
+        var before = Ranked(await db.Articles.FullTextSearchAsync("idx_fts_Body", "sleeps", 10).ToListAsync());
+        // Same term and location as the real posting, another frequency and length.
+        await AddPostingsAsync(db, "sleeps", dog);
+
+        Assert.Equal(dog, Assert.Single(BodyIndex(db).FullTextMatch("sleeps")));
+        Assert.Equal("dog", Assert.Single(db.Articles.AsQueryable().Where(a => a.Body.FullTextMatch("sleeps")).ToList()).Title);
+        Assert.Equal("dog", Assert.Single(await db.Articles.FullTextSearchAsync("idx_fts_Body", "sleeps", 10).ToListAsync()).Document.Title);
+        Assert.Equal(before.Select(r => r.Title), Ranked(await db.Articles.FullTextSearchAsync("idx_fts_Body", "sleeps", 10).ToListAsync()).Select(r => r.Title));
+    }
+
+    [Fact]
     public async Task MissingStatistics_SearchStillFindsAndRanksTheDocuments()
     {
         using var db = new FullTextDbContext(_dbPath);
@@ -726,5 +761,12 @@ public class FullTextSearchTests : IDisposable
         Assert.Empty(await col.FullTextSearchAsync("idx_fts_text", "ghost", 10).ToListAsync());
         var any = await col.FullTextSearchAsync("idx_fts_text", "ghost plain", 10, matchAllTerms: false).ToListAsync();
         Assert.Equal("kept", Assert.Single(any).Document.TryGetString("title", out var t) ? t : null);
+
+        // A stale hit ranked first is replaced by the next candidate, so k hits still come back.
+        txn = engine.Storage.BeginTransaction();
+        index.Insert("more more more more", Assert.Single(index.Match("plain", null)), txn);
+        await txn.CommitAsync();
+        var top1 = await col.FullTextSearchAsync("idx_fts_text", "more", 1).ToListAsync();
+        Assert.Equal("other", Assert.Single(top1).Document.TryGetString("title", out var o) ? o : null);
     }
 }

@@ -405,6 +405,18 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     }
 
     /// <summary>
+    /// The BM25 matches for <paramref name="query"/>, best first, starting with the
+    /// <paramref name="k"/> best and continuing past them for as long as the caller enumerates.
+    /// </summary>
+    internal IEnumerable<(DocumentLocation Location, double Score)> FullTextSearchExpanding(string query, int k, bool matchAllTerms, ITransaction? transaction = null)
+    {
+        if (_fullTextIndex == null)
+            throw new InvalidOperationException("This index is not a full-text index.");
+
+        return _fullTextIndex.SearchExpanding(query, k, matchAllTerms, transaction);
+    }
+
+    /// <summary>
     /// Scans a range of keys (O(log n + k) where k is result count)
     /// </summary>
     /// <param name="minKey">Minimum key (inclusive), null for unbounded</param>

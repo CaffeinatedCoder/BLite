@@ -214,6 +214,32 @@ internal sealed class FullTextIndex
             .ToList();
     }
 
+    /// <summary>
+    /// Like <see cref="Search"/>, but keeps going past the first <paramref name="k"/> hits, best first,
+    /// for as long as the caller enumerates: when a window is used up it searches again with twice as
+    /// many and skips the hits already returned. Callers that drop hits (re-checking them against the
+    /// document) can so still return <paramref name="k"/> results. The first window costs exactly one
+    /// <see cref="Search"/>.
+    /// </summary>
+    public IEnumerable<(DocumentLocation Location, double Score)> SearchExpanding(string? query, int k, bool matchAllTerms, ITransaction? transaction)
+    {
+        HashSet<ulong>? returned = null;
+        for (int window = k; window > 0;)
+        {
+            var hits = Search(query, window, matchAllTerms, transaction);
+            foreach (var hit in hits)
+            {
+                if (returned == null || !returned.Contains(Pack(hit.Location)))
+                    yield return hit;
+            }
+            if (hits.Count < window || window == int.MaxValue) yield break;
+
+            returned ??= new HashSet<ulong>();
+            foreach (var hit in hits) returned.Add(Pack(hit.Location));
+            window = window > int.MaxValue / 2 ? int.MaxValue : window * 2;
+        }
+    }
+
     /// <summary>The posting of <paramref name="term"/> for the document at <paramref name="location"/>, if any.</summary>
     private (DocumentLocation Location, int Frequency, int Length)? TryPosting(string term, DocumentLocation location, ulong? txnId)
     {
@@ -238,11 +264,23 @@ internal sealed class FullTextIndex
         return null;
     }
 
+    /// <summary>
+    /// The postings of <paramref name="term"/>, one per location. A stale posting left at a location
+    /// that now holds another document containing the term differs only in its frequency and length,
+    /// so it sorts next to the current one and is skipped: the first posting of a location wins.
+    /// </summary>
     private IEnumerable<(DocumentLocation Location, int Frequency, int Length)> Postings(string term, ulong? txnId)
     {
         int offset = 2 + Encoding.UTF8.GetByteCount(term) + DocumentLocation.SerializedSize;
+        ulong previous = 0;
+        bool first = true;
         foreach (var entry in _tree.Range(TermMin(term), TermMax(term), IndexDirection.Forward, txnId))
         {
+            var packed = Pack(entry.Location);
+            if (!first && packed == previous) continue;
+            first = false;
+            previous = packed;
+
             var key = entry.Key.Data;
             yield return (entry.Location,
                           BinaryPrimitives.ReadUInt16BigEndian(key.Slice(offset)),
