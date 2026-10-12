@@ -2809,8 +2809,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             else
             {
-                // Delete old + insert new
-                await DeleteCore(id, transaction, notifyCdc: false);
+                // Delete old + insert new. Secondary indexes are moved below, so an entry whose
+                // key did not change is re-pointed rather than deleted and inserted again.
+                await DeleteCore(id, transaction, notifyCdc: false, deleteFromIndexes: false);
 
                 DocumentLocation newLocation;
                 if (bytesWritten + SlotEntry.Size <= _maxDocumentSizeForSinglePage)
@@ -2827,9 +2828,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
 
                 _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
-                // DeleteCore already removed all secondary index entries for this document.
-                // We only need to insert the new entries at the new physical location.
-                _indexManager.InsertIntoAll(entity, newLocation, transaction);
+                _indexManager.UpdateInAll(oldEntity, entity, oldLocation, newLocation, transaction);
 
                 // Notify CDC
                 await NotifyCdc(OperationType.Update, id, transaction, docData);
@@ -3089,17 +3088,20 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         return deleteCount;
     }
 
-    private async Task<bool> DeleteCore(TId id, ITransaction transaction, bool notifyCdc = true)
+    private async Task<bool> DeleteCore(TId id, ITransaction transaction, bool notifyCdc = true, bool deleteFromIndexes = true)
     {
         var key = _mapper.ToIndexKey(id);
         if (!_primaryIndex.TryFind(key, out var location, transaction.TransactionId))
             return false;
 
         // Notify secondary indexes BEFORE deleting document from storage
-        var entity = await FindByLocation(location, transaction);
-        if (entity != null)
+        if (deleteFromIndexes)
         {
-            _indexManager.DeleteFromAll(entity, location, transaction);
+            var entity = await FindByLocation(location, transaction);
+            if (entity != null)
+            {
+                _indexManager.DeleteFromAll(entity, location, transaction);
+            }
         }
 
         // Read page

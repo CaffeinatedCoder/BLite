@@ -135,20 +135,60 @@ public class SpatialVectorIndexMaintenanceTests : IDisposable
     }
 
     [Fact]
-    public async Task Vector_DeleteMost_SearchReturnsOnlySurvivors()
+    public async Task Vector_DeleteMoreThanEfSearch_SearchStillReturnsKLiveResults()
     {
+        // 200 deleted nodes sit closer to the query than any survivor, more than efSearch (100).
         var all = new List<VectorEntity>();
-        for (int i = 0; i < 40; i++)
+        for (int i = 0; i < 300; i++)
         {
             var e = new VectorEntity { Title = $"v{i}", Embedding = [i, i, i] };
             await _db.VectorItems.InsertAsync(e);
             all.Add(e);
         }
-        foreach (var e in all.Take(30))
+        foreach (var e in all.Take(200))
             await _db.VectorItems.DeleteAsync(e.Id);
 
         var titles = (await NearestAsync([0f, 0f, 0f], 10)).Select(e => e.Title).ToList();
-        Assert.Equal(Enumerable.Range(30, 10).Select(i => $"v{i}"), titles);
+        Assert.Equal(Enumerable.Range(200, 10).Select(i => $"v{i}"), titles);
+    }
+
+    [Fact]
+    public async Task Vector_RelocatingUpdatesWithAnUnchangedVector_AddNoNodes()
+    {
+        var a = new VectorEntity { Title = "a", Embedding = [1f, 2f, 3f] };
+        await _db.VectorItems.InsertAsync(a);
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "b", Embedding = [4f, 5f, 6f] });
+        int before = VectorNodeCount();
+
+        for (int i = 1; i <= 3; i++)
+        {
+            a.Title = new string('x', 1000 * i); // outgrows its slot every time
+            await _db.VectorItems.UpdateAsync(a);
+        }
+
+        Assert.Equal(before, VectorNodeCount());
+        Assert.Equal(a.Title, (await NearestAsync([1f, 2f, 3f], 1)).Single().Title);
+    }
+
+    /// <summary>All HNSW nodes of idx_vector, deleted ones included.</summary>
+    private int VectorNodeCount()
+    {
+        var manager = typeof(BLite.Core.Collections.DocumentCollection<ObjectId, VectorEntity>)
+            .GetField("_indexManager", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(_db.VectorItems)!;
+        var index = (BLite.Core.Indexing.CollectionSecondaryIndex<ObjectId, VectorEntity>)manager.GetType()
+            .GetMethod("GetIndex")!.Invoke(manager, ["idx_vector"])!;
+        var vectorIndex = (VectorSearchIndex)index.GetType()
+            .GetField("_vectorIndex", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(index)!;
+        var buffer = new byte[_db.Storage.PageSize];
+        int nodes = 0;
+        foreach (var page in vectorIndex.CollectAllPages())
+        {
+            _db.Storage.ReadPage(page, null, buffer);
+            nodes += BLite.Core.Storage.VectorPage.GetNodeCount(buffer);
+        }
+        return nodes;
     }
 
     [Fact]

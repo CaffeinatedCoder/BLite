@@ -131,10 +131,23 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         _definition.TryGetKey(oldDocument, out var oldKey);
         _definition.TryGetKey(newDocument, out var newKey);
         
-        // If keys are the same, no index update needed (optimization for in-place updates
-        // where the existing entry at the same location remains valid).
+        bool moved = oldLocation.PageId != newLocation.PageId || oldLocation.SlotIndex != newLocation.SlotIndex;
+
         if (KeysEqual(oldKey, newKey))
+        {
+            // Same key at the same location: the existing entry stays valid.
+            if (!moved || oldKey == null)
+                return;
+
+            // Same key, new location: re-point the entry. An unchanged vector keeps its HNSW
+            // node instead of leaving a deleted node behind.
+            if (_vectorIndex == null || !TryRelocateVectors(oldKey, oldLocation, newLocation, transaction))
+            {
+                DeleteKey(oldKey, oldDocument, oldLocation, transaction);
+                InsertKey(newKey!, newDocument, newLocation, transaction);
+            }
             return;
+        }
         
         // Delete old entry if it had a key
         if (oldKey != null)
@@ -198,6 +211,23 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             var compositeKey = CreateCompositeKey(userKey, _mapper.ToIndexKey(documentId));
             _btreeIndex.Insert(compositeKey, location, transaction?.TransactionId);
         }
+    }
+
+    /// <summary>Re-points every vector of <paramref name="keyValue"/>; false if any node was missing.</summary>
+    private bool TryRelocateVectors(object keyValue, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction? transaction)
+    {
+        if (keyValue is float[] singleVector)
+            return _vectorIndex!.Relocate(singleVector, oldLocation, newLocation, transaction);
+
+        if (keyValue is IEnumerable<float[]> vectors)
+        {
+            bool all = true;
+            foreach (var v in vectors)
+                all &= _vectorIndex!.Relocate(v, oldLocation, newLocation, transaction);
+            return all;
+        }
+
+        return false;
     }
 
     private void DeleteKey(object keyValue, T document, DocumentLocation location, ITransaction? transaction)
