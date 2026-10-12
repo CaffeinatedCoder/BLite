@@ -38,7 +38,16 @@ public sealed partial class StorageEngine
     /// </summary>
     public async Task CheckpointAsync(CancellationToken ct = default)
     {
-        if (_walIndex.IsEmpty) return;
+        if (_walIndex.IsEmpty)
+        {
+            // Nothing to flush, but pages freed since the last truncation wait for the next one.
+            if (HasPendingFreePages && Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) == 0)
+            {
+                try { await TryTruncateWalAsync(ct).ConfigureAwait(false); }
+                finally { Interlocked.Exchange(ref _checkpointRunning, 0); }
+            }
+            return;
+        }
         if (Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) != 0) return;
         var sw = _metrics != null ? Metrics.ValueStopwatch.StartNew() : default;
         try
@@ -69,6 +78,11 @@ public sealed partial class StorageEngine
             }
 
             if (toCheckpoint.Count == 0) return;
+
+            // The WAL file keeps these records until it is truncated; FreePage must still treat
+            // the pages as having a WAL image once they leave _walIndex below.
+            foreach (var kvp in toCheckpoint)
+                _checkpointedWalPages.TryAdd(kvp.Key, 0);
 
             foreach (var kvp in toCheckpoint)
                 GetPageFile(kvp.Key, out var physId).WritePage(physId, kvp.Value);
@@ -108,53 +122,9 @@ public sealed partial class StorageEngine
                 _shm.WriteCheckpointedOffset(maxCheckpointedOffset);
 
             // Truncate WAL only when _walIndex is fully drained.
-            // _commitLock is still needed here to prevent truncating while the
-            // group-commit writer is appending new WAL records.
-            //
-            // In multi-process mode the SHM cross-process writer lock must also be held
-            // for the duration of the truncation: another process could be appending
-            // WAL records concurrently (its commit path acquires only its own
-            // _commitLock, not ours), and truncating the shared WAL file underneath it
-            // would corrupt the on-disk format. The lock order matches the commit path
-            // (in-process _commitLock → cross-process SHM writer lock) to avoid any
-            // possible cross-lock deadlock.
-            if (_walIndex.IsEmpty && _commitLock.Wait(0))
+            if (_walIndex.IsEmpty)
             {
-                bool shmHeld = false;
-                try
-                {
-                    if (_shm != null)
-                    {
-                        shmHeld = _shm.TryAcquireWriterLock(_config.LockTimeout.WriteTimeoutMs);
-                        if (!shmHeld)
-                        {
-                            // Skip this truncation cycle rather than throw — a future
-                            // checkpoint will retry. Concurrent commits from another
-                            // process are a normal, recoverable condition.
-                            return;
-                        }
-                    }
-                    // Double-check: new commits may have promoted entries
-                    // between our IsEmpty check and acquiring the lock.
-                    if (_walIndex.IsEmpty)
-                    {
-                        await _wal.TruncateAsync(ct);
-                        // Reset the SHM WAL index and end offset so other processes
-                        // know the WAL has been cleared (Phase 4 / Phase 6).
-                        if (_shm != null)
-                        {
-                            _shm.RebuildIndex(System.Array.Empty<(uint, long)>());
-                            _shm.WriteWalEndOffset(0);
-                            _shm.WriteCheckpointedOffset(0);
-                            Volatile.Write(ref _lastKnownWalEndOffset, 0);
-                        }
-                    }
-                }
-                finally
-                {
-                    if (shmHeld) { try { _shm!.ReleaseWriterLock(); } catch { /* best-effort */ } }
-                    _commitLock.Release();
-                }
+                await TryTruncateWalAsync(ct);
             }
             else if (_shm != null && !_walIndex.IsEmpty)
             {
@@ -202,6 +172,58 @@ public sealed partial class StorageEngine
     }
 
     /// <summary>
+    /// Truncates the WAL if every committed record has been checkpointed, then releases the
+    /// pages queued by <see cref="FreePage"/>. Skipped when a commit holds the lock.
+    /// </summary>
+    private async Task TryTruncateWalAsync(CancellationToken ct)
+    {
+        // _commitLock prevents truncating while the group-commit writer is appending new WAL
+        // records. In multi-process mode the SHM cross-process writer lock must also be held:
+        // another process could be appending WAL records concurrently (its commit path acquires
+        // only its own _commitLock, not ours), and truncating the shared WAL file underneath it
+        // would corrupt the on-disk format. The lock order matches the commit path (in-process
+        // _commitLock → cross-process SHM writer lock) to avoid any possible cross-lock deadlock.
+        if (!_walIndex.IsEmpty || !_commitLock.Wait(0)) return;
+
+        bool shmHeld = false;
+        try
+        {
+            if (_shm != null)
+            {
+                shmHeld = _shm.TryAcquireWriterLock(_config.LockTimeout.WriteTimeoutMs);
+                if (!shmHeld)
+                {
+                    // Skip this truncation cycle rather than throw — a future
+                    // checkpoint will retry. Concurrent commits from another
+                    // process are a normal, recoverable condition.
+                    return;
+                }
+            }
+            // Double-check: new commits may have promoted entries
+            // between our IsEmpty check and acquiring the lock.
+            if (_walIndex.IsEmpty)
+            {
+                await _wal.TruncateAsync(ct);
+                // Reset the SHM WAL index and end offset so other processes
+                // know the WAL has been cleared (Phase 4 / Phase 6).
+                if (_shm != null)
+                {
+                    _shm.RebuildIndex(System.Array.Empty<(uint, long)>());
+                    _shm.WriteWalEndOffset(0);
+                    _shm.WriteCheckpointedOffset(0);
+                    Volatile.Write(ref _lastKnownWalEndOffset, 0);
+                }
+                OnWalTruncated();
+            }
+        }
+        finally
+        {
+            if (shmHeld) { try { _shm!.ReleaseWriterLock(); } catch { /* best-effort */ } }
+            _commitLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Creates a consistent backup of this database to <paramref name="destinationDbPath"/>.
     /// <para>
     /// Strategy (fully safe under concurrent writes):
@@ -238,7 +260,10 @@ public sealed partial class StorageEngine
         {
             await CheckpointAsync(ct);
             if (_walIndex.IsEmpty)
+            {
                 await _wal.TruncateAsync(ct).ConfigureAwait(false);
+                OnWalTruncated();
+            }
 
             operations = BuildBackupPlan(destinationDbPath, includeIndexes);
 
@@ -349,6 +374,7 @@ public sealed partial class StorageEngine
             
             // 5. Truncate WAL (all changes now in PageFile)
             await _wal.TruncateAsync(ct);
+            OnWalTruncated();
         }
         finally
         {

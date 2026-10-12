@@ -68,10 +68,97 @@ public sealed partial class StorageEngine
         return CollectionPageMarker | ((uint)(slot & 0x3F) << CollSlotShift) | (localId & CollLocalMask);
     }
 
-    /// <summary>Frees a page, routing to the correct sub-file via the encoded page ID.</summary>
+    // Pages checkpointed out of _walIndex whose records are still in the WAL file, i.e. since
+    // the last truncation. See FreePage.
+    private readonly ConcurrentDictionary<uint, byte> _checkpointedWalPages = new();
+
+    // Freed pages that had a WAL image, held off the free list until the next truncation.
+    private readonly object _pendingFreeLock = new();
+    private HashSet<uint> _pendingFreePages = new();
+
+    /// <summary>
+    /// Frees a page, routing to the correct sub-file via the encoded page ID.
+    /// <para>
+    /// A page that still has a committed image in the WAL is not reusable right away:
+    /// <see cref="ReadPage"/> prefers that image over the page file and recovery replays it over
+    /// the page file, so a page handed out again would read back, or be overwritten with, its
+    /// old contents. Such a page is queued instead and returned to its file's free list right
+    /// after the next WAL truncation (checkpoint, backup or recovery); until then
+    /// <see cref="GetCollectionPageIds"/> skips it. A queued page is leaked, never reused
+    /// unsafely, if the process dies first. In multi-process mode every page is queued, since
+    /// another process may have written it.
+    /// </para>
+    /// </summary>
     public void FreePage(uint pageId)
     {
-        GetPageFile(pageId, out var physId).FreePage(physId);
+        if (pageId == 0) throw new InvalidOperationException("Cannot free header page 0");
+
+        if (_shm == null && !HasWalImage(pageId))
+        {
+            GetPageFile(pageId, out var physId).FreePage(physId);
+            return;
+        }
+
+        lock (_pendingFreeLock)
+            _pendingFreePages.Add(pageId);
+    }
+
+    /// <summary>
+    /// Whether the WAL holds, or an open transaction is about to commit, an image of the page.
+    /// </summary>
+    private bool HasWalImage(uint pageId)
+    {
+        if (_walIndex.ContainsKey(pageId) || _checkpointedWalPages.ContainsKey(pageId))
+            return true;
+
+        foreach (var txnPages in _walCache.Values)
+            if (txnPages.ContainsKey(pageId))
+                return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns every page queued by <see cref="FreePage"/> to its file's free list. Call only
+    /// right after the WAL was truncated, before any new commit can append to it.
+    /// </summary>
+    private void OnWalTruncated()
+    {
+        _checkpointedWalPages.Clear();
+
+        HashSet<uint> pages;
+        lock (_pendingFreeLock)
+        {
+            if (_pendingFreePages.Count == 0) return;
+            pages = _pendingFreePages;
+            _pendingFreePages = new HashSet<uint>();
+        }
+
+        foreach (var pageId in pages)
+            GetPageFile(pageId, out var physId).FreePage(physId);
+    }
+
+    /// <summary>Snapshot of the queued frees, or <c>null</c> when there are none.</summary>
+    private HashSet<uint>? SnapshotPendingFreePages()
+    {
+        lock (_pendingFreeLock)
+            return _pendingFreePages.Count == 0 ? null : new HashSet<uint>(_pendingFreePages);
+    }
+
+    /// <summary>
+    /// Drops queued frees of pages in the given collection file, which is being deleted: the
+    /// slot keeps its number, so releasing them later would free pages of a recreated file.
+    /// </summary>
+    private void DiscardPendingFreePages(int collectionSlot)
+    {
+        var slotBits = CollectionPageMarker | ((uint)(collectionSlot & 0x3F) << CollSlotShift);
+        lock (_pendingFreeLock)
+            _pendingFreePages.RemoveWhere(p => (p & (SubFileTypeMask | CollSlotMask)) == slotBits);
+    }
+
+    private bool HasPendingFreePages
+    {
+        get { lock (_pendingFreeLock) return _pendingFreePages.Count > 0; }
     }
 
     // -----------------------------------------------------------------------
@@ -160,6 +247,9 @@ public sealed partial class StorageEngine
     public void DropCollectionFile(string collectionName)
     {
         if (_collectionFiles == null) return;
+
+        if (_collectionNameToSlot != null && _collectionNameToSlot.TryGetValue(collectionName, out var slot))
+            DiscardPendingFreePages(slot);
 
         if (_collectionFiles.TryRemove(collectionName, out var lazy))
         {
@@ -369,13 +459,9 @@ public sealed partial class StorageEngine
 
         beforeFree?.Invoke(toFree);
 
-        // Free all collected pages and remove stale WAL-index entries so that
-        // a re-allocated page is not served stale data from the WAL index.
+        // FreePage defers reuse until the WAL holds no stale image of these pages.
         foreach (var pageId in toFree)
-        {
             FreePage(pageId);
-            _walIndex.TryRemove(pageId, out _);
-        }
 
         return toFree;
     }
@@ -391,11 +477,15 @@ public sealed partial class StorageEngine
     /// </summary>
     public IEnumerable<uint> GetCollectionPageIds(string collectionName)
     {
+        // Freed pages waiting for a WAL truncation still carry their old contents on disk.
+        var pending = SnapshotPendingFreePages();
+
         if (_collectionFiles == null)
         {
             var mainCount = _pageFile.NextPageId;
             for (uint i = 0; i < mainCount; i++)
-                yield return i;
+                if (pending == null || !pending.Contains(i))
+                    yield return i;
             yield break;
         }
 
@@ -406,7 +496,11 @@ public sealed partial class StorageEngine
         var localCount = file.NextPageId;
         var encBase = CollectionPageMarker | ((uint)(slot & 0x3F) << CollSlotShift);
         for (uint localId = 0; localId < localCount; localId++)
-            yield return encBase | (localId & CollLocalMask);
+        {
+            var pageId = encBase | (localId & CollLocalMask);
+            if (pending == null || !pending.Contains(pageId))
+                yield return pageId;
+        }
     }
 
     // -----------------------------------------------------------------------
