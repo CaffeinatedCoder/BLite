@@ -110,6 +110,57 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         }
     }
 
+    /// <summary>The name an index on <paramref name="keySelector"/> gets when none is given.</summary>
+    internal static string ResolveIndexName(LambdaExpression keySelector, string? name)
+        => name ?? GenerateIndexName(ExpressionAnalyzer.ExtractPropertyPaths(keySelector));
+
+    /// <summary>
+    /// Builds an index definition from an untyped key selector, as declared in the model.
+    /// </summary>
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    internal static CollectionIndexDefinition<T> BuildDefinition(
+        LambdaExpression keySelector,
+        string? name,
+        bool unique,
+        IndexType type,
+        int dimensions,
+        VectorMetric metric)
+    {
+        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
+        var body = keySelector.Body.Type == typeof(object)
+            ? keySelector.Body
+            : Expression.Convert(keySelector.Body, typeof(object));
+        var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
+
+        return new CollectionIndexDefinition<T>(
+            name ?? GenerateIndexName(propertyPaths), propertyPaths, lambda, unique, type, false, dimensions, metric);
+    }
+
+    /// <summary>
+    /// Creates an index for <paramref name="definition"/> without registering or persisting it,
+    /// so it can be filled before queries or the collection metadata see it. The index owns its
+    /// root page: hand it to <see cref="Register"/> or release it with
+    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/>.
+    /// </summary>
+    internal CollectionSecondaryIndex<TId, T> CreateUnregistered(CollectionIndexDefinition<T> definition)
+        => new(definition, _storage, _mapper);
+
+    /// <summary>Registers an index built by <see cref="CreateUnregistered"/> and persists it.</summary>
+    internal void Register(CollectionSecondaryIndex<TId, T> index)
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
+            if (_indexes.ContainsKey(index.Name))
+                throw new InvalidOperationException($"Index '{index.Name}' already exists");
+
+            _indexes[index.Name] = index;
+            _cachedIndexInfo = null; // invalidate cache
+            SaveMetadata();
+        }
+    }
+
     // ... methods ...
 
     /// <summary>

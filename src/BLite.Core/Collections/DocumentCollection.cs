@@ -1070,28 +1070,29 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder)
     {
-        // Use the IndexManager directly to ensure the index exists
-        // We need to convert the LambdaExpression to a typed expression if possible, 
-        // or add an untyped CreateIndexAsync to IndexManager.
+        var name = CollectionIndexManager<TId, T>.ResolveIndexName(builder.KeySelector, builder.Name);
+        if (_indexManager.GetIndex(name) != null)
+            return;
 
-        // For now, let's use a dynamic approach or cast if we know it's Func<T, object>
-        if (builder.Type == IndexType.Vector)
+        // The collection may already hold documents, e.g. when a new app version adds the index.
+        // Fill the index before registering it, so neither a crash nor a document that cannot be
+        // indexed leaves an empty index persisted that later opens would trust.
+        var definition = CollectionIndexManager<TId, T>.BuildDefinition(
+            builder.KeySelector, name, builder.IsUnique, builder.Type, builder.Dimensions, builder.Metric);
+        var index = _indexManager.CreateUnregistered(definition);
+        try
         {
-            _indexManager.CreateVectorIndexUntyped(builder.KeySelector, builder.Dimensions, builder.Metric, builder.Name);
+            // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+            Task.Run(() => RebuildIndexAsync(index, skipUnreadableDocuments: false)).GetAwaiter().GetResult();
         }
-        else if (builder.Type == IndexType.Spatial)
+        catch (Exception ex)
         {
-            _indexManager.CreateSpatialIndexUntyped(builder.KeySelector, builder.Name);
+            index.FreeAllPages(_storage);
+            index.Dispose();
+            throw new InvalidOperationException(
+                $"Failed to build index '{name}' of collection '{_collectionName}' from its existing documents; it is built again on the next open.", ex);
         }
-        else if (builder.KeySelector is System.Linq.Expressions.Expression<Func<T, object>> selector)
-        {
-            _indexManager.EnsureIndex(selector, builder.Name, builder.IsUnique);
-        }
-        else
-        {
-            // Try to rebuild the expression or use untyped version
-            _indexManager.EnsureIndexUntyped(builder.KeySelector, builder.Name, builder.IsUnique);
-        }
+        _indexManager.Register(index);
     }
 
     /// <summary>
