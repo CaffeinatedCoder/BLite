@@ -720,7 +720,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             if (options?.RebuildIndexes == true)
             {
                 foreach (var index in _indexManager.GetAllIndexes())
-                    await RebuildIndexAsync(index, ct).ConfigureAwait(false);
+                    await RebuildIndexFromScratchAsync(index.Name, ct).ConfigureAwait(false);
             }
 
             success = true;
@@ -1592,6 +1592,28 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                     Success        = true,
                 });
         }
+    }
+
+    /// <summary>
+    /// Populates an empty copy of index <paramref name="name"/> from the documents and swaps it in
+    /// only after the rebuild committed; the old tree is then freed. If any document cannot be
+    /// loaded or indexed, the rebuild fails and the existing index stays in place untouched,
+    /// instead of being replaced by an incomplete one.
+    /// </summary>
+    private async Task RebuildIndexFromScratchAsync(string name, CancellationToken ct)
+    {
+        var fresh = _indexManager.CreateUnregisteredCopy(name);
+        try
+        {
+            await RebuildIndexAsync(fresh, ct, skipUnreadableDocuments: false).ConfigureAwait(false);
+        }
+        catch
+        {
+            fresh.FreeAllPages(_storage);
+            fresh.Dispose();
+            throw;
+        }
+        _indexManager.ReplaceIndex(name, fresh);
     }
 
     private async Task RebuildIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct = default, bool skipUnreadableDocuments = true)

@@ -301,10 +301,41 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
-            var fresh = new CollectionSecondaryIndex<TId, T>(old.Definition, _storage, _mapper)
-            {
-                KeyFormat = old.KeyFormat
-            };
+            var fresh = CreateUnregisteredCopy(name);
+            fresh.KeyFormat = old.KeyFormat;
+            ReplaceIndex(name, fresh);
+            return fresh;
+        }
+    }
+
+    /// <summary>
+    /// Creates an empty index with the same definition as <paramref name="name"/> without
+    /// registering it, so queries keep using the existing index while the copy is populated.
+    /// The copy owns its root page: hand it to <see cref="ReplaceIndex"/> or release it with
+    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/>.
+    /// </summary>
+    internal CollectionSecondaryIndex<TId, T> CreateUnregisteredCopy(string name)
+    {
+        lock (_lock)
+        {
+            if (!_indexes.TryGetValue(name, out var old))
+                throw new InvalidOperationException($"Index '{name}' does not exist");
+
+            return new CollectionSecondaryIndex<TId, T>(old.Definition, _storage, _mapper);
+        }
+    }
+
+    /// <summary>
+    /// Registers <paramref name="fresh"/> under <paramref name="name"/>, persists its root page
+    /// and frees the pages of the index it replaces.
+    /// </summary>
+    internal void ReplaceIndex(string name, CollectionSecondaryIndex<TId, T> fresh)
+    {
+        lock (_lock)
+        {
+            if (!_indexes.TryGetValue(name, out var old))
+                throw new InvalidOperationException($"Index '{name}' does not exist");
+
             _indexes[name] = fresh;
             _cachedIndexInfo = null; // invalidate cache
 
@@ -313,7 +344,6 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             SaveMetadata();
             old.FreeAllPages(_storage);
             old.Dispose();
-            return fresh;
         }
     }
 

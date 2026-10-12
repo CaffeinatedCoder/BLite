@@ -345,7 +345,7 @@ public class VacuumTests : IDisposable
         await db.Users.DeleteAsync(user.Id);
         await db.SaveChangesAsync();
 
-        db.ForceCheckpoint();
+        await db.CheckpointAsync();
 
         AssertAllDataPageFreeSpaceIsZero(db.Storage, "users");
     }
@@ -399,7 +399,7 @@ public class VacuumTests : IDisposable
         await db.SaveChangesAsync();
 
         await db.Users.VacuumAsync();
-        db.ForceCheckpoint();
+        await db.CheckpointAsync();
 
         AssertAllDataPageFreeSpaceIsZero(db.Storage, "users");
     }
@@ -584,6 +584,122 @@ public class VacuumTests : IDisposable
             Assert.NotNull(await col.FindByIdAsync(ids[i]));
 
         Assert.Equal(10, await col.CountAsync());
+    }
+
+    // ======================================================================
+    //  RebuildIndexes on DocumentCollection (#167)
+    // ======================================================================
+
+    /// <summary>
+    /// A rebuild must replace the B-Tree contents, not re-insert every document into the
+    /// existing tree: each document is found exactly once by equality and range queries.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_BTree_NoDuplicates()
+    {
+        using var db = new TestDbContext(_dbPath);
+        for (int i = 1; i <= 3; i++)
+            await db.PeopleV2.InsertAsync(new PersonV2 { Name = $"p{i}", Age = 30 + i });
+
+        await db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true });
+
+        Assert.Single(db.PeopleV2.AsQueryable().Where(p => p.Age == 32).ToList());
+        Assert.Equal(3, db.PeopleV2.AsQueryable().Where(p => p.Age >= 31).ToList().Count);
+    }
+
+    /// <summary>
+    /// Back-to-back rebuilds stay idempotent even though each one frees the previous tree while
+    /// the WAL still holds its pages (#168). Once the WAL is checkpointed, those pages are reused,
+    /// so further rebuilds do not grow the file.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_Repeated_NoDuplicatesNoGrowth()
+    {
+        using var db = new TestDbContext(_dbPath);
+        for (int i = 0; i < 200; i++)
+            await db.PeopleV2.InsertAsync(new PersonV2 { Name = $"p{i}", Age = i % 50 });
+
+        var options = new VacuumOptions { RebuildIndexes = true, TruncateFile = false };
+        for (int pass = 0; pass < 5; pass++)
+            await db.PeopleV2.VacuumAsync(options);
+
+        Assert.Equal(4, db.PeopleV2.AsQueryable().Where(p => p.Age == 7).ToList().Count);
+        Assert.Equal(200, db.PeopleV2.AsQueryable().Where(p => p.Age >= 0).ToList().Count);
+
+        await db.CheckpointAsync();
+        long sizeBefore = new FileInfo(_dbPath).Length;
+        for (int pass = 0; pass < 5; pass++)
+        {
+            await db.PeopleV2.VacuumAsync(options);
+            await db.CheckpointAsync();
+        }
+
+        Assert.Equal(200, db.PeopleV2.AsQueryable().Where(p => p.Age >= 0).ToList().Count);
+        Assert.Equal(sizeBefore, new FileInfo(_dbPath).Length);
+    }
+
+    /// <summary>
+    /// The rebuilt tree's root page is persisted, so the index is still correct after reopening.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_SurvivesReopen()
+    {
+        using (var db = new TestDbContext(_dbPath))
+        {
+            for (int i = 1; i <= 10; i++)
+                await db.PeopleV2.InsertAsync(new PersonV2 { Name = $"p{i}", Age = i });
+            await db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true });
+        }
+
+        using (var db = new TestDbContext(_dbPath))
+        {
+            Assert.Single(db.PeopleV2.AsQueryable().Where(p => p.Age == 5).ToList());
+            Assert.Equal(10, db.PeopleV2.AsQueryable().Where(p => p.Age >= 1).ToList().Count);
+
+            await db.PeopleV2.InsertAsync(new PersonV2 { Name = "late", Age = 5 });
+            Assert.Equal(2, db.PeopleV2.AsQueryable().Where(p => p.Age == 5).ToList().Count);
+        }
+    }
+
+    /// <summary>
+    /// A rebuilt spatial index holds only current positions, so a moved document is no longer
+    /// found where it used to be.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_Spatial_DropsStaleEntries()
+    {
+        using var db = new TestDbContext(_dbPath);
+        var e = new GeoEntity { Name = "mover", Location = (45.0, 9.0) };
+        await db.GeoItems.InsertAsync(e);
+        e.Location = (10.0, 10.0);
+        await db.GeoItems.UpdateAsync(e);
+
+        await db.GeoItems.VacuumAsync(new VacuumOptions { RebuildIndexes = true });
+
+        (double, double) oldMin = (44.0, 8.0), oldMax = (46.0, 10.0);
+        (double, double) newMin = (9.0, 9.0), newMax = (11.0, 11.0);
+        Assert.Empty(db.GeoItems.AsQueryable().Where(p => p.Location.Within(oldMin, oldMax)).ToList());
+        Assert.Single(db.GeoItems.AsQueryable().Where(p => p.Location.Within(newMin, newMax)).ToList());
+    }
+
+    /// <summary>
+    /// A rebuilt vector index holds only current embeddings, so nearest-neighbour search sees
+    /// the updated vector.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_Vector_UsesCurrentEmbeddings()
+    {
+        using var db = new TestDbContext(_dbPath);
+        var a = new VectorEntity { Title = "A", Embedding = [0f, 0f, 0f] };
+        await db.VectorItems.InsertAsync(a);
+        await db.VectorItems.InsertAsync(new VectorEntity { Title = "B", Embedding = [5f, 5f, 5f] });
+        a.Embedding = [100f, 100f, 100f];
+        await db.VectorItems.UpdateAsync(a);
+
+        await db.VectorItems.VacuumAsync(new VacuumOptions { RebuildIndexes = true });
+
+        var top = await db.VectorItems.VectorSearchAsync("idx_vector", [0f, 0f, 0f], 1).ToListAsync();
+        Assert.Equal("B", Assert.Single(top).Title);
     }
 
     // ======================================================================
