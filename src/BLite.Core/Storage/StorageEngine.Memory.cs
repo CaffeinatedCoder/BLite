@@ -108,19 +108,17 @@ public sealed partial class StorageEngine
     /// </summary>
     private bool HasWalImage(uint pageId)
     {
-        if (_walIndex.ContainsKey(pageId) || _checkpointedWalPages.ContainsKey(pageId))
-            return true;
-
-        foreach (var txnPages in _walCache.Values)
-            if (txnPages.ContainsKey(pageId))
-                return true;
-
-        return false;
+        return _walIndex.ContainsKey(pageId)
+            || _checkpointedWalPages.ContainsKey(pageId)
+            || IsInOpenTransaction(pageId);
     }
 
     /// <summary>
-    /// Returns every page queued by <see cref="FreePage"/> to its file's free list. Call only
-    /// right after the WAL was truncated, before any new commit can append to it.
+    /// Returns the pages queued by <see cref="FreePage"/> to their file's free list. Call only
+    /// right after the WAL was truncated, under <c>_commitLock</c>, so no commit can append to it.
+    /// A page that an open transaction has written stays queued: its image reaches the WAL only
+    /// when that transaction commits, so it is released after the truncation that follows. A
+    /// page whose release fails stays queued as well, and is retried at the next truncation.
     /// </summary>
     private void OnWalTruncated()
     {
@@ -134,8 +132,39 @@ public sealed partial class StorageEngine
             _pendingFreePages = new HashSet<uint>();
         }
 
+        var keep = new List<uint>();
         foreach (var pageId in pages)
-            GetPageFile(pageId, out var physId).FreePage(physId);
+        {
+            if (IsInOpenTransaction(pageId))
+            {
+                keep.Add(pageId);
+                continue;
+            }
+
+            try
+            {
+                GetPageFile(pageId, out var physId).FreePage(physId);
+            }
+            catch
+            {
+                keep.Add(pageId);
+            }
+        }
+
+        if (keep.Count > 0)
+        {
+            lock (_pendingFreeLock)
+                foreach (var pageId in keep)
+                    _pendingFreePages.Add(pageId);
+        }
+    }
+
+    private bool IsInOpenTransaction(uint pageId)
+    {
+        foreach (var txnPages in _walCache.Values)
+            if (txnPages.ContainsKey(pageId))
+                return true;
+        return false;
     }
 
     /// <summary>Snapshot of the queued frees, or <c>null</c> when there are none.</summary>

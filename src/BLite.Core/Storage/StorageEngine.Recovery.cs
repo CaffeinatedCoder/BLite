@@ -41,9 +41,10 @@ public sealed partial class StorageEngine
         if (_walIndex.IsEmpty)
         {
             // Nothing to flush, but pages freed since the last truncation wait for the next one.
+            // No Checkpoint metric is published for this path: nothing is written to the page files.
             if (HasPendingFreePages && Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) == 0)
             {
-                try { await TryTruncateWalAsync(ct).ConfigureAwait(false); }
+                try { await TryTruncateWalAsync(ct); }
                 finally { Interlocked.Exchange(ref _checkpointRunning, 0); }
             }
             return;
@@ -198,6 +199,12 @@ public sealed partial class StorageEngine
                     // process are a normal, recoverable condition.
                     return;
                 }
+
+                // Another process may have committed records this process has not replayed
+                // into its _walIndex yet; an empty local index says nothing about them, and
+                // truncating would discard them.
+                if (_shm.ReadWalEndOffset() > Volatile.Read(ref _lastKnownWalEndOffset))
+                    return;
             }
             // Double-check: new commits may have promoted entries
             // between our IsEmpty check and acquiring the lock.

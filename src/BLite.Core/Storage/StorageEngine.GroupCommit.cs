@@ -193,9 +193,11 @@ public sealed partial class StorageEngine
             {
                 if (commit.Pages != null)
                 {
-                    _walCache.TryRemove(commit.TransactionId, out _);
+                    // Index first, then drop the cache: a page must never be in neither
+                    // (FreePage relies on finding its WAL image in one of them).
                     foreach (var kvp in commit.Pages)
                         _walIndex[kvp.Key] = kvp.Value;
+                    _walCache.TryRemove(commit.TransactionId, out _);
                 }
             }
 

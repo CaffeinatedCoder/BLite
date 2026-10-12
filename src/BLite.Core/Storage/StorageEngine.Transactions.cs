@@ -219,12 +219,13 @@ public sealed partial class StorageEngine
             await _wal.WriteCommitRecordAsync(transactionId);
             await _wal.FlushAsync(); // Durability: ensure WAL is on disk
 
-            // 3. Move pages from cache to WAL index (for reads)
-            _walCache.TryRemove(transactionId, out _);
+            // 3. Move pages from cache to WAL index (for reads). Index first, then drop the
+            // cache: a page must never be in neither (FreePage relies on finding its WAL image).
             foreach (var kvp in pages)
             {
                 _walIndex[kvp.Key] = kvp.Value;
             }
+            _walCache.TryRemove(transactionId, out _);
 
             // Check if checkpoint is needed, but defer it until after releasing the lock
             needsCheckpoint = _wal.GetCurrentSize() > MaxWalSize;
@@ -368,13 +369,15 @@ public sealed partial class StorageEngine
             await _wal.WriteCommitRecordAsync(transactionId);
             await _wal.FlushAsync();
             
-            // Move from cache to WAL index
-            if (_walCache.TryRemove(transactionId, out var pages))
+            // Move from cache to WAL index. Index first, then drop the cache: a page must
+            // never be in neither (FreePage relies on finding its WAL image).
+            if (_walCache.TryGetValue(transactionId, out var pages))
             {
                 foreach (var kvp in pages)
                 {
                     _walIndex[kvp.Key] = kvp.Value;
                 }
+                _walCache.TryRemove(transactionId, out _);
             }
 
             // Check if checkpoint is needed, but defer it until after releasing the lock
