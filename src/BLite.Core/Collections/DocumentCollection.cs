@@ -1090,7 +1090,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             index.FreeAllPages(_storage);
             index.Dispose();
             throw new InvalidOperationException(
-                $"Failed to build index '{name}' of collection '{_collectionName}' from its existing documents; it is built again on the next open.", ex);
+                $"Cannot build index '{name}' of collection '{_collectionName}' from the documents already in it: {ex.Message} " +
+                "Nothing was saved, but every open fails the same way until those documents can be indexed or the index " +
+                "is removed from the model (OnModelCreating).", ex);
         }
         _indexManager.Register(index);
     }

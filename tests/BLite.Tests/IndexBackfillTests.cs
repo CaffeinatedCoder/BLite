@@ -86,6 +86,8 @@ public class IndexBackfillTests : IDisposable
         // The stored embeddings have 3 dimensions; the declared index expects 4.
         var ex = Assert.Throws<InvalidOperationException>(() => new IndexEvoBadVectorDbContext(_dbPath));
         Assert.Contains("idx_vector", ex.Message);
+        Assert.Contains("removed from the model", ex.Message);
+        Assert.IsType<ArgumentException>(ex.InnerException); // the dimension mismatch
 
         // Nothing was registered, so the data stays readable and the next open tries again.
         using (var v1 = new IndexEvoV1DbContext(_dbPath))

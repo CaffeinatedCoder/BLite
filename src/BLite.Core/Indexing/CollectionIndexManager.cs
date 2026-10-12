@@ -140,7 +140,8 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     /// Creates an index for <paramref name="definition"/> without registering or persisting it,
     /// so it can be filled before queries or the collection metadata see it. The index owns its
     /// root page: hand it to <see cref="Register"/> or release it with
-    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/>.
+    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/> (a spatial index cannot release
+    /// its pages yet, so an abandoned one leaks them).
     /// </summary>
     internal CollectionSecondaryIndex<TId, T> CreateUnregistered(CollectionIndexDefinition<T> definition)
         => new(definition, _storage, _mapper);
@@ -236,78 +237,6 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
                 return existing;
 
             return CreateIndex(keySelector, name, unique);
-        }
-    }
-
-    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    internal CollectionSecondaryIndex<TId, T> EnsureIndexUntyped(
-        LambdaExpression keySelector,
-        string? name = null,
-        bool unique = false)
-    {
-        // Convert LambdaExpression to Expression<Func<T, object>> properly by sharing parameters
-        var body = keySelector.Body;
-        if (body.Type != typeof(object))
-        {
-            body = Expression.Convert(body, typeof(object));
-        }
-        
-        var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
-
-        return EnsureIndex(lambda, name, unique);
-    }
-
-    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    public CollectionSecondaryIndex<TId, T> CreateVectorIndexUntyped(
-        LambdaExpression keySelector,
-        int dimensions,
-        VectorMetric metric = VectorMetric.Cosine,
-        string? name = null)
-    {
-        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
-        var indexName = name ?? GenerateIndexName(propertyPaths);
-
-        lock (_lock)
-        {
-            if (_indexes.TryGetValue(indexName, out var existing))
-                return existing;
-
-            var body = keySelector.Body;
-            if (body.Type != typeof(object))
-            {
-                body = Expression.Convert(body, typeof(object));
-            }
-
-            var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
-
-            var definition = new CollectionIndexDefinition<T>(indexName, propertyPaths, lambda, false, IndexType.Vector, false, dimensions, metric);
-            return CreateIndex(definition);
-        }
-    }
-
-    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    public CollectionSecondaryIndex<TId, T> CreateSpatialIndexUntyped(
-        LambdaExpression keySelector,
-        string? name = null)
-    {
-        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
-        var indexName = name ?? GenerateIndexName(propertyPaths);
-
-        lock (_lock)
-        {
-            if (_indexes.TryGetValue(indexName, out var existing))
-                return existing;
-
-            var body = keySelector.Body;
-            if (body.Type != typeof(object))
-            {
-                body = Expression.Convert(body, typeof(object));
-            }
-            
-            var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
-
-            var definition = new CollectionIndexDefinition<T>(indexName, propertyPaths, lambda, false, IndexType.Spatial);
-            return CreateIndex(definition);
         }
     }
 
