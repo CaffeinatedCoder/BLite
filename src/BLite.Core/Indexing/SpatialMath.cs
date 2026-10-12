@@ -39,14 +39,24 @@ public static class SpatialMath
     internal static GeoBox[] NearQueryBoxes(double lat, double lon, double radiusKm)
     {
         double angularRadius = radiusKm / EarthRadiusKm;
+        if (angularRadius >= Math.PI)
+            return [new GeoBox(-90, -180, 90, 180)]; // the circle covers the whole globe
+
+        // Keep the centre in [-180, 180) so the meridian split below yields tight boxes.
+        lon = ((lon + 180) % 360 + 360) % 360 - 180;
+
         double dLat = ToDegrees(angularRadius);
         double minLat = lat - dLat;
         double maxLat = lat + dLat;
 
-        if (maxLat >= 90 || minLat <= -90)
+        // The circle contains a pole exactly when sin(r) >= cos(lat). Testing that ratio, rather
+        // than lat ± dLat in degrees, also keeps the asin argument below 1 when rounding puts
+        // |lat| + r within a few ulp of 90°.
+        double ratio = Math.Sin(angularRadius) / Math.Cos(ToRadians(lat));
+        if (maxLat >= 90 || minLat <= -90 || ratio >= 1)
             return [new GeoBox(Math.Max(minLat, -90), -180, Math.Min(maxLat, 90), 180)];
 
-        double dLon = ToDegrees(Math.Asin(Math.Sin(angularRadius) / Math.Cos(ToRadians(lat))));
+        double dLon = ToDegrees(Math.Asin(ratio));
         double minLon = lon - dLon;
         double maxLon = lon + dLon;
 

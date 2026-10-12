@@ -77,6 +77,42 @@ public class NearAntimeridianPoleTests : IDisposable
     }
 
     [Fact]
+    public void NearQueryBoxes_AtThePoleBoundary_NeverContainNaN()
+    {
+        // Radii at and just under the exact distance to the pole, where sin(r)/cos(lat) can round to 1 + ε.
+        for (double lat = 60; lat < 90; lat += 0.37)
+        {
+            double toPoleKm = (90 - lat) * Math.PI / 180 * 6371.0;
+            foreach (var radius in new[] { toPoleKm, toPoleKm * (1 - 1e-15), toPoleKm * (1 - 1e-12) })
+            {
+                foreach (var box in SpatialMath.NearQueryBoxes(lat, 10.0, radius))
+                {
+                    Assert.False(double.IsNaN(box.MinLat) || double.IsNaN(box.MaxLat) || double.IsNaN(box.MinLon) || double.IsNaN(box.MaxLon),
+                        $"NaN box for lat {lat}, radius {radius}");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Near_WithAnUnnormalisedCentreLongitude_MatchesTheNormalisedOne()
+    {
+        Assert.Equal(SpatialMath.NearQueryBoxes(0.0, -170.0, 50.0), SpatialMath.NearQueryBoxes(0.0, 190.0, 50.0));
+
+        await _db.GeoItems.InsertAsync(new GeoEntity { Name = "near", Location = (0.0, -170.1) });
+        await _db.GeoItems.InsertAsync(new GeoEntity { Name = "far", Location = (0.0, 10.0) });
+
+        Assert.Equal(new[] { "near" }, await NearAsync((0.0, 190.0), 50.0));
+    }
+
+    [Fact]
+    public void NearQueryBoxes_LargerThanHalfTheEarth_CoverTheWholeGlobe()
+    {
+        var box = Assert.Single(SpatialMath.NearQueryBoxes(10.0, 20.0, 25_000));
+        Assert.Equal((-90.0, -180.0, 90.0, 180.0), (box.MinLat, box.MinLon, box.MaxLat, box.MaxLon));
+    }
+
+    [Fact]
     public async Task Dynamic_Near_AcrossTheAntimeridian_FindsPointsOnBothSides()
     {
         var path = Path.ChangeExtension(_dbPath, ".dyn.db");

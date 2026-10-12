@@ -63,7 +63,9 @@ internal class RTreeIndex : IDisposable
     /// </summary>
     public IEnumerable<DocumentLocation> SearchNear(double latitude, double longitude, double radiusKm, ITransaction? transaction = null)
     {
-        // The boxes never overlap, so no point is returned twice.
+        // The boxes never overlap, so no point is returned twice: a split happens only when no
+        // pole is inside the circle, and then the longitude half-width asin(sin r / cos lat) is
+        // below 90°, so the two halves together span less than 360°.
         foreach (var box in SpatialMath.NearQueryBoxes(latitude, longitude, radiusKm))
         {
             foreach (var (mbr, location) in SearchEntries(box, transaction))
