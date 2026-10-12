@@ -360,6 +360,8 @@ var config = new PageFileConfig { AllowMultiProcessAccess = true };
 using var db = new AppDb("shared.db", config); // open from multiple processes
 ```
 
+Each transaction starts by replaying what other processes have committed since. If a commit in the same process is running, it waits up to `LockTimeout.ReadTimeoutMs` for it; after that it starts anyway and may not see those other commits until the next transaction. A checkpoint writes its pages under the cross-process writer lock, so commits in every process wait for those writes (not for the flush that follows).
+
 ### �📡 Change Data Capture (CDC)
 Real-time event streaming for database changes with transactional consistency.
 

@@ -135,7 +135,9 @@ Offset    Size    Field
 24        8       WalEndOffset       [last byte written to WAL, Interlocked]
 32        8       CheckpointedOffset [last byte safely checkpointed, Interlocked]
 40        4       WriterOwnerPid     [0 = unlocked]
-44        20      Reserved           [pad to 64 bytes]
+44        4       Reserved
+48        8       WalGeneration      [incremented on every WAL truncation, Interlocked]
+56        8       Reserved           [pad to 64 bytes]
 ─────────────────────────────────────────────────────────
 64        MaxReaders × 16    Reader Slot Array
                              Per slot: [long ProcessId][long MaxReadOffset]

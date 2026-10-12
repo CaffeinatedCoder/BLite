@@ -36,7 +36,14 @@ public sealed partial class StorageEngine
     /// Async opportunistic checkpoint — NEVER blocks commits.
     /// See <see cref="Checkpoint"/> for the strategy.
     /// </summary>
-    public async Task CheckpointAsync(CancellationToken ct = default)
+    /// <remarks>
+    /// In multi-process mode the page writes run under the commit lock and the cross-process
+    /// writer lock, so commits in this and other processes wait for them (not for the flush).
+    /// </remarks>
+    public Task CheckpointAsync(CancellationToken ct = default) => CheckpointCoreAsync(commitLockHeld: false, ct);
+
+    /// <param name="commitLockHeld">The caller holds <c>_commitLock</c> (backup).</param>
+    private async Task CheckpointCoreAsync(bool commitLockHeld, CancellationToken ct)
     {
         if (_walIndex.IsEmpty)
         {
@@ -44,7 +51,7 @@ public sealed partial class StorageEngine
             // No Checkpoint metric is published for this path: nothing is written to the page files.
             if (HasPendingFreePages && Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) == 0)
             {
-                try { await TryTruncateWalAsync(ct).ConfigureAwait(false); }
+                try { await TryTruncateWalCoreAsync(commitLockHeld, ct).ConfigureAwait(false); }
                 finally { Interlocked.Exchange(ref _checkpointRunning, 0); }
             }
             return;
@@ -53,40 +60,66 @@ public sealed partial class StorageEngine
         var sw = _metrics != null ? Metrics.ValueStopwatch.StartNew() : default;
         try
         {
-            // Phase 6: Compute the safe upper boundary for this checkpoint run.
-            // In multi-process mode we must not flush WAL entries whose records are
-            // still within the read window of an active cross-process reader.  The SHM
-            // reader-slot array gives us the minimum offset any live reader registered;
-            // we only checkpoint entries whose WAL offset is at or below that boundary.
-            long safeOffset = long.MaxValue;
-            if (_shm != null)
-                safeOffset = Math.Min(_wal.GetCurrentSize(), _shm.GetMinReaderOffset());
+            List<KeyValuePair<uint, byte[]>> toCheckpoint;
 
-            var snapshot = _walIndex.ToArray();
-            if (snapshot.Length == 0) return;
-
-            // Build the set of entries that are safe to checkpoint.
-            var toCheckpoint = new List<KeyValuePair<uint, byte[]>>(snapshot.Length);
-            foreach (var kvp in snapshot)
+            // Multi-process: catch up with the shared WAL and write the pages under _commitLock and
+            // the SHM writer lock. Otherwise this engine could write an image older than one another
+            // process already checkpointed (from a record it has not replayed yet), or one from a WAL
+            // that process has checkpointed and truncated since (#197). Same order as the commit path.
+            bool writeCommitHeld = false, writeShmHeld = false;
+            try
             {
-                if (_shm != null && _walOffsets != null)
+                if (_shm != null && _wal is Transactions.WriteAheadLog sharedWal)
                 {
-                    // Only include entries whose WAL record is within the safe window.
-                    if (_walOffsets.TryGetValue(kvp.Key, out long entryOffset) && entryOffset > safeOffset)
-                        continue; // reader still needs this WAL record — skip for now
+                    if (!commitLockHeld)
+                    {
+                        writeCommitHeld = await _commitLock.WaitAsync(_config.LockTimeout.WriteTimeoutMs, ct).ConfigureAwait(false);
+                        if (!writeCommitHeld) return; // a later checkpoint retries
+                    }
+                    writeShmHeld = _shm.TryAcquireWriterLock(_config.LockTimeout.WriteTimeoutMs);
+                    if (!writeShmHeld || !TryCatchUpWithSharedWal(sharedWal)) return;
                 }
-                toCheckpoint.Add(kvp);
+
+                // Phase 6: Compute the safe upper boundary for this checkpoint run.
+                // In multi-process mode we must not flush WAL entries whose records are
+                // still within the read window of an active cross-process reader.  The SHM
+                // reader-slot array gives us the minimum offset any live reader registered;
+                // we only checkpoint entries whose WAL offset is at or below that boundary.
+                long safeOffset = long.MaxValue;
+                if (_shm != null)
+                    safeOffset = Math.Min(_wal.GetCurrentSize(), _shm.GetMinReaderOffset());
+
+                var snapshot = _walIndex.ToArray();
+                if (snapshot.Length == 0) return;
+
+                // Build the set of entries that are safe to checkpoint.
+                toCheckpoint = new List<KeyValuePair<uint, byte[]>>(snapshot.Length);
+                foreach (var kvp in snapshot)
+                {
+                    if (_shm != null && _walOffsets != null)
+                    {
+                        // Only include entries whose WAL record is within the safe window.
+                        if (_walOffsets.TryGetValue(kvp.Key, out long entryOffset) && entryOffset > safeOffset)
+                            continue; // reader still needs this WAL record — skip for now
+                    }
+                    toCheckpoint.Add(kvp);
+                }
+
+                if (toCheckpoint.Count == 0) return;
+
+                // The WAL file keeps these records until it is truncated; FreePage must still treat
+                // the pages as having a WAL image once they leave _walIndex below.
+                foreach (var kvp in toCheckpoint)
+                    _checkpointedWalPages.TryAdd(kvp.Key, 0);
+
+                foreach (var kvp in toCheckpoint)
+                    GetPageFile(kvp.Key, out var physId).WritePage(physId, kvp.Value);
             }
-
-            if (toCheckpoint.Count == 0) return;
-
-            // The WAL file keeps these records until it is truncated; FreePage must still treat
-            // the pages as having a WAL image once they leave _walIndex below.
-            foreach (var kvp in toCheckpoint)
-                _checkpointedWalPages.TryAdd(kvp.Key, 0);
-
-            foreach (var kvp in toCheckpoint)
-                GetPageFile(kvp.Key, out var physId).WritePage(physId, kvp.Value);
+            finally
+            {
+                if (writeShmHeld) { try { _shm!.ReleaseWriterLock(); } catch { /* best-effort */ } }
+                if (writeCommitHeld) _commitLock.Release();
+            }
 
             // Phase 6: Parallel flush in multi-file mode.
             var flushTasks = new List<Task>();
@@ -125,7 +158,7 @@ public sealed partial class StorageEngine
             // Truncate WAL only when _walIndex is fully drained.
             if (_walIndex.IsEmpty)
             {
-                await TryTruncateWalAsync(ct).ConfigureAwait(false);
+                await TryTruncateWalCoreAsync(commitLockHeld, ct).ConfigureAwait(false);
             }
             else if (_shm != null && !_walIndex.IsEmpty)
             {
@@ -176,7 +209,10 @@ public sealed partial class StorageEngine
     /// Truncates the WAL if every committed record has been checkpointed, then releases the
     /// pages queued by <see cref="FreePage"/>. Skipped when a commit holds the lock.
     /// </summary>
-    private async Task TryTruncateWalAsync(CancellationToken ct)
+    private Task TryTruncateWalAsync(CancellationToken ct) => TryTruncateWalCoreAsync(commitLockHeld: false, ct);
+
+    /// <param name="commitLockHeld">The caller holds <c>_commitLock</c> (backup).</param>
+    private async Task TryTruncateWalCoreAsync(bool commitLockHeld, CancellationToken ct)
     {
         // _commitLock prevents truncating while the group-commit writer is appending new WAL
         // records. In multi-process mode the SHM cross-process writer lock must also be held:
@@ -184,7 +220,7 @@ public sealed partial class StorageEngine
         // only its own _commitLock, not ours), and truncating the shared WAL file underneath it
         // would corrupt the on-disk format. The lock order matches the commit path (in-process
         // _commitLock → cross-process SHM writer lock) to avoid any possible cross-lock deadlock.
-        if (!_walIndex.IsEmpty || !_commitLock.Wait(0)) return;
+        if (!_walIndex.IsEmpty || (!commitLockHeld && !_commitLock.Wait(0))) return;
 
         bool shmHeld = false;
         try
@@ -219,6 +255,10 @@ public sealed partial class StorageEngine
                     _shm.WriteWalEndOffset(0);
                     _shm.WriteCheckpointedOffset(0);
                     Volatile.Write(ref _lastKnownWalEndOffset, 0);
+
+                    // Last, so a process that sees the new generation also sees the reset end. It
+                    // then discards what it replayed from the old WAL, which is now all on disk.
+                    DiscardSharedWalState(_shm.IncrementWalGeneration());
                 }
                 OnWalTruncated();
             }
@@ -226,7 +266,7 @@ public sealed partial class StorageEngine
         finally
         {
             if (shmHeld) { try { _shm!.ReleaseWriterLock(); } catch { /* best-effort */ } }
-            _commitLock.Release();
+            if (!commitLockHeld) _commitLock.Release();
         }
     }
 
@@ -265,12 +305,11 @@ public sealed partial class StorageEngine
         List<BackupCopyOperation>? operations = null;
         try
         {
-            await CheckpointAsync(ct);
-            if (_walIndex.IsEmpty)
-            {
-                await _wal.TruncateAsync(ct).ConfigureAwait(false);
-                OnWalTruncated();
-            }
+            await CheckpointCoreAsync(commitLockHeld: true, ct).ConfigureAwait(false);
+
+            // Through the same path as a checkpoint: in multi-process mode it takes the SHM writer
+            // lock, keeps records other processes have not replayed, and starts a new WAL generation.
+            await TryTruncateWalCoreAsync(commitLockHeld: true, ct).ConfigureAwait(false);
 
             operations = BuildBackupPlan(destinationDbPath, includeIndexes);
 

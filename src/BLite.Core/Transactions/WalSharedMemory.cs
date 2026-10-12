@@ -38,7 +38,9 @@ namespace BLite.Core.Transactions;
 /// 24   8   WalEndOffset       (Interlocked)
 /// 32   8   CheckpointedOffset (Interlocked)
 /// 40   4   WriterOwnerPid     (0 = unlocked; set under writer lock)
-/// 44   20  Reserved           (padded to 64-byte header)
+/// 44   4   Reserved
+/// 48   8   WalGeneration      (Interlocked; incremented on every WAL truncation)
+/// 56   8   Reserved           (padded to 64-byte header)
 /// 64   N×16 Reader-slot array  (N = MaxReaders; per slot: long PID + long MaxReadOffset)
 /// </code>
 /// </summary>
@@ -236,6 +238,7 @@ public sealed class WalSharedMemory : IDisposable
         _accessor.Write(WalSharedMemoryLayout.OffsetWalEndOffset, 0L);
         _accessor.Write(WalSharedMemoryLayout.OffsetCheckpointedOffset, 0L);
         _accessor.Write(WalSharedMemoryLayout.OffsetWriterOwnerPid, 0);
+        _accessor.Write(WalSharedMemoryLayout.OffsetWalGeneration, 0L);
         _accessor.Flush();
     }
 
@@ -314,6 +317,28 @@ public sealed class WalSharedMemory : IDisposable
     {
         ThrowIfDisposed();
         Volatile.Write(ref RefLong(WalSharedMemoryLayout.OffsetCheckpointedOffset), offset);
+    }
+
+    /// <summary>
+    /// Reads the WAL generation: how many times the shared WAL has been truncated. Records a
+    /// process replayed from an earlier generation are stale, because the process that truncated
+    /// had checkpointed every record first. SHM files written before this field existed read 0.
+    /// </summary>
+    public long ReadWalGeneration()
+    {
+        ThrowIfDisposed();
+        return Volatile.Read(ref RefLong(WalSharedMemoryLayout.OffsetWalGeneration));
+    }
+
+    /// <summary>
+    /// Starts a new WAL generation and returns it. Called under the writer lock once the WAL has
+    /// been truncated and <c>WalEndOffset</c> reset, so a process that sees the new generation
+    /// also sees the reset offset.
+    /// </summary>
+    public long IncrementWalGeneration()
+    {
+        ThrowIfDisposed();
+        return Interlocked.Increment(ref RefLong(WalSharedMemoryLayout.OffsetWalGeneration));
     }
 
     /// <summary>
