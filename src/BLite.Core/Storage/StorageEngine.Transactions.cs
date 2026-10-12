@@ -13,52 +13,15 @@ public sealed partial class StorageEngine
         // Compare the SHM WAL end offset against the last offset this engine has
         // replayed. If another process has committed since then, replay the new
         // WAL records into _walIndex so reads in this transaction see fresh data.
-        if (_shm != null && _wal is Transactions.WriteAheadLog walForReplay)
+        // The replay runs under _commitLock (see TryCatchUpWithSharedWal); if a local commit
+        // holds it for longer than the read timeout, the transaction starts without the
+        // replay: its reads may be stale, and the next transaction or commit catches up.
+        if (_shm != null && _wal is Transactions.WriteAheadLog walForReplay
+            && _shm.ReadWalEndOffset() != Volatile.Read(ref _lastKnownWalEndOffset)
+            && _commitLock.Wait(_config.LockTimeout.ReadTimeoutMs))
         {
-            long shmEnd   = _shm.ReadWalEndOffset();
-            long lastKnown = Volatile.Read(ref _lastKnownWalEndOffset);
-
-            // Detect WAL truncation by another process: shmEnd < lastKnown means the WAL
-            // was reset to 0 by a checkpoint and new records are already being appended.
-            // Reset our bookmark so the next iteration replays from the new base.
-            if (shmEnd < lastKnown)
-            {
-                Interlocked.CompareExchange(ref _lastKnownWalEndOffset, 0, lastKnown);
-                lastKnown = Volatile.Read(ref _lastKnownWalEndOffset);
-            }
-
-            if (shmEnd > lastKnown)
-            {
-                // Attempt to claim the replay range; only the first thread wins —
-                // others will see the updated _lastKnownWalEndOffset and skip.
-                if (Interlocked.CompareExchange(ref _lastKnownWalEndOffset, shmEnd, lastKnown) == lastKnown)
-                {
-                    try
-                    {
-                        var newPages = walForReplay.ReadCommittedPagesSince(lastKnown, shmEnd);
-                        foreach (var (pid, data, walOffset) in newPages)
-                        {
-                            // Only populate _walIndex if this engine hasn't already committed
-                            // a newer local version of this page. `_walOffsets` tracks pages
-                            // committed by THIS engine; if the page is present there, our
-                            // local _walIndex already has the fresher version.
-                            if (_walOffsets == null || !_walOffsets.ContainsKey(pid))
-                            {
-                                _walIndex[pid] = data;
-                                // Record the WAL offset so CheckpointAsync can apply the
-                                // GetMinReaderOffset() safe boundary for this page (Phase 6).
-                                _walOffsets?[pid] = walOffset;
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // Best-effort: a failed replay only means stale reads,
-                        // never data corruption. Reset so the next transaction retries.
-                        Interlocked.CompareExchange(ref _lastKnownWalEndOffset, lastKnown, shmEnd);
-                    }
-                }
-            }
+            try { TryCatchUpWithSharedWal(walForReplay); }
+            finally { _commitLock.Release(); }
         }
 
         // In multi-process mode, allocate the transaction id from the shared SHM counter
@@ -89,6 +52,56 @@ public sealed partial class StorageEngine
             Success    = true,
         });
         return transaction;
+    }
+
+    /// <summary>
+    /// Replays into <c>_walIndex</c> the records other processes have committed to the shared
+    /// WAL since this engine last caught up with it, <c>[_lastKnownWalEndOffset, SHM WAL end)</c>,
+    /// and advances <c>_lastKnownWalEndOffset</c> to that end. Returns <c>false</c>, leaving the
+    /// bookmark where it was, if the records could not be read.
+    /// <para>
+    /// The caller must hold <c>_commitLock</c>, so no local commit or truncation interleaves.
+    /// The bookmark then never runs ahead of what this engine holds, which
+    /// <see cref="TryTruncateWalAsync"/> relies on: every record before it is in
+    /// <c>_walIndex</c> or already checkpointed. The replayed range runs to the end of the WAL,
+    /// so the latest committed image of each page in it is the newest there is and replaces
+    /// whatever this engine holds for that page, including an image it committed itself.
+    /// </para>
+    /// </summary>
+    private bool TryCatchUpWithSharedWal(Transactions.WriteAheadLog wal)
+    {
+        long shmEnd = _shm!.ReadWalEndOffset();
+        long lastKnown = Volatile.Read(ref _lastKnownWalEndOffset);
+
+        // shmEnd < lastKnown: another process truncated the WAL after checkpointing it, and
+        // may have appended to it since. Replay the new WAL from its start.
+        if (shmEnd < lastKnown)
+            lastKnown = 0;
+
+        if (shmEnd > lastKnown)
+        {
+            List<(uint pageId, byte[] data, long walOffset)> newPages;
+            try
+            {
+                newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd);
+            }
+            catch
+            {
+                // Stale reads until the next catch-up retries, never a skipped record.
+                return false;
+            }
+
+            foreach (var (pid, data, walOffset) in newPages)
+            {
+                _walIndex[pid] = data;
+                // Record the WAL offset so CheckpointAsync can apply the
+                // GetMinReaderOffset() safe boundary for this page (Phase 6).
+                _walOffsets?[pid] = walOffset;
+            }
+        }
+
+        Volatile.Write(ref _lastKnownWalEndOffset, shmEnd);
+        return true;
     }
 
     /// <summary>

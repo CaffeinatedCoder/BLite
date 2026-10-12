@@ -221,6 +221,87 @@ public class FreePageReuseTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task MultiProcess_CommitAfterAnotherProcessCommitted_CheckpointKeepsThatCommit()
+    {
+        var dir = _dbPath + "_mp";
+        Directory.CreateDirectory(dir);
+        var dbPath = Path.Combine(dir, "shared.db");
+        var cfg = PageFileConfig.Default with { AllowMultiProcessAccess = true };
+        try
+        {
+            using var engineA = new StorageEngine(dbPath, cfg);
+            using var engineB = new StorageEngine(dbPath, cfg);
+            var pageA = engineA.AllocatePage();
+            var pageB = engineA.AllocatePage();
+
+            // B begins before A commits, so its begin-time replay does not see A's record.
+            using (var txB = engineB.BeginTransaction())
+            {
+                await WriteAndCommitAsync(engineA, pageA, fill: 0xAA);
+
+                engineB.WritePage(pageB, txB.TransactionId, Filled(engineB.PageSize, 0xBB));
+                await txB.CommitAsync();
+            }
+
+            // B's commit must not have skipped (or overwritten) A's record: after B checkpoints,
+            // A's page is still there for B and for a process that opens the database now.
+            await engineB.CheckpointAsync();
+
+            AssertPage(engineB, pageA, 0xAA);
+            AssertPage(engineB, pageB, 0xBB);
+            using var engineC = new StorageEngine(dbPath, cfg);
+            using (engineC.BeginTransaction())
+            {
+                AssertPage(engineC, pageA, 0xAA);
+                AssertPage(engineC, pageB, 0xBB);
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task MultiProcess_PageCommittedByBothProcesses_CheckpointKeepsTheNewerImage()
+    {
+        var dir = _dbPath + "_mp";
+        Directory.CreateDirectory(dir);
+        var dbPath = Path.Combine(dir, "shared.db");
+        var cfg = PageFileConfig.Default with { AllowMultiProcessAccess = true };
+        try
+        {
+            using var engineA = new StorageEngine(dbPath, cfg);
+            using var engineB = new StorageEngine(dbPath, cfg);
+            var page = engineA.AllocatePage();
+
+            await WriteAndCommitAsync(engineB, page, fill: 0xBB);
+            await WriteAndCommitAsync(engineA, page, fill: 0xAA);
+
+            // B replays A's newer image of the page it has committed itself, then checkpoints.
+            using (engineB.BeginTransaction())
+                AssertPage(engineB, page, 0xAA);
+            await engineB.CheckpointAsync();
+
+            AssertPage(engineB, page, 0xAA);
+            using var engineC = new StorageEngine(dbPath, cfg);
+            using (engineC.BeginTransaction())
+                AssertPage(engineC, page, 0xAA);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    private static void AssertPage(StorageEngine storage, uint page, byte fill)
+    {
+        var read = new byte[storage.PageSize];
+        storage.ReadPage(page, null, read);
+        Assert.Equal(Filled(storage.PageSize, fill), read);
+    }
+
     private static async Task<uint> AllocateAndCommitAsync(StorageEngine storage, byte fill)
     {
         var page = storage.AllocatePage();
