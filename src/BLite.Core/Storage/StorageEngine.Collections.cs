@@ -93,6 +93,15 @@ public class CollectionMetadata
 
     // ── Generalized Retention Policy ──
     public RetentionPolicy? GeneralRetentionPolicy { get; set; }
+
+    // ── Required features ──
+    /// <summary>
+    /// Features this collection depends on that older versions cannot maintain; a version that
+    /// does not know one of them refuses to open or modify the collection (see
+    /// <see cref="CollectionFeatures"/>). Persisted as stored, including features this version does
+    /// not know, so a rewrite of the record never drops them.
+    /// </summary>
+    internal List<RequiredFeature> RequiredFeatures { get; } = new();
 }
 
 public class IndexMetadata
@@ -276,6 +285,19 @@ public sealed partial class StorageEngine
                     metadata.Indexes[j].KeyFormat = format;
             }
         }
+
+        // ── Required features (backward-compatible; absent = none) ────────
+        if (reader.BaseStream.Position < reader.BaseStream.Length)
+        {
+            int featureCount = reader.ReadInt32();
+            for (int j = 0; j < featureCount; j++)
+            {
+                var id          = reader.ReadString();
+                var requirement = (FeatureRequirement)reader.ReadByte();
+                var description = reader.ReadString();
+                metadata.RequiredFeatures.Add(new RequiredFeature(id, requirement, description));
+            }
+        }
         return metadata;
     }
 
@@ -363,6 +385,17 @@ public sealed partial class StorageEngine
         foreach (var idx in metadata.Indexes)
             writer.Write(idx.KeyFormat);
 
+        // ── Required features (id, requirement, description) ──────────────────
+        // Written after every older section, so releases that stop reading at the key formats
+        // load the record unchanged. New sections go after this one.
+        writer.Write(metadata.RequiredFeatures.Count);
+        foreach (var feature in metadata.RequiredFeatures)
+        {
+            writer.Write(feature.Id);
+            writer.Write((byte)feature.Requirement);
+            writer.Write(feature.Description);
+        }
+
         var newData = stream.ToArray();
         if (newData.Length + SlotEntry.Size > PageSize - SlottedPageHeader.Size)
             throw new InvalidOperationException(
@@ -372,6 +405,15 @@ public sealed partial class StorageEngine
         if (chain.Count == 0)
             throw new InvalidOperationException("Page 1 is not a collection metadata page.");
         var (foundPage, foundSlot) = FindMetadataRecord(chain, metadata.Name);
+
+        // Never rewrite the record of a collection that requires features this version lacks
+        // (see CollectionFeatures). Checked before every write path, the in-place one included.
+        // Nothing has been written yet.
+        if (foundPage >= 0
+            && TryReadRecord(chain[foundPage].Buffer, ReadSlot(chain[foundPage].Buffer, foundSlot)) is { } stored)
+        {
+            CollectionFeatures.EnsureCanWrite(stored);
+        }
 
         // ── 1. No larger than the stored record: overwrite it where it is ─────
         // A single page write. Covers the frequent saves (sequence values, root page ids) whose
@@ -612,6 +654,21 @@ public sealed partial class StorageEngine
         }
     }
 
+    /// <summary>Parses the collection record in <paramref name="slot"/>, or returns <c>null</c> if it is malformed.</summary>
+    private static CollectionMetadata? TryReadRecord(byte[] page, SlotEntry slot)
+    {
+        try
+        {
+            using var ms     = new MemoryStream(page, slot.Offset, slot.Length, false);
+            using var reader = new BinaryReader(ms);
+            return ReadCollectionMetadata(reader.ReadString(), reader);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// Marks the collection's metadata slot as deleted so that it no longer
     /// appears in <see cref="GetAllCollectionsMetadata"/> or
@@ -623,6 +680,11 @@ public sealed partial class StorageEngine
             throw new TimeoutException("Timed out acquiring metadata lock (DeleteCollectionMetadata).");
         try
         {
+        // Never drop the record of a collection that requires features this version lacks
+        // (see CollectionFeatures).
+        if (GetCollectionMetadata(name) is { } stored)
+            CollectionFeatures.EnsureCanWrite(stored);
+
         var buffer = new byte[PageSize];
         uint pageId = 1;
 

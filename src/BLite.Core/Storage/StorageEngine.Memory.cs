@@ -323,6 +323,10 @@ public sealed partial class StorageEngine
         var metadata = GetCollectionMetadata(collectionName);
         if (metadata == null) return Array.Empty<uint>();
 
+        // The pages of a feature this version lacks (e.g. an index type it does not know) cannot be
+        // found here; refuse instead of leaking them and dropping the rest.
+        CollectionFeatures.EnsureCanWrite(metadata);
+
         // Collect page IDs in a set first, then free them all — avoids modifying storage
         // while iterating over B-tree nodes (which also read from the same storage).
         var toFree = new HashSet<uint>();
