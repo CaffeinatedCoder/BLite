@@ -535,9 +535,19 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         return false;
     }
 
-    private async IAsyncEnumerable<(IndexEntry Entry, byte[] RawBytes)> EnumerateOwnedRawDocumentsAsync(
+    /// <summary>Processes the raw BSON of one document in place; returns whether to yield <paramref name="result"/>.</summary>
+    private delegate bool RawDocumentVisitor<TResult>(ReadOnlySpan<byte> bson, out TResult result);
+
+    /// <summary>
+    /// Visits the raw BSON of every document in primary-key order. Single-page documents are
+    /// handed to <paramref name="visit"/> straight from the page buffer, without a copy; only
+    /// overflow documents are reassembled. Each page is read once and kept until the scan ends:
+    /// primary-key order is not page order (ObjectIds created in the same second are not
+    /// monotonic), so a bounded window of pages would read the same pages over and over.
+    /// </summary>
+    private async IAsyncEnumerable<TResult> VisitRawDocumentsAsync<TResult>(
         ulong txnId,
-        bool includeOverflow,
+        RawDocumentVisitor<TResult> visit,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var pageCache = new Dictionary<uint, byte[]>();
@@ -550,25 +560,40 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (!pageCache.TryGetValue(entry.Location.PageId, out var cachedBuffer))
+                if (!pageCache.TryGetValue(entry.Location.PageId, out var pageBuffer))
                 {
-                    cachedBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
-                    _storage.ReadPage(entry.Location.PageId, txnId, cachedBuffer);
-                    pageCache[entry.Location.PageId] = cachedBuffer;
+                    pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
+                    _storage.ReadPage(entry.Location.PageId, txnId, pageBuffer);
+                    pageCache[entry.Location.PageId] = pageBuffer;
                 }
 
-                var rawBytes = ReadRawBytesAt(entry.Location, txnId, includeOverflow, cachedBuffer);
-                if (rawBytes is null) continue;
-                if (!MatchesIndexEntryKey(rawBytes, entry.Key)) continue;
-
-                yield return (entry, rawBytes);
+                if (TryVisitRawDocument(entry, txnId, pageBuffer, visit, out var result))
+                    yield return result;
             }
         }
         finally
         {
-            foreach (var buf in pageCache.Values)
-                ArrayPool<byte>.Shared.Return(buf);
+            foreach (var buf in pageCache.Values) ArrayPool<byte>.Shared.Return(buf);
         }
+    }
+
+    /// <summary>
+    /// Applies <paramref name="visit"/> to the document <paramref name="entry"/> points at, if that
+    /// slot still holds the document with this primary key.
+    /// </summary>
+    private bool TryVisitRawDocument<TResult>(IndexEntry entry, ulong txnId, byte[] pageBuffer, RawDocumentVisitor<TResult> visit, out TResult result)
+    {
+        result = default!;
+
+        var pageType = (PageType)pageBuffer[4];
+        if (pageType == PageType.Free || pageType == PageType.Empty || pageType == PageType.TimeSeries)
+            return false;
+
+        if (TryReadInlineRawBytes(pageBuffer, entry.Location.SlotIndex, out var inline))
+            return MatchesIndexEntryKey(inline, entry.Key) && visit(inline, out result);
+
+        var reassembled = ReadRawBytesAt(entry.Location, txnId, includeOverflow: true, pageBuffer);
+        return reassembled is not null && MatchesIndexEntryKey(reassembled, entry.Key) && visit(reassembled, out result);
     }
 
     /// <summary>
@@ -1119,10 +1144,15 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
         try
         {
-            await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+            await foreach (var document in VisitRawDocumentsAsync<T>(txnId, (ReadOnlySpan<byte> bson, out T doc) =>
+                {
+                    doc = default!;
+                    if (!predicate(new BsonSpanReader(bson, keyMap))) return false;
+                    doc = _mapper.Deserialize(new BsonSpanReader(bson, keyMap));
+                    return true;
+                }, ct).ConfigureAwait(false))
             {
-                if (!predicate(new BsonSpanReader(rawBytes, keyMap))) continue;
-                yield return _mapper.Deserialize(new BsonSpanReader(rawBytes, keyMap));
+                yield return document;
             }
         }
         finally
@@ -1284,10 +1314,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var txnId = 0UL;
         var keyMap = _storage.GetKeyReverseMap();
 
-        await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+        await foreach (var result in VisitRawDocumentsAsync<TResult>(txnId, (ReadOnlySpan<byte> bson, out TResult projected) =>
+            {
+                projected = projector(new BsonSpanReader(bson, keyMap))!;
+                return projected is not null;
+            }, ct).ConfigureAwait(false))
         {
-            var result = projector(new BsonSpanReader(rawBytes, keyMap));
-            if (result is not null) yield return result;
+            yield return result;
         }
     }
 
@@ -1310,16 +1343,20 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         int count = 0;
         var keyMap = _storage.GetKeyReverseMap();
 
-        await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+        await foreach (var _ in VisitRawDocumentsAsync<bool>(txnId, (ReadOnlySpan<byte> bson, out bool matched) =>
+            {
+                try
+                {
+                    matched = predicate(new BsonSpanReader(bson, keyMap));
+                }
+                catch
+                {
+                    matched = false; // Malformed BSON — skip silently.
+                }
+                return matched;
+            }, ct).ConfigureAwait(false))
         {
-            try
-            {
-                if (predicate(new BsonSpanReader(rawBytes, keyMap))) count++;
-            }
-            catch
-            {
-                // Malformed BSON — skip silently.
-            }
+            count++;
         }
 
         return count;
