@@ -720,7 +720,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             if (options?.RebuildIndexes == true)
             {
                 foreach (var index in _indexManager.GetAllIndexes())
+                {
+                    // RTreeIndex cannot enumerate its pages yet, so a rebuild would leak the
+                    // whole old tree on every vacuum. Spatial indexes are kept as they are.
+                    if (index.Definition.Type == IndexType.Spatial) continue;
                     await RebuildIndexFromScratchAsync(index.Name, ct).ConfigureAwait(false);
+                }
             }
 
             success = true;
@@ -1603,13 +1608,29 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     private async Task RebuildIndexFromScratchAsync(string name, CancellationToken ct)
     {
         var fresh = _indexManager.CreateUnregisteredCopy(name);
+        var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
         try
         {
-            await RebuildIndexAsync(fresh, ct, skipUnreadableDocuments: false).ConfigureAwait(false);
+            await FillIndexAsync(fresh, transaction, skipUnreadableDocuments: false, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct);
         }
         catch
         {
-            fresh.FreeAllPages(_storage);
+            // Collect the copy's pages through the transaction before rolling it back: pages added
+            // by splits are allocated outside the transaction but linked only from nodes written
+            // in it, so after the rollback they could not be found any more.
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = fresh.CollectAllPages(transaction.TransactionId); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            await transaction.RollbackAsync();
+
+            try
+            {
+                foreach (var pageId in pages)
+                    _storage.FreePage(pageId);
+            }
+            catch { /* best-effort: never mask the original failure */ }
             fresh.Dispose();
             throw;
         }
@@ -1621,30 +1642,35 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
         try
         {
-            // Iterate all documents in the collection via primary index
-            foreach (var entry in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
-            {
-                ct.ThrowIfCancellationRequested();
-                try
-                {
-                    var document = await FindByLocationAsync(entry.Location, transaction.TransactionId, ct);
-                    if (document != null)
-                    {
-                        index.Insert(document, entry.Location, transaction);
-                    }
-                }
-                catch when (skipUnreadableDocuments)
-                {
-                    // Skip documents that fail to load or index
-                    // Production: should log errors
-                }
-            }
+            await FillIndexAsync(index, transaction, skipUnreadableDocuments, ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct);
         }
         catch
         {
             await transaction.RollbackAsync();
             throw;
+        }
+    }
+
+    private async Task FillIndexAsync(CollectionSecondaryIndex<TId, T> index, ITransaction transaction, bool skipUnreadableDocuments, CancellationToken ct)
+    {
+        // Iterate all documents in the collection via primary index
+        foreach (var entry in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var document = await FindByLocationAsync(entry.Location, transaction.TransactionId, ct);
+                if (document != null)
+                {
+                    index.Insert(document, entry.Location, transaction);
+                }
+            }
+            catch when (skipUnreadableDocuments)
+            {
+                // Skip documents that fail to load or index
+                // Production: should log errors
+            }
         }
     }
 

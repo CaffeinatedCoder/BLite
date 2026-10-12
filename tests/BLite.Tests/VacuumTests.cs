@@ -1,6 +1,7 @@
 using BLite.Bson;
 using BLite.Core;
 using BLite.Core.Collections;
+using BLite.Core.Indexing;
 using BLite.Core.Storage;
 using BLite.Shared;
 
@@ -662,24 +663,62 @@ public class VacuumTests : IDisposable
     }
 
     /// <summary>
-    /// A rebuilt spatial index holds only current positions, so a moved document is no longer
-    /// found where it used to be.
+    /// Spatial indexes are not rebuilt (their pages cannot be enumerated and freed yet); the
+    /// existing R-Tree is kept and keeps answering queries.
     /// </summary>
     [Fact]
-    public async Task Vacuum_RebuildIndexes_DocumentCollection_Spatial_DropsStaleEntries()
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_Spatial_IsKept()
     {
         using var db = new TestDbContext(_dbPath);
-        var e = new GeoEntity { Name = "mover", Location = (45.0, 9.0) };
-        await db.GeoItems.InsertAsync(e);
-        e.Location = (10.0, 10.0);
-        await db.GeoItems.UpdateAsync(e);
+        await db.GeoItems.InsertAsync(new GeoEntity { Name = "milan", Location = (45.46, 9.19) });
+        uint SpatialRoot() => db.Storage.GetAllCollectionsMetadata()
+            .SelectMany(m => m.Indexes).Single(i => i.Name == "idx_spatial").RootPageId;
+        var rootBefore = SpatialRoot();
 
         await db.GeoItems.VacuumAsync(new VacuumOptions { RebuildIndexes = true });
 
-        (double, double) oldMin = (44.0, 8.0), oldMax = (46.0, 10.0);
-        (double, double) newMin = (9.0, 9.0), newMax = (11.0, 11.0);
-        Assert.Empty(db.GeoItems.AsQueryable().Where(p => p.Location.Within(oldMin, oldMax)).ToList());
-        Assert.Single(db.GeoItems.AsQueryable().Where(p => p.Location.Within(newMin, newMax)).ToList());
+        Assert.Equal(rootBefore, SpatialRoot());
+        (double, double) min = (45.0, 9.0), max = (46.0, 10.0);
+        Assert.Equal("milan", Assert.Single(db.GeoItems.AsQueryable().Where(p => p.Location.Within(min, max)).ToList()).Name);
+    }
+
+    /// <summary>
+    /// A rebuild that fails part-way keeps the old index and returns every page of the half-built
+    /// copy, including the pages its splits added, to the free list.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_FailedRebuild_KeepsIndexAndFreesCopy()
+    {
+        using var db = new TestDbContext(_dbPath);
+        var people = Enumerable.Range(0, 3000).Select(i => new PersonV2 { Name = $"p{i}", Age = i % 90 }).ToList();
+        await db.PeopleV2.InsertBulkAsync(people);
+        await db.CheckpointAsync();
+
+        // Corrupt the last document in primary-key order, so the rebuild fails after most inserts.
+        var storage = db.Storage;
+        var last = people.Select(p => p.Id).Max();
+        var primary = (BTreeIndex)typeof(DocumentCollection<ObjectId, PersonV2>)
+            .GetField("_primaryIndex", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(db.PeopleV2)!;
+        Assert.True(primary.TryFind(new IndexKey(last), out var location));
+        var page = new byte[storage.PageSize];
+        storage.ReadPage(location.PageId, null, page);
+        var slot = SlotEntry.ReadFrom(page.AsSpan(SlottedPageHeader.Size + location.SlotIndex * SlotEntry.Size));
+        page.AsSpan(slot.Offset + 4, 12).Fill(0xFF); // invalid element types
+        storage.WritePageImmediate(location.PageId, page);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
+
+        // The old index still answers queries.
+        Assert.Equal(people.Count(p => p.Age == 10), (await db.PeopleV2.QueryIndexAsync("idx_Age", 10, 10).ToListAsync()).Count);
+
+        // Pages handed out next come from the free list until it is empty; the half-built copy of
+        // a 3000-entry index spans dozens of pages, not just its root.
+        await db.CheckpointAsync();
+        var highWater = (uint)storage.GetCollectionPageIds("peoplev2_collection").Count();
+        int reused = 0;
+        while (storage.AllocatePage() < highWater) reused++;
+        Assert.True(reused > 20, $"only {reused} pages were returned to the free list");
     }
 
     /// <summary>

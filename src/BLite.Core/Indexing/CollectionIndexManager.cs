@@ -318,6 +318,8 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     {
         lock (_lock)
         {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
@@ -333,6 +335,8 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     {
         lock (_lock)
         {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
