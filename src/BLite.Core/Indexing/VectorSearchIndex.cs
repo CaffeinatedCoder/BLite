@@ -519,6 +519,9 @@ public sealed class VectorSearchIndex
     /// Marks the node that stores <paramref name="vector"/> for <paramref name="docLocation"/> as
     /// deleted. The node keeps its vector and links so the graph stays connected, but search no
     /// longer returns it. Deleted nodes are dropped when the index is rebuilt.
+    /// Search keeps expanding deleted nodes until it holds <c>ef</c> live ones, so when fewer
+    /// than <c>ef</c> live nodes are reachable, query cost grows with the number of deleted
+    /// nodes; rebuild the index (<see cref="VacuumOptions.RebuildIndexes"/>) to remove them.
     /// </summary>
     /// <returns><c>false</c> if no such node exists.</returns>
     public bool Delete(float[] vector, DocumentLocation docLocation, ITransaction? transaction = null)

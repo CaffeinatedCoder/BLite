@@ -288,4 +288,38 @@ public class SpatialVectorIndexMaintenanceTests : IDisposable
                 try { if (File.Exists(f)) File.Delete(f); } catch { /* best-effort */ }
         }
     }
+
+    // ── Statistics ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// An update that gives a document a key, or takes it away, changes the index's document
+    /// count like an insert or delete would, whether the document stays in its slot or moves.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Update_BetweenNullAndNonNullKey_AdjustsEstimatedDocumentCount(bool relocating)
+    {
+        var people = _db.PeopleWithEmbeddedAddress;
+        // Read the index directly: GetIndexes() caches its result until the set of indexes changes.
+        long Count() => people.IndexManager.GetAllIndexes().Select(i => i.GetInfo())
+            .Single(i => i.PropertyPaths[0].StartsWith("MainAddress", StringComparison.OrdinalIgnoreCase))
+            .EstimatedDocumentCount;
+        // In place: each update is smaller than the stored document. Relocating: each one is larger.
+        string Name(int step) => new string('x', relocating ? 1000 * step : 1000 / step);
+
+        var p = new PersonWithEmbeddedAddress { Id = 1, Name = Name(1) };
+        await people.InsertAsync(p);
+        Assert.Equal(0, Count());
+
+        p.MainAddress = new Address { City = new City { Name = "Milan" } };
+        p.Name = Name(2);
+        await people.UpdateAsync(p);
+        Assert.Equal(1, Count());
+
+        p.MainAddress = null;
+        p.Name = Name(3);
+        await people.UpdateAsync(p);
+        Assert.Equal(0, Count());
+    }
 }

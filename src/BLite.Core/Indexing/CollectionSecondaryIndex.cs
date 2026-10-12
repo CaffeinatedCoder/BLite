@@ -109,16 +109,15 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     }
 
     /// <summary>
-    /// Updates a document in this index (delete old, insert new).
-    /// This optimization applies only for in-place updates where the physical location
-    /// is unchanged and the old index entry remains valid. For non-in-place (relocating)
-    /// updates, callers must use <c>InsertInAll</c> directly after <c>DeleteFromAll</c>
-    /// has already been called (e.g., via <c>DeleteCore</c>).
+    /// Updates a document in this index, for both in-place and relocating updates.
+    /// If the key is unchanged and the document did not move, the existing entry is kept;
+    /// if only the location changed, the entry is re-pointed to <paramref name="newLocation"/>;
+    /// otherwise the old entry is removed and the new one inserted.
     /// </summary>
     /// <param name="oldDocument">Old version of document</param>
     /// <param name="newDocument">New version of document</param>
     /// <param name="oldLocation">Physical location of old document</param>
-    /// <param name="newLocation">Physical location of new document (must equal oldLocation for this method)</param>
+    /// <param name="newLocation">Physical location of new document (may differ from <paramref name="oldLocation"/>)</param>
     /// <param name="transaction">Optional transaction</param>
     public void Update(T oldDocument, T newDocument, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction transaction)
     {
@@ -156,6 +155,12 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         // Insert new entry if it has a key
         if (newKey != null)
             InsertKey(newKey, newDocument, newLocation, transaction);
+
+        // Keep the count in line with Insert/Delete, which skip documents without a key.
+        if (oldKey == null && newKey != null)
+            System.Threading.Interlocked.Increment(ref _documentCount);
+        else if (oldKey != null && newKey == null)
+            System.Threading.Interlocked.Decrement(ref _documentCount);
     }
 
     /// <summary>
