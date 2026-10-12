@@ -481,13 +481,13 @@ public sealed class VectorSearchIndex
         // 2. Comprehensive search on level 0
         var nearest = SearchLayer(currentPoint, query, Math.Max(efSearch, k), 0, transaction);
         
-        // 3. Return top-k results.
+        // 3. Return top-k results, skipping deleted nodes.
         // SearchLayer already computed distances; we retrieve location + vector together
         // in a single page read to avoid the double-LoadVector that the old code did.
         int count = 0;
         foreach (var node in nearest)
         {
-            if (count++ >= k) break;
+            if (count >= k) break;
 
             var buffer = RentPageBuffer();
             try
@@ -495,11 +495,87 @@ public sealed class VectorSearchIndex
                 _storage.ReadPage(node.PageId, transaction?.TransactionId, buffer);
                 float[] vec = new float[_options.Dimensions];
                 VectorPage.ReadNodeData(buffer, node.NodeIndex, out var loc, out _, vec);
+                if (loc.PageId == 0) continue;
+
+                count++;
                 float dist = VectorMath.Distance(query, vec, _options.Metric);
                 yield return new VectorSearchResult(loc, dist);
             }
             finally { ReturnPageBuffer(buffer); }
         }
+    }
+
+    /// <summary>
+    /// Marks the node that stores <paramref name="vector"/> for <paramref name="docLocation"/> as
+    /// deleted. The node keeps its vector and links so the graph stays connected, but search no
+    /// longer returns it. Deleted nodes are dropped when the index is rebuilt.
+    /// </summary>
+    /// <returns><c>false</c> if no such node exists.</returns>
+    public bool Delete(float[] vector, DocumentLocation docLocation, ITransaction? transaction = null)
+        => RewriteLocation(vector, docLocation, default, transaction);
+
+    /// <summary>
+    /// Points the node that stores <paramref name="vector"/> for <paramref name="oldLocation"/> at
+    /// <paramref name="newLocation"/>, for a document that moved without changing its vector.
+    /// </summary>
+    /// <returns><c>false</c> if no such node exists.</returns>
+    public bool Relocate(float[] vector, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction? transaction = null)
+        => RewriteLocation(vector, oldLocation, newLocation, transaction);
+
+    /// <summary>
+    /// Finds one node holding exactly <paramref name="vector"/> for <paramref name="from"/> and
+    /// rewrites its location. A search for the vector itself finds the node in practice; the
+    /// page scan behind it only runs if the approximate search misses.
+    /// </summary>
+    private bool RewriteLocation(float[] vector, DocumentLocation from, DocumentLocation to, ITransaction? transaction)
+    {
+        if (vector.Length != _options.Dimensions || from.PageId == 0) return false;
+        if (!TryGetEntryPoint(transaction?.TransactionId ?? 0, out var entryPoint)) return false;
+
+        var buffer = RentPageBuffer();
+        var stored = new float[_options.Dimensions];
+        try
+        {
+            bool IsTarget(int nodeIndex)
+            {
+                var loc = VectorPage.ReadLocation(buffer, nodeIndex);
+                if (loc.PageId != from.PageId || loc.SlotIndex != from.SlotIndex) return false;
+                VectorPage.ReadNodeData(buffer, nodeIndex, out _, out _, stored);
+                return stored.AsSpan().SequenceEqual(vector);
+            }
+
+            void Rewrite(uint pageId, int nodeIndex)
+            {
+                VectorPage.WriteLocation(buffer, nodeIndex, to);
+                WritePage(pageId, transaction, buffer);
+            }
+
+            var currentPoint = entryPoint;
+            for (int l = entryPoint.MaxLevel; l > 0; l--)
+                currentPoint = GreedySearch(currentPoint, vector, l, transaction);
+
+            foreach (var node in SearchLayer(currentPoint, vector, _options.EfConstruction, 0, transaction))
+            {
+                _storage.ReadPage(node.PageId, transaction?.TransactionId, buffer);
+                if (!IsTarget(node.NodeIndex)) continue;
+                Rewrite(node.PageId, node.NodeIndex);
+                return true;
+            }
+
+            for (uint pageId = _rootPageId; pageId != 0; pageId = PageHeader.ReadFrom(buffer).NextPageId)
+            {
+                _storage.ReadPage(pageId, transaction?.TransactionId, buffer);
+                int nodeCount = VectorPage.GetNodeCount(buffer);
+                for (int i = 0; i < nodeCount; i++)
+                {
+                    if (!IsTarget(i)) continue;
+                    Rewrite(pageId, i);
+                    return true;
+                }
+            }
+            return false;
+        }
+        finally { ReturnPageBuffer(buffer); }
     }
 
     private DocumentLocation LoadDocumentLocation(NodeReference node, ITransaction? transaction)
