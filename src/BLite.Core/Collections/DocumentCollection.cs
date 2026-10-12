@@ -3419,6 +3419,291 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     /// <summary>
+    /// Computes <c>Sum</c>, <c>Average</c>, <c>Min</c> or <c>Max</c> of <paramref name="selector"/> over
+    /// the documents matching <paramref name="whereClause"/> without materialising them, with the
+    /// result LINQ would compute over the entities. Returns <c>Handled = false</c> when the query
+    /// must run the usual way.
+    /// <list type="number">
+    ///   <item>An <c>int</c>/<c>long</c> property with a B-Tree index, and no filter or one the same
+    ///         index covers exactly, is aggregated from the index keys alone (<c>Min</c>/<c>Max</c>
+    ///         read one entry).</item>
+    ///   <item>Otherwise, when no index serves the filter, the property is read from the raw BSON
+    ///         of each document in primary-key order, the order a scan yields the entities in. A
+    ///         document without the field, or holding a type the entity would not be read from
+    ///         unchanged, ends the attempt so the query runs the usual way.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="selector">A plain property access, <c>x =&gt; x.Property</c>.</param>
+    /// <param name="resultType">The result type of the LINQ operator.</param>
+    [RequiresDynamicCode("Aggregate push-down uses index optimization and Expression.Compile() which require dynamic code generation.")]
+    [RequiresUnreferencedCode("Aggregate push-down uses reflection to resolve members at runtime. Ensure all entity types are preserved.")]
+    internal Task<(bool Handled, object? Value)> TryAggregateAsync(
+        AggregateOperator op,
+        LambdaExpression selector,
+        LambdaExpression? whereClause,
+        Type resultType,
+        CancellationToken ct = default)
+    {
+        if (selector.Body is not MemberExpression { Member: System.Reflection.PropertyInfo property } member
+            || member.Expression != selector.Parameters[0]
+            || selector.ReturnType != property.PropertyType
+            || ConverterRegistry.HasConverter(property.Name))
+            return Task.FromResult<(bool, object?)>(default);
+
+        var valueType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+        bool nullable = valueType != property.PropertyType;
+
+        if (valueType == typeof(int)) return TryAggregateAsync<int>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(long)) return TryAggregateAsync<long>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(double)) return TryAggregateAsync<double>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(float)) return TryAggregateAsync<float>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(decimal)) return TryAggregateAsync<decimal>(op, property, nullable, whereClause, resultType, ct);
+        return Task.FromResult<(bool, object?)>(default);
+    }
+
+    [RequiresDynamicCode("Aggregate push-down uses index optimization and Expression.Compile() which require dynamic code generation.")]
+    [RequiresUnreferencedCode("Aggregate push-down uses reflection to resolve members at runtime. Ensure all entity types are preserved.")]
+    private async Task<(bool Handled, object? Value)> TryAggregateAsync<TValue>(
+        AggregateOperator op,
+        System.Reflection.PropertyInfo property,
+        bool nullable,
+        LambdaExpression? whereClause,
+        Type resultType,
+        CancellationToken ct)
+        where TValue : struct, IComparable<TValue>
+    {
+        if (LinqAggregate<TValue>.ResultType(op, nullable) != resultType)
+            return default;
+
+        var plan = whereClause == null ? null : Query.IndexOptimizer.TryOptimize<T>(whereClause, GetIndexes(), ConverterRegistry);
+
+        // Index keys hold the exact int/long value. Not for the other types: floating-point sums
+        // depend on the order of the values, decimal keys drop trailing zeros (1.50 → 1.5), and the
+        // first of equal Min/Max values wins (-0.0 vs 0.0, 1.0 vs 1.00).
+        if (typeof(TValue) == typeof(int) || typeof(TValue) == typeof(long))
+        {
+            var index = _indexManager.GetAllIndexes().FirstOrDefault(i =>
+                i.Definition.Type == IndexType.BTree
+                && !i.Definition.IsPrimary
+                && i.Definition.PropertyPaths.Length == 1
+                && i.Definition.PropertyPaths[0] == property.Name);
+
+            if (index != null)
+            {
+                if (whereClause == null)
+                    return AggregateIndexKeys<TValue>(op, nullable, index, null, null, true, true);
+
+                if (plan != null
+                    && plan.IndexName == index.Name
+                    && !plan.HasResiduePredicate
+                    && !plan.IsVectorSearch
+                    && !plan.IsSpatialSearch
+                    && plan.InValues == null
+                    && plan.MinValue is not DBNull
+                    && plan.MaxValue is not DBNull)
+                    return AggregateIndexKeys<TValue>(op, nullable, index, plan.MinValue, plan.MaxValue, plan.StartInclusive, plan.EndInclusive);
+            }
+        }
+
+        // An index serves the filter: fetching the matching documents through it is cheaper than
+        // scanning them all, and keeps the order the values are aggregated in unchanged.
+        if (plan != null || IsRenamedInBson(property))
+            return default;
+
+        BsonReaderPredicate? predicate = null;
+        if (whereClause != null)
+        {
+            predicate = BsonExpressionEvaluator.TryCompile<T>(whereClause, ConverterRegistry, _storage.GetKeyMap());
+            if (predicate == null) return default;
+        }
+
+        return await AggregateRawFieldAsync<TValue>(op, nullable, ProjectionAnalyzer.ToBsonName(property.Name), predicate, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Aggregates the values of the index entries in the given range from their keys.</summary>
+    private static (bool Handled, object? Value) AggregateIndexKeys<TValue>(
+        AggregateOperator op,
+        bool nullable,
+        CollectionSecondaryIndex<TId, T> index,
+        object? min,
+        object? max,
+        bool startInclusive,
+        bool endInclusive)
+        where TValue : struct, IComparable<TValue>
+    {
+        var aggregate = new LinqAggregate<TValue>(op, nullable, exactTotal: true);
+
+        if (op == AggregateOperator.Max)
+        {
+            // Keys are [value][document id]: the last entry holds the largest value.
+            var last = index.LastKey(min, max, startInclusive, endInclusive);
+            if (last is { } key)
+            {
+                if (!IndexKeyValueVisitor<TValue>.TryDecode(key.Data, out var value)) return default;
+                aggregate.Add(value);
+            }
+            return (true, aggregate.Result());
+        }
+
+        var visitor = new IndexKeyValueVisitor<TValue>(aggregate, stopAfterFirst: op == AggregateOperator.Min);
+        index.ScanKeys(min, max, startInclusive, endInclusive, ref visitor);
+        return visitor.Malformed ? default : (true, aggregate.Result());
+    }
+
+    /// <summary>
+    /// Feeds the value prefix of each <c>[value][document id]</c> key of an <c>int</c> or
+    /// <c>long</c> index to a <see cref="LinqAggregate{TValue}"/>.
+    /// </summary>
+    private struct IndexKeyValueVisitor<TValue> : BTreeIndex.IKeyVisitor
+        where TValue : struct, IComparable<TValue>
+    {
+        private readonly LinqAggregate<TValue> _aggregate;
+        private readonly bool _stopAfterFirst;
+
+        public IndexKeyValueVisitor(LinqAggregate<TValue> aggregate, bool stopAfterFirst)
+        {
+            _aggregate = aggregate;
+            _stopAfterFirst = stopAfterFirst;
+            Malformed = false;
+        }
+
+        /// <summary>A key did not start with an encoded value of the expected type.</summary>
+        public bool Malformed { get; private set; }
+
+        public bool Visit(ReadOnlySpan<byte> key)
+        {
+            if (!TryDecode(key, out var value))
+            {
+                Malformed = true;
+                return false;
+            }
+            _aggregate.Add(value);
+            return !_stopAfterFirst;
+        }
+
+        /// <summary>Decodes the <see cref="IndexKey(int)"/> / <see cref="IndexKey(long)"/> prefix of a key.</summary>
+        public static bool TryDecode(ReadOnlySpan<byte> key, out TValue value)
+        {
+            value = default;
+            if (key.Length == 0 || key[0] != IndexKey.KeyPrefix) return false;
+
+            if (typeof(TValue) == typeof(int))
+            {
+                if (key.Length < 5) return false;
+                value = (TValue)(object)(int)(BinaryPrimitives.ReadUInt32BigEndian(key.Slice(1)) ^ 0x8000_0000u);
+                return true;
+            }
+            if (typeof(TValue) == typeof(long))
+            {
+                if (key.Length < 9) return false;
+                value = (TValue)(object)(long)(BinaryPrimitives.ReadUInt64BigEndian(key.Slice(1)) ^ 0x8000_0000_0000_0000UL);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="property"/> is stored under a name other than the convention
+    /// <see cref="ProjectionAnalyzer.ToBsonName"/> follows, through the attributes the mapper
+    /// generator honours (<c>[BsonProperty]</c>, <c>[JsonPropertyName]</c>, <c>[Column]</c>).
+    /// </summary>
+    private static bool IsRenamedInBson(System.Reflection.PropertyInfo property)
+    {
+        foreach (var attribute in property.GetCustomAttributes(inherit: true))
+        {
+            var name = attribute.GetType().Name;
+            if (name is "BsonPropertyAttribute" or "BsonProperty"
+                or "JsonPropertyNameAttribute" or "JsonPropertyName"
+                or "ColumnAttribute" or "Column")
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Aggregates field <paramref name="fieldName"/> of every document matching
+    /// <paramref name="predicate"/> from raw BSON, in primary-key order. Gives up (<c>Handled =
+    /// false</c>) on a document without the field, with a BSON type other than the one the mapper
+    /// writes for <typeparamref name="TValue"/> (or <c>null</c> for a nullable property), or that
+    /// fails to evaluate, since materialising the entity could then yield a different value.
+    /// </summary>
+    private async Task<(bool Handled, object? Value)> AggregateRawFieldAsync<TValue>(
+        AggregateOperator op,
+        bool nullable,
+        string fieldName,
+        BsonReaderPredicate? predicate,
+        CancellationToken ct)
+        where TValue : struct, IComparable<TValue>
+    {
+        if (!_storage.GetKeyMap().TryGetValue(fieldName, out var fieldId))
+            return default; // never written: every document lacks it
+
+        var expectedType =
+            typeof(TValue) == typeof(int) ? BsonType.Int32 :
+            typeof(TValue) == typeof(long) ? BsonType.Int64 :
+            typeof(TValue) == typeof(decimal) ? BsonType.Decimal128 :
+            BsonType.Double; // double and float
+        var keyMap = _storage.GetKeyReverseMap();
+        var aggregate = new LinqAggregate<TValue>(op, nullable);
+
+        // Adds the document's value if it matches; false to give up.
+        bool Fold(ReadOnlySpan<byte> bson)
+        {
+            try
+            {
+                if (predicate != null && !predicate(new BsonSpanReader(bson, keyMap)))
+                    return true;
+
+                var reader = new BsonSpanReader(bson, keyMap);
+                reader.ReadDocumentSize();
+                if (!reader.TrySeekToField(fieldId, out var type) && !SeekField(ref reader, fieldName, out type))
+                    return false;
+
+                if (type == BsonType.Null)
+                    return nullable;
+                if (type != expectedType)
+                    return false;
+
+                aggregate.Add(ReadValue<TValue>(ref reader));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // The scan yields only for a document that ends the attempt.
+        await foreach (var _ in VisitRawDocumentsAsync<bool>(0UL, (ReadOnlySpan<byte> bson, out bool giveUp) => giveUp = !Fold(bson), ct).ConfigureAwait(false))
+            return default;
+
+        return (true, aggregate.Result());
+
+        static bool SeekField(ref BsonSpanReader reader, string name, out BsonType type)
+        {
+            while (reader.Remaining > 1)
+            {
+                type = reader.ReadBsonType();
+                if (type == BsonType.EndOfDocument) break;
+                if (reader.ReadElementHeader() == name) return true;
+                reader.SkipValue(type);
+            }
+            type = BsonType.EndOfDocument;
+            return false;
+        }
+
+        static TV ReadValue<TV>(ref BsonSpanReader reader)
+        {
+            if (typeof(TV) == typeof(int)) return (TV)(object)reader.ReadInt32();
+            if (typeof(TV) == typeof(long)) return (TV)(object)reader.ReadInt64();
+            if (typeof(TV) == typeof(double)) return (TV)(object)reader.ReadDouble();
+            if (typeof(TV) == typeof(float)) return (TV)(object)(float)reader.ReadDouble();
+            return (TV)(object)reader.ReadDecimal128();
+        }
+    }
+
+    /// <summary>
     /// Queries the collection using an expression tree predicate, enabling index optimisation.
     /// When the predicate references an indexed field the query engine performs a BTree lookup
     /// instead of a full collection scan.
