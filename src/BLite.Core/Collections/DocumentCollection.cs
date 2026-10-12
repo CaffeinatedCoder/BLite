@@ -884,7 +884,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             try
             {
                 var fresh = _indexManager.CreateUnregistered(index.Definition);
-                fresh.KeyFormat = IndexMetadata.CurrentKeyFormat;
+                fresh.KeyFormat = fresh.TargetKeyFormat;
                 // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
                 // A document that cannot be loaded fails the migration rather than silently leaving
                 // the rebuilt index incomplete.
@@ -894,7 +894,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
-                    $"Failed to rebuild index '{name}' of collection '{_collectionName}' with the exact decimal key format; the migration is retried on the next open.", ex);
+                    $"Failed to rebuild index '{name}' of collection '{_collectionName}' in its current key format; the migration is retried on the next open.", ex);
             }
         }
     }
@@ -1012,8 +1012,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             throw new TimeoutException("Timed out acquiring collection write lock (CreateFullTextIndexAsync).");
         try
         {
+            var existing = _indexManager.GetIndex(CollectionIndexManager<TId, T>.ResolveIndexName(keySelector, name, IndexType.FullText));
+            if (existing != null && existing.Definition.Type != IndexType.FullText)
+                throw new InvalidOperationException($"Index '{existing.Name}' already exists and is not a full-text index.");
+
             var builder = new Metadata.IndexBuilder<T>(keySelector, name, false, IndexType.FullText);
-            await Task.Run(() => ApplyIndexBuilder(builder), ct).ConfigureAwait(false);
+            await Task.Run(() => ApplyIndexBuilder(builder, ct), ct).ConfigureAwait(false);
         }
         finally
         {
@@ -1105,7 +1109,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder)
+    internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder, CancellationToken ct = default)
     {
         var name = CollectionIndexManager<TId, T>.ResolveIndexName(builder.KeySelector, builder.Name, builder.Type);
         if (_indexManager.GetIndex(name) != null)
@@ -1120,7 +1124,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         try
         {
             // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
-            Task.Run(() => FillUnregisteredIndexAsync(index, CancellationToken.None)).GetAwaiter().GetResult();
+            Task.Run(() => FillUnregisteredIndexAsync(index, ct)).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -3669,11 +3673,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
                 else if (indexOpt.IsFullTextSearch)
                 {
+                    // Every hit is re-checked with the full predicate: a posting left behind by an
+                    // analyzer change must not surface the document that now holds its location.
                     var ftsIndex = _indexManager.GetIndex(indexOpt.IndexName)!;
                     foreach (var location in ftsIndex.FullTextMatch(indexOpt.FullTextQuery!, transaction))
                     {
                         var item = await FindByLocationAsync(location, transaction?.TransactionId ?? 0UL, ct);
-                        if (item != null && (indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact || GetCompiled()(item))) { yield return item; if (++yielded >= fetchLimit) yield break; }
+                        if (item != null && GetCompiled()(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
                     }
                 }
                 else if (indexOpt.IsSpatialSearch)
@@ -3930,7 +3936,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         {
             ct.ThrowIfCancellationRequested();
             var doc = await FindByLocationAsync(location, 0UL, ct);
-            if (doc != null) yield return new FullTextSearchResult<T>(doc, score);
+            if (doc != null && index.FullTextContains(doc, query, matchAllTerms))
+                yield return new FullTextSearchResult<T>(doc, score);
         }
     }
 

@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BLite.Bson;
+using BLite.Core.Text;
 using BLite.Core.Audit;
 using BLite.Core.CDC;
 using BLite.Core.Collections;
@@ -115,6 +116,7 @@ public sealed class DynamicCollection : IDisposable
         _isPageLocked = _storage.IsPageLocked;
 
         // Load or create collection metadata
+        var staleFullTextIndexes = new List<string>();
         var metadata = _storage.GetCollectionMetadata(_collectionName);
         uint primaryRootPageId = 0;
 
@@ -168,6 +170,8 @@ public sealed class DynamicCollection : IDisposable
                         var opts = IndexOptions.CreateBTree(idxMeta.PropertyPaths);
                         var fullText = new FullTextIndex(_storage, opts, idxMeta.RootPageId);
                         _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(fullText, fieldPath, opts);
+                        if (idxMeta.KeyFormat != FullTextIndex.FormatVersion || fullText.HasForeignKeys())
+                            staleFullTextIndexes.Add(idxMeta.Name);
                         break;
                     }
                 }
@@ -205,8 +209,45 @@ public sealed class DynamicCollection : IDisposable
         if (rootsChanged)
             _storage.SaveCollectionMetadata(metadata);
 
+        // A full-text index written with another analyzer or key layout is rebuilt: deleting a
+        // document relies on reproducing the keys it was indexed under.
+        foreach (var name in staleFullTextIndexes)
+            RebuildFullTextIndex(name);
+
         // Rebuild the free-space index from existing page headers on cold start.
         RebuildFreeSpaceIndex();
+    }
+
+    /// <summary>
+    /// Rebuilds full-text index <paramref name="name"/> into a fresh tree, swaps it in once the
+    /// rebuild committed, persists it with the current format version and frees the old tree.
+    /// </summary>
+    private void RebuildFullTextIndex(string name)
+    {
+        var old = _secondaryIndexes[name];
+        var fresh = new DynamicSecondaryIndex(new FullTextIndex(_storage, old.Options), old.FieldPath, old.Options);
+        var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        try
+        {
+            foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+            {
+                var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
+                if (doc != null) IndexInsert(fresh, doc, e.Location, transaction);
+            }
+            // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+            Task.Run(async () => await transaction.CommitAsync()).GetAwaiter().GetResult();
+        }
+        catch
+        {
+            Task.Run(async () => await transaction.RollbackAsync()).GetAwaiter().GetResult();
+            throw;
+        }
+
+        var oldPages = old.FullText!.CollectAllPages();
+        _secondaryIndexes[name] = fresh;
+        PersistIndexMetadata();
+        foreach (var pageId in oldPages)
+            _storage.FreePage(pageId);
     }
 
     private void RebuildFreeSpaceIndex()
@@ -1009,15 +1050,26 @@ public sealed class DynamicCollection : IDisposable
     /// <c>true</c> (the default) to return only documents containing every query term;
     /// <c>false</c> to return documents containing any of them, ranked by relevance.
     /// </param>
-    public async IAsyncEnumerable<FullTextSearchResult<BsonDocument>> FullTextSearchAsync(string indexName, string query, int k, bool matchAllTerms = true)
+    public async IAsyncEnumerable<FullTextSearchResult<BsonDocument>> FullTextSearchAsync(
+        string indexName,
+        string query,
+        int k,
+        bool matchAllTerms = true,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         if (!_secondaryIndexes.TryGetValue(indexName, out var entry) || entry.Kind != DynamicIndexKind.FullText || entry.FullText == null)
             throw new ArgumentException($"Full-text index '{indexName}' not found on collection '{_collectionName}'");
 
         foreach (var (location, score) in entry.FullText.Search(query, k, matchAllTerms, null))
         {
+            ct.ThrowIfCancellationRequested();
             var doc = ReadDocumentAt(location, 0UL);
-            if (doc != null) yield return new FullTextSearchResult<BsonDocument>(doc, score);
+            if (doc == null) continue;
+
+            // Re-check the hit, so a stale posting can never surface another document.
+            var text = TryGetNestedValue(doc, entry.FieldPath, out var val) && val.IsString ? val.AsString : null;
+            if (matchAllTerms ? FullTextAnalyzer.Matches(text, query) : FullTextAnalyzer.MatchesAny(text, query))
+                yield return new FullTextSearchResult<BsonDocument>(doc, score);
         }
     }
 
@@ -1928,6 +1980,7 @@ public sealed class DynamicCollection : IDisposable
                     break;
                 case DynamicIndexKind.FullText:
                     idxMeta.Type = IndexType.FullText;
+                    idxMeta.KeyFormat = FullTextIndex.FormatVersion;
                     break;
             }
 

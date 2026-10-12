@@ -10,20 +10,36 @@ namespace BLite.Core.Indexing;
 /// Inverted index for full-text search, stored in a single B-Tree.
 /// <list type="bullet">
 ///   <item>Posting, one per distinct term of a document:
-///   <c>[0x01][term UTF-8][0x00][location (6)][term frequency u16][document length u32]</c>,
+///   <c>[0x10][term UTF-8][0x00][location (6)][term frequency u16][document length u32]</c>,
 ///   pointing at the document. The term frequency and length make BM25 scoring possible from the
 ///   postings alone; deleting a document recomputes the same keys from its old text.</item>
-///   <item>Statistics, a single entry: <c>[0x02][documents u64][terms u64]</c>, the number of
+///   <item>Statistics, a single entry: <c>[0x20][documents u64][terms u64]</c>, the number of
 ///   indexed documents and their total length, maintained in the same transaction as the
 ///   postings.</item>
 /// </list>
+/// The tags cannot start a key that an older BLite (which reads this tree as a plain B-Tree index)
+/// writes: those begin with <c>0x00</c>-<c>0x03</c>, so such keys stay outside every range read here,
+/// and <see cref="HasForeignKeys"/> detects them so the index is rebuilt on open.
 /// Terms come from <see cref="FullTextAnalyzer"/>; a document without any term is not indexed.
+/// <para>
+/// Every write updates the single statistics entry, so two explicit transactions writing to the
+/// same collection concurrently lose one of the updates (BLite has no write-write conflict
+/// detection between transactions). Searches stay correct, but scores drift until the index is
+/// rebuilt.
+/// </para>
 /// </summary>
 internal sealed class FullTextIndex
 {
-    private const byte PostingTag = 0x01;
-    private const byte StatsTag = 0x02;
+    /// <summary>
+    /// Version of the analyzer and key layout, recorded as the index's <c>KeyFormat</c>. An index
+    /// written with another version is rebuilt on open, since deletes rely on reproducing the keys.
+    /// </summary>
+    internal const byte FormatVersion = 1;
+
+    private const byte PostingTag = 0x10;
+    private const byte StatsTag = 0x20;
     private const byte TermEnd = 0x00;
+    private const int StatsKeyLength = 17;
 
     // BM25 parameters (Robertson et al.; the usual defaults, also used by SQLite FTS5 and Lucene).
     private const double K1 = 1.2;
@@ -31,6 +47,7 @@ internal sealed class FullTextIndex
 
     private static readonly IndexKey StatsMin = IndexKey.FromOwnedArray([StatsTag]);
     private static readonly IndexKey StatsMax = IndexKey.FromOwnedArray([StatsTag + 1]);
+    private static readonly IndexKey AfterPostings = IndexKey.FromOwnedArray([PostingTag + 1]);
 
     private readonly BTreeIndex _tree;
 
@@ -45,6 +62,30 @@ internal sealed class FullTextIndex
 
     /// <summary>The index pages as <paramref name="transactionId"/> sees them.</summary>
     public IReadOnlyList<uint> CollectAllPages(ulong transactionId) => _tree.CollectAllPages(transactionId);
+
+    /// <summary>
+    /// Whether the tree holds a key this index did not write, such as one inserted by an older BLite
+    /// that read the tree as a plain B-Tree index. Such an index is also missing the postings of those
+    /// writes, so it must be rebuilt. Reads at most the first key and the keys after the postings.
+    /// </summary>
+    public bool HasForeignKeys()
+    {
+        foreach (var entry in _tree.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, null))
+        {
+            var first = entry.Key.Data;
+            if (first.Length == 0 || (first[0] != PostingTag && first[0] != StatsTag)) return true;
+            break;
+        }
+
+        // After the postings only the single statistics entry may follow.
+        int count = 0;
+        foreach (var entry in _tree.Range(AfterPostings, IndexKey.MaxKey, IndexDirection.Forward, null))
+        {
+            var key = entry.Key.Data;
+            if (++count > 1 || key.Length != StatsKeyLength || key[0] != StatsTag) return true;
+        }
+        return false;
+    }
 
     public void Insert(string? text, DocumentLocation location, ITransaction? transaction)
     {
@@ -106,39 +147,95 @@ internal sealed class FullTextIndex
         if (terms.Count == 0 || k <= 0) return Array.Empty<(DocumentLocation, double)>();
 
         var txnId = transaction?.TransactionId;
+
+        // Rarest term first: with matchAllTerms its postings bound the candidate set.
+        var ordered = terms
+            .Select(t => (Term: t, Count: _tree.CountRange(TermMin(t), TermMax(t), txnId)))
+            .OrderBy(t => t.Count)
+            .ToList();
+        if (matchAllTerms && ordered[0].Count == 0) return Array.Empty<(DocumentLocation, double)>();
+
+        var perTerm = new List<(int DocumentFrequency, List<(DocumentLocation Location, int Frequency, int Length)> Postings)>();
+        Dictionary<ulong, DocumentLocation>? candidates = null;
+        foreach (var (term, count) in ordered)
+        {
+            if (count == 0) continue;
+
+            // Once the candidates are few, look each one up instead of reading every posting of a
+            // much more common term.
+            var postings = candidates != null && candidates.Count * 8 < count
+                ? candidates.Values.Select(l => TryPosting(term, l, txnId)).Where(p => p.HasValue).Select(p => p!.Value).ToList()
+                : Postings(term, txnId).ToList();
+
+            if (matchAllTerms)
+            {
+                var next = new Dictionary<ulong, DocumentLocation>();
+                foreach (var p in postings)
+                {
+                    var key = Pack(p.Location);
+                    if (candidates == null || candidates.ContainsKey(key)) next[key] = p.Location;
+                }
+                if (next.Count == 0) return Array.Empty<(DocumentLocation, double)>();
+                candidates = next;
+            }
+            perTerm.Add((count, postings));
+        }
+        if (perTerm.Count == 0) return Array.Empty<(DocumentLocation, double)>();
+
         var (documents, totalLength) = ReadStats(txnId);
-        if (documents == 0) return Array.Empty<(DocumentLocation, double)>();
+        if (documents <= 0 || totalLength <= 0)
+        {
+            // No statistics (e.g. a concurrent transaction's update won): estimate them from the
+            // postings at hand rather than return nothing while Match still finds the documents.
+            var lengths = perTerm.SelectMany(t => t.Postings).GroupBy(p => Pack(p.Location)).Select(g => g.First().Length).ToList();
+            documents = Math.Max(1, perTerm.Max(t => t.DocumentFrequency));
+            totalLength = Math.Max(1, (long)(lengths.Average() * documents));
+        }
         double averageLength = (double)totalLength / documents;
 
-        var scores = new Dictionary<ulong, (DocumentLocation Location, double Score, int Terms)>();
-        foreach (var term in terms)
+        var scores = new Dictionary<ulong, (DocumentLocation Location, double Score)>();
+        foreach (var (df, postings) in perTerm)
         {
-            var postings = Postings(term, txnId).ToList();
-            if (postings.Count == 0)
-            {
-                if (matchAllTerms) return Array.Empty<(DocumentLocation, double)>();
-                continue;
-            }
-
-            double idf = Math.Log(1 + (documents - postings.Count + 0.5) / (postings.Count + 0.5));
+            double idf = Math.Log(1 + (documents - df + 0.5) / (df + 0.5));
             foreach (var p in postings)
             {
+                var key = Pack(p.Location);
+                if (candidates != null && !candidates.ContainsKey(key)) continue;
                 double weight = idf * p.Frequency * (K1 + 1)
                               / (p.Frequency + K1 * (1 - B + B * p.Length / averageLength));
-                var key = Pack(p.Location);
-                scores[key] = scores.TryGetValue(key, out var s)
-                    ? (s.Location, s.Score + weight, s.Terms + 1)
-                    : (p.Location, weight, 1);
+                scores[key] = scores.TryGetValue(key, out var s) ? (s.Location, s.Score + weight) : (p.Location, weight);
             }
         }
 
         return scores.Values
-            .Where(s => !matchAllTerms || s.Terms == terms.Count)
             .OrderByDescending(s => s.Score)
             .ThenBy(s => Pack(s.Location))
             .Take(k)
-            .Select(s => (s.Location, s.Score))
             .ToList();
+    }
+
+    /// <summary>The posting of <paramref name="term"/> for the document at <paramref name="location"/>, if any.</summary>
+    private (DocumentLocation Location, int Frequency, int Length)? TryPosting(string term, DocumentLocation location, ulong? txnId)
+    {
+        int termBytes = Encoding.UTF8.GetByteCount(term);
+        int prefixLength = 2 + termBytes + DocumentLocation.SerializedSize;
+        var min = new byte[prefixLength];
+        min[0] = PostingTag;
+        Encoding.UTF8.GetBytes(term, 0, term.Length, min, 1);
+        min[1 + termBytes] = TermEnd;
+        location.WriteTo(min.AsSpan(2 + termBytes));
+        var max = new byte[prefixLength + 6];
+        min.CopyTo(max, 0);
+        max.AsSpan(prefixLength).Fill(0xFF);
+
+        foreach (var entry in _tree.Range(IndexKey.FromOwnedArray(min), IndexKey.FromOwnedArray(max), IndexDirection.Forward, txnId))
+        {
+            var key = entry.Key.Data;
+            return (entry.Location,
+                    BinaryPrimitives.ReadUInt16BigEndian(key.Slice(prefixLength)),
+                    (int)BinaryPrimitives.ReadUInt32BigEndian(key.Slice(prefixLength + 2)));
+        }
+        return null;
     }
 
     private IEnumerable<(DocumentLocation Location, int Frequency, int Length)> Postings(string term, ulong? txnId)
@@ -158,6 +255,7 @@ internal sealed class FullTextIndex
         foreach (var entry in _tree.Range(StatsMin, StatsMax, IndexDirection.Forward, txnId))
         {
             var key = entry.Key.Data;
+            if (key.Length != StatsKeyLength) continue; // not written by this index: ignore
             return ((long)BinaryPrimitives.ReadUInt64BigEndian(key.Slice(1)),
                     (long)BinaryPrimitives.ReadUInt64BigEndian(key.Slice(9)));
         }
@@ -170,6 +268,7 @@ internal sealed class FullTextIndex
         foreach (var entry in _tree.Range(StatsMin, StatsMax, IndexDirection.Forward, txnId))
         {
             var key = entry.Key.Data;
+            if (key.Length != StatsKeyLength) continue; // not written by this index: ignore
             currentDocuments = (long)BinaryPrimitives.ReadUInt64BigEndian(key.Slice(1));
             currentLength = (long)BinaryPrimitives.ReadUInt64BigEndian(key.Slice(9));
             _tree.Delete(entry.Key, entry.Location, txnId);
@@ -180,7 +279,7 @@ internal sealed class FullTextIndex
         long newLength = currentLength + length;
         if (newDocuments <= 0) return;
 
-        var stats = new byte[17];
+        var stats = new byte[StatsKeyLength];
         stats[0] = StatsTag;
         BinaryPrimitives.WriteUInt64BigEndian(stats.AsSpan(1), (ulong)newDocuments);
         BinaryPrimitives.WriteUInt64BigEndian(stats.AsSpan(9), (ulong)Math.Max(0, newLength));
@@ -202,7 +301,7 @@ internal sealed class FullTextIndex
         return IndexKey.FromOwnedArray(key);
     }
 
-    // [0x01][term][0x00] .. [0x01][term][0x01]: every posting of exactly this term. A longer term
+    // [0x10][term][0x00] .. [0x10][term][0x01]: every posting of exactly this term. A longer term
     // sharing the prefix has a letter or digit (> 0x01) where these bounds have 0x00 / 0x01.
     private static IndexKey TermMin(string term) => TermBound(term, TermEnd);
     private static IndexKey TermMax(string term) => TermBound(term, TermEnd + 1);

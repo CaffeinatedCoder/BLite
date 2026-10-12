@@ -93,6 +93,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             _btreeIndex = null;
             _vectorIndex = null;
             _spatialIndex = null;
+            KeyFormat = FullTextIndex.FormatVersion;
         }
         else
         {
@@ -742,10 +743,27 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
 
     /// <summary>
     /// True when this B-tree index keys a <c>decimal</c> property and its pages still use the legacy
-    /// format, i.e. hold <c>(double)value</c> keys that the exact decimal encoding cannot match.
+    /// format, i.e. hold <c>(double)value</c> keys that the exact decimal encoding cannot match; or
+    /// when this full-text index was written with another analyzer version or holds keys it did not
+    /// write (e.g. from an older BLite that read it as a plain B-tree).
     /// </summary>
     internal bool NeedsKeyFormatMigration =>
-        _btreeIndex != null && KeyFormat < IndexMetadata.CurrentKeyFormat && IsDecimalKeyed;
+        (_btreeIndex != null && KeyFormat < IndexMetadata.CurrentKeyFormat && IsDecimalKeyed)
+        || (_fullTextIndex != null && (KeyFormat != FullTextIndex.FormatVersion || _fullTextIndex.HasForeignKeys()));
+
+    /// <summary>The key format a rebuilt copy of this index is written in.</summary>
+    internal byte TargetKeyFormat => _fullTextIndex != null ? FullTextIndex.FormatVersion : IndexMetadata.CurrentKeyFormat;
+
+    /// <summary>
+    /// Whether the indexed text of <paramref name="document"/> contains every term of
+    /// <paramref name="query"/> (or, with <paramref name="matchAllTerms"/> false, at least one).
+    /// Used to re-check full-text hits, so a stale posting can never surface another document.
+    /// </summary>
+    internal bool FullTextContains(T document, string query, bool matchAllTerms)
+    {
+        var text = _definition.TryGetKey(document, out var key) ? key as string : null;
+        return matchAllTerms ? Text.FullTextAnalyzer.Matches(text, query) : Text.FullTextAnalyzer.MatchesAny(text, query);
+    }
 
     // ── ICollectionIndex metadata pass-throughs ─────────────────────────────
 

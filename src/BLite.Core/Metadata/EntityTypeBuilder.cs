@@ -85,6 +85,11 @@ public class EntityTypeBuilder<T> : IGdprModeAccessor where T : class
     /// Declares a full-text index on a string property, queried with
     /// <see cref="FullTextExtensions.FullTextMatch"/> in LINQ or ranked with
     /// <c>DocumentCollection.FullTextSearchAsync</c>. The default name is <c>idx_fts_{property}</c>.
+    /// <para>
+    /// Each document touches one index page per distinct term, so single-document writes cost
+    /// noticeably more than without the index; insert and update in batches
+    /// (<c>InsertBulkAsync</c> or one explicit transaction) where possible.
+    /// </para>
     /// </summary>
     public EntityTypeBuilder<T> HasFullTextIndex(Expression<Func<T, string?>> keySelector, string? name = null)
     {

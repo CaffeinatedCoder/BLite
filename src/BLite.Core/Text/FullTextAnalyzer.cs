@@ -13,7 +13,9 @@ namespace BLite.Core.Text;
 /// </para>
 /// <para>
 /// Scripts written without spaces between words, such as Chinese or Japanese, are not segmented:
-/// each run of letters is one term.
+/// each run of letters is one term (and is then cut to <see cref="MaxTermBytes"/>, about ten
+/// ideographs). Characters outside the Basic Multilingual Plane, such as emoji or supplementary
+/// letters, are treated as separators.
 /// </para>
 /// </summary>
 internal static class FullTextAnalyzer
@@ -65,6 +67,22 @@ internal static class FullTextAnalyzer
                 return false;
         }
         return true;
+    }
+
+    /// <summary>Whether <paramref name="text"/> contains at least one term of <paramref name="query"/>.</summary>
+    public static bool MatchesAny(string? text, string? query)
+    {
+        var queryTerms = QueryTerms(query);
+        if (queryTerms.Count == 0)
+            return false;
+
+        var textTerms = new HashSet<string>(Terms(text), StringComparer.Ordinal);
+        foreach (var term in queryTerms)
+        {
+            if (textTerms.Contains(term))
+                return true;
+        }
+        return false;
     }
 
     private static IEnumerable<string> Terms(string? text)
