@@ -150,6 +150,55 @@ public class NearWithinCorrectnessTests : IDisposable
             .ToList());
     }
 
+    [Fact]
+    public async Task VectorSearch_FollowedByGroupByOrAggregate_UsesTheIndexResult()
+    {
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "A", Embedding = [0f, 0f, 0f] });
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "A", Embedding = [1f, 1f, 1f] });
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "B", Embedding = [50f, 50f, 50f] });
+        float[] query = [0f, 0f, 0f];
+
+        var groups = _db.VectorItems.AsQueryable()
+            .Where(x => x.Embedding.VectorSearch(query, 2))
+            .GroupBy(x => x.Title)
+            .Select(g => new { g.Key, Count = g.Count() })
+            .ToList();
+        var sum = _db.VectorItems.AsQueryable()
+            .Where(x => x.Embedding.VectorSearch(query, 2))
+            .Sum(x => (int)x.Embedding[0]);
+
+        Assert.Equal("A", Assert.Single(groups).Key);
+        Assert.Equal(2, groups[0].Count);
+        Assert.Equal(1, sum);
+    }
+
+    [Fact]
+    public async Task NearOrNear_OnTheSameIndex_ReturnsDocumentsNearEither()
+    {
+        await _db.GeoItems.InsertAsync(new GeoEntity { Name = "Milan", Location = (45.47, 9.19) });
+        await _db.GeoItems.InsertAsync(new GeoEntity { Name = "New York", Location = (40.72, -74.0) });
+        await _db.GeoItems.InsertAsync(new GeoEntity { Name = "Tokyo", Location = (35.68, 139.69) });
+
+        var results = _db.GeoItems.AsQueryable()
+            .Where(p => p.Location.Near(Milan, 10.0) || p.Location.Near(NewYork, 10.0))
+            .ToList()
+            .Select(p => p.Name).OrderBy(n => n).ToList();
+
+        Assert.Equal(new[] { "Milan", "New York" }, results);
+    }
+
+    [Fact]
+    public async Task TwoVectorSearches_ExplainThatOnlyOneIsSupported()
+    {
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "A", Embedding = [0f, 0f, 0f] });
+        float[] q1 = [0f, 0f, 0f], q2 = [1f, 1f, 1f];
+
+        var ex = Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+            .Where(x => x.Embedding.VectorSearch(q1, 1) && x.Embedding.VectorSearch(q2, 1))
+            .ToList());
+        Assert.Contains("only one VectorSearch", ex.Message);
+    }
+
     // ── DynamicCollection ───────────────────────────────────────────────────
 
     [Fact]

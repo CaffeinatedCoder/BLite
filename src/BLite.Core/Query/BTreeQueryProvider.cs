@@ -311,6 +311,11 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // pipeline cannot model.  We still benefit from index / BSON-scan fetch,
         // then let EnumerableRewriter translate the remaining Queryable calls to
         // Enumerable equivalents and compile the residual expression once.
+        // FetchAsync applied the WHERE. A VectorSearch term in it was served by the index (otherwise
+        // the fetch would have thrown evaluating it), so the in-memory replay treats it as satisfied.
+        if (whereAlreadyApplied)
+            expression = VectorSearchSatisfiedRewriter.Instance.Visit(expression);
+
         if (model.HasComplexOperators)
             return ExecuteViaEnumerableRewriter<TResult>(expression, sourceData);
 
@@ -635,6 +640,17 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     }
 
     // ─── Expression-tree helpers ──────────────────────────────────────────────
+
+    /// <summary>Replaces every <c>VectorSearch</c> call with <c>true</c>.</summary>
+    private sealed class VectorSearchSatisfiedRewriter : ExpressionVisitor
+    {
+        public static readonly VectorSearchSatisfiedRewriter Instance = new();
+
+        protected override Expression VisitMethodCall(MethodCallExpression node)
+            => node.Method.DeclaringType == typeof(VectorSearchExtensions)
+                ? Expression.Constant(true)
+                : base.VisitMethodCall(node);
+    }
 
     /// <summary>
     /// Fallback for queries containing operators the direct pipeline cannot handle

@@ -32,5 +32,6 @@ public static class VectorSearchExtensions
 
     private static NotSupportedException NotEvaluable() => new(
         "VectorSearch selects the k nearest neighbours of the whole collection and cannot be evaluated per document. " +
-        "Use it on a property with a vector index, either on its own or combined with other conditions using &&.");
+        "Use it on a property with a vector index, either on its own or combined with other conditions using &&; " +
+        "a query can contain only one VectorSearch.");
 }

@@ -19,7 +19,9 @@ public static class GeoSpatialExtensions
     /// <summary>
     /// Performs a geospatial bounding box search (Within) on a coordinate tuple property.
     /// The LINQ query provider serves it from an R-Tree index when one exists; otherwise it is
-    /// evaluated per document. The box includes its edges.
+    /// evaluated per document. The box includes its edges and does not wrap across the ±180°
+    /// meridian: a <paramref name="min"/> longitude greater than the <paramref name="max"/>
+    /// longitude matches nothing.
     /// </summary>
     /// <param name="point">The coordinate tuple (Latitude, Longitude) property of the entity.</param>
     /// <param name="min">The minimum (Latitude, Longitude) of the bounding box.</param>

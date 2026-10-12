@@ -217,6 +217,8 @@ internal static class IndexOptimizer
 
             if (left != null && right != null &&
                 left.IndexName == right.IndexName &&
+                !left.IsSpatialSearch && !right.IsSpatialSearch &&
+                !left.IsVectorSearch && !right.IsVectorSearch &&
                 left.FilterCompleteness == FilterCompleteness.Exact &&
                 right.FilterCompleteness == FilterCompleteness.Exact &&
                 TryGetPointValues(left, out var leftValues) &&
