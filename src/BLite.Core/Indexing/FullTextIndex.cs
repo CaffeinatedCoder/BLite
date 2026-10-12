@@ -120,7 +120,8 @@ internal sealed class FullTextIndex
         if (terms.Count == 0) return Array.Empty<DocumentLocation>();
 
         var txnId = transaction?.TransactionId;
-        // Start from the rarest term so the candidate list is as short as possible.
+        // Start from the rarest term so the candidate list is as short as possible. Counting a term
+        // (CountRange) still walks all of its leaf entries, without decoding or allocating them.
         var ordered = terms
             .Select(t => (Term: t, Count: _tree.CountRange(TermMin(t), TermMax(t), txnId)))
             .OrderBy(t => t.Count)
@@ -148,7 +149,8 @@ internal sealed class FullTextIndex
 
         var txnId = transaction?.TransactionId;
 
-        // Rarest term first: with matchAllTerms its postings bound the candidate set.
+        // Rarest term first: with matchAllTerms its postings bound the candidate set. Counting a term
+        // (CountRange) still walks all of its leaf entries, without decoding or allocating them.
         var ordered = terms
             .Select(t => (Term: t, Count: _tree.CountRange(TermMin(t), TermMax(t), txnId)))
             .OrderBy(t => t.Count)
@@ -161,8 +163,9 @@ internal sealed class FullTextIndex
         {
             if (count == 0) continue;
 
-            // Once the candidates are few, look each one up instead of reading every posting of a
-            // much more common term.
+            // Once the candidates are few, look each one up instead of decoding every posting of a
+            // much more common term. This saves decoding and allocation, not I/O: CountRange above
+            // has already read that term's leaf pages.
             var postings = candidates != null && candidates.Count * 8 < count
                 ? candidates.Values.Select(l => TryPosting(term, l, txnId)).Where(p => p.HasValue).Select(p => p!.Value).ToList()
                 : Postings(term, txnId).ToList();
