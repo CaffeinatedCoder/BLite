@@ -199,6 +199,89 @@ public class NearWithinCorrectnessTests : IDisposable
         Assert.Contains("only one VectorSearch", ex.Message);
     }
 
+    // Only the VectorSearch in a Where that FetchAsync applied is served by the index. One in a
+    // projection, a group or an aggregate after the fetch must still throw, not match everything.
+
+    private static readonly float[] Q = [0f, 0f, 0f];
+
+    private async Task InsertVectorProbeDataAsync()
+    {
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "A", Embedding = [0f, 0f, 0f] });
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "A", Embedding = [1f, 1f, 1f] });
+        await _db.VectorItems.InsertAsync(new VectorEntity { Title = "B", Embedding = [50f, 50f, 50f] });
+    }
+
+    [Fact]
+    public async Task VectorSearch_InWhereThenProjectionOrderedAfterSelect_UsesTheIndexResult()
+    {
+        await InsertVectorProbeDataAsync();
+
+        var titles = _db.VectorItems.AsQueryable()
+            .Where(x => x.Embedding.VectorSearch(Q, 2))
+            .Select(x => new { x.Title })
+            .OrderBy(a => a.Title)
+            .ToList();
+
+        Assert.Equal(new[] { "A", "A" }, titles.Select(a => a.Title));
+    }
+
+    [Fact]
+    public async Task VectorSearch_InProjection_AfterIndexedVectorWhere_Throws()
+    {
+        await InsertVectorProbeDataAsync();
+        float[] q2 = [1f, 1f, 1f];
+
+        Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+            .Where(x => x.Embedding.VectorSearch(Q, 2))
+            .Select(x => new { x.Title, ok = x.Embedding.VectorSearch(q2, 1) })
+            .OrderBy(a => a.Title)
+            .ToList());
+    }
+
+    [Fact]
+    public async Task VectorSearch_InProjection_AfterOtherWhere_Throws()
+    {
+        await InsertVectorProbeDataAsync();
+
+        Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+            .Where(x => x.Title != null)
+            .Select(x => new { x.Title, ok = x.Embedding.VectorSearch(Q, 1) })
+            .OrderBy(a => a.Title)
+            .ToList());
+    }
+
+    [Fact]
+    public async Task VectorSearch_InGroupCount_AfterOtherWhere_Throws()
+    {
+        await InsertVectorProbeDataAsync();
+
+        Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+            .Where(x => x.Title != null)
+            .GroupBy(x => x.Title)
+            .Select(g => new { g.Key, Count = g.Count(x => x.Embedding.VectorSearch(Q, 1)) })
+            .ToList());
+    }
+
+    [Fact]
+    public async Task VectorSearch_InSumSelector_AfterOtherWhere_Throws()
+    {
+        await InsertVectorProbeDataAsync();
+
+        Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+            .Where(x => x.Title != null)
+            .Sum(x => x.Embedding.VectorSearch(Q, 1) ? 1 : 0));
+    }
+
+    [Fact]
+    public async Task VectorSearch_InCountPredicate_AfterOtherWhere_Throws()
+    {
+        await InsertVectorProbeDataAsync();
+
+        Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+            .Where(x => x.Title != null)
+            .Count(x => x.Embedding.VectorSearch(Q, 1)));
+    }
+
     // ── DynamicCollection ───────────────────────────────────────────────────
 
     [Fact]
