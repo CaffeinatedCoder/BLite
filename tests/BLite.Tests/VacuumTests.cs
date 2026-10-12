@@ -3,6 +3,7 @@ using BLite.Core;
 using BLite.Core.Collections;
 using BLite.Core.Indexing;
 using BLite.Core.Storage;
+using BLite.Core.Transactions;
 using BLite.Shared;
 
 namespace BLite.Tests;
@@ -690,11 +691,99 @@ public class VacuumTests : IDisposable
     public async Task Vacuum_RebuildIndexes_DocumentCollection_FailedRebuild_KeepsIndexAndFreesCopy()
     {
         using var db = new TestDbContext(_dbPath);
+        var people = await InsertPeopleAsync(db);
+        var queryAge = await CorruptLastDocumentAsync(db);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
+
+        // The old index still answers queries.
+        Assert.Equal(people.Count(p => p.Age == queryAge), (await db.PeopleV2.QueryIndexAsync("idx_Age", queryAge, queryAge).ToListAsync()).Count);
+        await AssertCopyWasFreedAsync(db);
+    }
+
+    /// <summary>
+    /// If the abort record of a failed rebuild cannot be written either, the rebuild's own failure
+    /// is what surfaces, and the half-built copy is still freed.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_FailedRollback_KeepsOriginalErrorAndFreesCopy()
+    {
+        using var db = new TestDbContext(_dbPath);
+        var people = await InsertPeopleAsync(db);
+        var queryAge = await CorruptLastDocumentAsync(db);
+
+        var walField = typeof(StorageEngine).GetField("_wal", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var wal = (IWriteAheadLog)walField.GetValue(db.Storage)!;
+        walField.SetValue(db.Storage, new AbortRecordFailingWal(wal));
+        Exception ex;
+        try
+        {
+            ex = await Assert.ThrowsAnyAsync<Exception>(() => db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
+        }
+        finally
+        {
+            walField.SetValue(db.Storage, wal);
+        }
+
+        Assert.IsNotType<AbortRecordFailedException>(ex);
+        Assert.Equal(people.Count(p => p.Age == queryAge), (await db.PeopleV2.QueryIndexAsync("idx_Age", queryAge, queryAge).ToListAsync()).Count);
+        await AssertCopyWasFreedAsync(db);
+    }
+
+    /// <summary>
+    /// If the rebuilt copy committed but cannot be swapped in (here: its metadata cannot be saved),
+    /// the old index stays in place, in memory and on disk, and the copy's pages are freed.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_FailedSwap_KeepsIndexAndFreesCopy()
+    {
+        int expected;
+        using (var db = new TestDbContext(_dbPath))
+        {
+            var people = await InsertPeopleAsync(db);
+            expected = people.Count(p => p.Age == 7);
+            uint StoredRoot() => db.Storage.GetCollectionMetadata("peoplev2_collection")!
+                .Indexes.Single(i => i.Name == "idx_Age").RootPageId;
+            var rootBefore = StoredRoot();
+
+            // Hold the metadata lock so saving the new root times out.
+            var metadataLock = (SemaphoreSlim)typeof(StorageEngine)
+                .GetField("_metadataLock", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+                .GetValue(db.Storage)!;
+            metadataLock.Wait();
+            try
+            {
+                await Assert.ThrowsAsync<TimeoutException>(() => db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
+            }
+            finally
+            {
+                metadataLock.Release();
+            }
+
+            Assert.Equal(rootBefore, StoredRoot());
+            Assert.Equal(rootBefore, db.PeopleV2.IndexManager.GetIndex("idx_Age")!.RootPageId);
+            Assert.Equal(expected, (await db.PeopleV2.QueryIndexAsync("idx_Age", 7, 7).ToListAsync()).Count);
+            await AssertCopyWasFreedAsync(db);
+        }
+
+        using (var db = new TestDbContext(_dbPath))
+            Assert.Equal(expected, (await db.PeopleV2.QueryIndexAsync("idx_Age", 7, 7).ToListAsync()).Count);
+    }
+
+    private static async Task<List<PersonV2>> InsertPeopleAsync(TestDbContext db)
+    {
         var people = Enumerable.Range(0, 3000).Select(i => new PersonV2 { Name = $"p{i}", Age = i % 90 }).ToList();
         await db.PeopleV2.InsertBulkAsync(people);
         await db.CheckpointAsync();
+        return people;
+    }
 
-        // Corrupt the last document in primary-key order, so the rebuild fails after most inserts.
+    /// <summary>
+    /// Corrupts the last document in primary-key order, so a rebuild fails after most inserts.
+    /// Returns an age that the corrupted document does not have, to query afterwards.
+    /// </summary>
+    private static async Task<int> CorruptLastDocumentAsync(TestDbContext db)
+    {
         var storage = db.Storage;
         var primary = (BTreeIndex)typeof(DocumentCollection<ObjectId, PersonV2>)
             .GetField("_primaryIndex", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
@@ -702,22 +791,23 @@ public class VacuumTests : IDisposable
         var lastEntry = primary.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Backward).First();
         var location = lastEntry.Location;
         var corruptedAge = (await db.PeopleV2.FindByIdAsync(lastEntry.Key.As<ObjectId>()))!.Age;
-        var queryAge = (corruptedAge + 1) % 90;
         var page = new byte[storage.PageSize];
         storage.ReadPage(location.PageId, null, page);
         var slot = SlotEntry.ReadFrom(page.AsSpan(SlottedPageHeader.Size + location.SlotIndex * SlotEntry.Size));
         page.AsSpan(slot.Offset + 4, 12).Fill(0xFF); // invalid element types
         storage.WritePageImmediate(location.PageId, page);
+        return (corruptedAge + 1) % 90;
+    }
 
-        await Assert.ThrowsAnyAsync<Exception>(() => db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
-
-        // The old index still answers queries.
-        Assert.Equal(people.Count(p => p.Age == queryAge), (await db.PeopleV2.QueryIndexAsync("idx_Age", queryAge, queryAge).ToListAsync()).Count);
-
-        // The half-built copy of a 3000-entry index spans dozens of pages, not just its root. Each
-        // is either back on the free list (handed out next, below the high-water mark) or still
-        // queued for the next WAL truncation (a recycled page with a WAL image; a background
-        // checkpoint can make the explicit one below return without truncating).
+    /// <summary>
+    /// The copy of a 3000-entry index spans dozens of pages, not just its root. Each is either
+    /// back on the free list (handed out next, below the high-water mark) or still queued for the
+    /// next WAL truncation (a recycled page with a WAL image; a background checkpoint can make the
+    /// explicit one below return without truncating).
+    /// </summary>
+    private static async Task AssertCopyWasFreedAsync(TestDbContext db)
+    {
+        var storage = db.Storage;
         await db.CheckpointAsync();
         var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
         int queued = ((HashSet<uint>)typeof(StorageEngine).GetField("_pendingFreePages", flags)!.GetValue(storage)!).Count;
@@ -725,6 +815,22 @@ public class VacuumTests : IDisposable
         int reused = 0;
         while (storage.AllocatePage() < highWater) reused++;
         Assert.True(reused + queued > 20, $"only {reused} pages were returned to the free list and {queued} queued");
+    }
+
+    private sealed class AbortRecordFailedException() : IOException("abort record could not be written");
+
+    /// <summary>Delegates to the real WAL but fails to write abort records.</summary>
+    private sealed class AbortRecordFailingWal(IWriteAheadLog inner) : IWriteAheadLog
+    {
+        public ValueTask WriteBeginRecordAsync(ulong transactionId, CancellationToken ct = default) => inner.WriteBeginRecordAsync(transactionId, ct);
+        public ValueTask WriteCommitRecordAsync(ulong transactionId, CancellationToken ct = default) => inner.WriteCommitRecordAsync(transactionId, ct);
+        public ValueTask WriteAbortRecordAsync(ulong transactionId, CancellationToken ct = default) => throw new AbortRecordFailedException();
+        public ValueTask WriteDataRecordAsync(ulong transactionId, uint pageId, ReadOnlyMemory<byte> afterImage, CancellationToken ct = default) => inner.WriteDataRecordAsync(transactionId, pageId, afterImage, ct);
+        public Task FlushAsync(CancellationToken ct = default) => inner.FlushAsync(ct);
+        public long GetCurrentSize() => inner.GetCurrentSize();
+        public Task TruncateAsync(CancellationToken ct = default) => inner.TruncateAsync(ct);
+        public List<WalRecord> ReadAll() => inner.ReadAll();
+        public void Dispose() { }
     }
 
     /// <summary>

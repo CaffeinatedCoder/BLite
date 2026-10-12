@@ -329,7 +329,8 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
 
     /// <summary>
     /// Registers <paramref name="fresh"/> under <paramref name="name"/>, persists its root page
-    /// and frees the pages of the index it replaces.
+    /// and frees the pages of the index it replaces. If the metadata cannot be saved, the old
+    /// index stays registered and <paramref name="fresh"/> remains the caller's to release.
     /// </summary>
     internal void ReplaceIndex(string name, CollectionSecondaryIndex<TId, T> fresh)
     {
@@ -345,7 +346,18 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
 
             // Persist the new root before freeing the old tree: a crash in between leaks the old
             // pages, whereas the reverse order would let the next open free them a second time.
-            SaveMetadata();
+            try
+            {
+                SaveMetadata();
+            }
+            catch
+            {
+                // Keep the old index registered, matching the metadata on disk; the caller still
+                // owns the copy.
+                _indexes[name] = old;
+                UpdateMetadata();
+                throw;
+            }
             old.FreeAllPages(_storage);
             old.Dispose();
         }

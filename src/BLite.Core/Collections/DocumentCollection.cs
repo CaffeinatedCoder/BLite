@@ -1623,18 +1623,40 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             try { pages = fresh.CollectAllPages(transaction.TransactionId); }
             catch { /* best-effort: never mask the original failure */ }
 
-            await transaction.RollbackAsync();
-
-            try
-            {
-                foreach (var pageId in pages)
-                    _storage.FreePage(pageId);
-            }
+            try { await transaction.RollbackAsync(); }
             catch { /* best-effort: never mask the original failure */ }
-            fresh.Dispose();
+
+            FreeUnregisteredCopy(fresh, pages);
             throw;
         }
-        _indexManager.ReplaceIndex(name, fresh);
+
+        try
+        {
+            _indexManager.ReplaceIndex(name, fresh);
+        }
+        catch
+        {
+            // The copy is committed but, unless the swap itself went through, nothing refers to it.
+            if (!ReferenceEquals(_indexManager.GetIndex(name), fresh))
+            {
+                IReadOnlyList<uint> pages = Array.Empty<uint>();
+                try { pages = fresh.CollectAllPages(0); }
+                catch { /* best-effort: never mask the original failure */ }
+                FreeUnregisteredCopy(fresh, pages);
+            }
+            throw;
+        }
+    }
+
+    private void FreeUnregisteredCopy(CollectionSecondaryIndex<TId, T> copy, IReadOnlyList<uint> pages)
+    {
+        try
+        {
+            foreach (var pageId in pages)
+                _storage.FreePage(pageId);
+        }
+        catch { /* best-effort: never mask the original failure */ }
+        copy.Dispose();
     }
 
     private async Task RebuildIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct = default, bool skipUnreadableDocuments = true)
