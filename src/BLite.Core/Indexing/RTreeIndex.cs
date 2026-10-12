@@ -57,16 +57,20 @@ internal class RTreeIndex : IDisposable
 
     /// <summary>
     /// Locations of the indexed points within <paramref name="radiusKm"/> of the center. The tree
-    /// is searched with the circle's bounding box, then each hit is checked against the
-    /// great-circle distance, so points in the box corners are left out.
+    /// is searched with boxes covering the circle (split at the ±180° meridian, widened to all
+    /// longitudes around a pole), then each hit is checked against the great-circle distance,
+    /// so points in the box corners are left out.
     /// </summary>
     public IEnumerable<DocumentLocation> SearchNear(double latitude, double longitude, double radiusKm, ITransaction? transaction = null)
     {
-        var box = SpatialMath.BoundingBox(latitude, longitude, radiusKm);
-        foreach (var (mbr, location) in SearchEntries(box, transaction))
+        // The boxes never overlap, so no point is returned twice.
+        foreach (var box in SpatialMath.NearQueryBoxes(latitude, longitude, radiusKm))
         {
-            if (SpatialMath.DistanceKm(mbr.MinLat, mbr.MinLon, latitude, longitude) <= radiusKm)
-                yield return location;
+            foreach (var (mbr, location) in SearchEntries(box, transaction))
+            {
+                if (SpatialMath.DistanceKm(mbr.MinLat, mbr.MinLon, latitude, longitude) <= radiusKm)
+                    yield return location;
+            }
         }
     }
 
