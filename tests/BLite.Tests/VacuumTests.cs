@@ -696,11 +696,13 @@ public class VacuumTests : IDisposable
 
         // Corrupt the last document in primary-key order, so the rebuild fails after most inserts.
         var storage = db.Storage;
-        var last = people.Select(p => p.Id).Max();
         var primary = (BTreeIndex)typeof(DocumentCollection<ObjectId, PersonV2>)
             .GetField("_primaryIndex", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
             .GetValue(db.PeopleV2)!;
-        Assert.True(primary.TryFind(new IndexKey(last), out var location));
+        var lastEntry = primary.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Backward).First();
+        var location = lastEntry.Location;
+        var corruptedAge = (await db.PeopleV2.FindByIdAsync(lastEntry.Key.As<ObjectId>()))!.Age;
+        var queryAge = (corruptedAge + 1) % 90;
         var page = new byte[storage.PageSize];
         storage.ReadPage(location.PageId, null, page);
         var slot = SlotEntry.ReadFrom(page.AsSpan(SlottedPageHeader.Size + location.SlotIndex * SlotEntry.Size));
@@ -710,15 +712,19 @@ public class VacuumTests : IDisposable
         await Assert.ThrowsAnyAsync<Exception>(() => db.PeopleV2.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
 
         // The old index still answers queries.
-        Assert.Equal(people.Count(p => p.Age == 10), (await db.PeopleV2.QueryIndexAsync("idx_Age", 10, 10).ToListAsync()).Count);
+        Assert.Equal(people.Count(p => p.Age == queryAge), (await db.PeopleV2.QueryIndexAsync("idx_Age", queryAge, queryAge).ToListAsync()).Count);
 
-        // Pages handed out next come from the free list until it is empty; the half-built copy of
-        // a 3000-entry index spans dozens of pages, not just its root.
+        // The half-built copy of a 3000-entry index spans dozens of pages, not just its root. Each
+        // is either back on the free list (handed out next, below the high-water mark) or still
+        // queued for the next WAL truncation (a recycled page with a WAL image; a background
+        // checkpoint can make the explicit one below return without truncating).
         await db.CheckpointAsync();
-        var highWater = (uint)storage.GetCollectionPageIds("peoplev2_collection").Count();
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        int queued = ((HashSet<uint>)typeof(StorageEngine).GetField("_pendingFreePages", flags)!.GetValue(storage)!).Count;
+        var highWater = ((IPageStorage)typeof(StorageEngine).GetField("_pageFile", flags)!.GetValue(storage)!).NextPageId;
         int reused = 0;
         while (storage.AllocatePage() < highWater) reused++;
-        Assert.True(reused > 20, $"only {reused} pages were returned to the free list");
+        Assert.True(reused + queued > 20, $"only {reused} pages were returned to the free list and {queued} queued");
     }
 
     /// <summary>
