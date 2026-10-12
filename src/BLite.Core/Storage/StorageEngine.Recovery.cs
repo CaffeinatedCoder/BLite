@@ -44,7 +44,7 @@ public sealed partial class StorageEngine
             // No Checkpoint metric is published for this path: nothing is written to the page files.
             if (HasPendingFreePages && Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) == 0)
             {
-                try { await TryTruncateWalAsync(ct); }
+                try { await TryTruncateWalAsync(ct).ConfigureAwait(false); }
                 finally { Interlocked.Exchange(ref _checkpointRunning, 0); }
             }
             return;
@@ -125,7 +125,7 @@ public sealed partial class StorageEngine
             // Truncate WAL only when _walIndex is fully drained.
             if (_walIndex.IsEmpty)
             {
-                await TryTruncateWalAsync(ct);
+                await TryTruncateWalAsync(ct).ConfigureAwait(false);
             }
             else if (_shm != null && !_walIndex.IsEmpty)
             {
