@@ -294,7 +294,7 @@ public sealed partial class StorageEngine
     /// available for reuse by the page allocator.
     /// <list type="bullet">
     ///   <item><b>Single-file mode:</b> frees data pages, overflow pages, all index pages
-    ///   (B-tree, vector; spatial is best-effort), TimeSeries page chains, and schema pages.</item>
+    ///   (B-tree, vector, spatial), TimeSeries page chains, and schema pages.</item>
     ///   <item><b>Multi-file mode:</b> data and TimeSeries pages reside in the dedicated
     ///   collection file, which the caller frees via <see cref="DropCollectionFile"/>.
     ///   This method frees the index pages and schema pages that are stored in the shared
@@ -438,9 +438,13 @@ public sealed partial class StorageEngine
                     break;
                 }
                 case IndexType.Spatial:
-                    // RTreeIndex does not yet implement CollectAllPages — pages will be
-                    // reclaimed by a subsequent VACUUM pass.
+                {
+                    var opts = IndexOptions.CreateSpatial(idx.PropertyPaths);
+                    var rtreeIndex = new RTreeIndex(this, opts, idx.RootPageId);
+                    foreach (var pageId in rtreeIndex.CollectAllPages())
+                        toFree.Add(pageId);
                     break;
+                }
             }
         }
 

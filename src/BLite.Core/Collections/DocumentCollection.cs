@@ -721,9 +721,6 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 foreach (var index in _indexManager.GetAllIndexes())
                 {
-                    // RTreeIndex cannot enumerate its pages yet, so a rebuild would leak the
-                    // whole old tree on every vacuum. Spatial indexes are kept as they are.
-                    if (index.Definition.Type == IndexType.Spatial) continue;
                     await RebuildIndexFromScratchAsync(index.Name, ct).ConfigureAwait(false);
                 }
             }
