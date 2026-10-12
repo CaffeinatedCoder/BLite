@@ -473,6 +473,67 @@ public class FullTextSearchTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedRebuildTriggeredByForeignKeys_IsRetriedOnTheNextOpen()
+    {
+        DocumentLocation dog;
+        byte[] intact;
+        uint root;
+        using (var db = new FullTextDbContext(_dbPath))
+        {
+            await SeedAsync(db);
+            // Only the foreign key triggers the rebuild: the persisted format is already current.
+            await WriteAsync(db, txn => RawTree(db).Insert(new IndexKey("a"), new DocumentLocation(1, 1), txn));
+            Assert.Equal(FullTextIndex.FormatVersion, BodyIndex(db).KeyFormat);
+            Assert.True(BodyIndex(db).NeedsKeyFormatMigration);
+            root = BodyIndex(db).RootPageId;
+            await db.CheckpointAsync();
+
+            // Make one document unreadable, so the rebuild on the next open fails.
+            dog = Assert.Single(BodyIndex(db).FullTextMatch("sleeps"));
+            intact = new byte[db.Storage.PageSize];
+            db.Storage.ReadPage(dog.PageId, null, intact);
+            var corrupt = (byte[])intact.Clone();
+            var slot = SlotEntry.ReadFrom(corrupt.AsSpan(SlottedPageHeader.Size + dog.SlotIndex * SlotEntry.Size));
+            corrupt.AsSpan(slot.Offset + 4, 12).Fill(0xFF); // invalid element types
+            db.Storage.WritePageImmediate(dog.PageId, corrupt);
+        }
+
+        var sizes = new List<long>();
+        for (int open = 0; open < 3; open++)
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() => new FullTextDbContext(_dbPath));
+            Assert.Contains("idx_fts_Body", ex.Message);
+            sizes.Add(new FileInfo(_dbPath).Length);
+
+            using var engine = new BLiteEngine(_dbPath); // the collection itself is not opened
+            // The old index is still the registered one, foreign key included, so it still needs
+            // the migration (format current, foreign keys present) and the next open retries it.
+            var stored = engine.Storage.GetCollectionMetadata("articles")!.Indexes.Single(i => i.Name == "idx_fts_Body");
+            Assert.Equal(root, stored.RootPageId);
+            Assert.Equal(FullTextIndex.FormatVersion, stored.KeyFormat);
+            Assert.True(new FullTextIndex(engine.Storage, IndexOptions.CreateBTree("Body"), stored.RootPageId).HasForeignKeys());
+            if (open == 2) engine.Storage.WritePageImmediate(dog.PageId, intact);
+        }
+        // The copy each failed open built is freed, so later opens reuse its pages.
+        Assert.All(sizes.Skip(1), size => Assert.Equal(sizes[0], size));
+
+        uint migrated;
+        using (var repaired = new FullTextDbContext(_dbPath))
+        {
+            migrated = BodyIndex(repaired).RootPageId;
+            Assert.NotEqual(root, migrated); // the rebuilt copy was swapped in
+            Assert.Equal(FullTextIndex.FormatVersion, BodyIndex(repaired).KeyFormat);
+            Assert.False(BodyIndex(repaired).NeedsKeyFormatMigration);
+        }
+
+        using var reopened = new FullTextDbContext(_dbPath);
+        Assert.Equal(migrated, BodyIndex(reopened).RootPageId); // not rebuilt again
+        Assert.Equal(dog, Assert.Single(BodyIndex(reopened).FullTextMatch("sleeps")));
+        Assert.Equal(new[] { "fox", "fox again" },
+            Titles((await reopened.Articles.FullTextSearchAsync("idx_fts_Body", "quick fox", 10).ToListAsync()).Select(r => r.Document)));
+    }
+
+    [Fact]
     public async Task StalePostings_NeverSurfaceTheDocumentAtTheirLocation()
     {
         using var db = new FullTextDbContext(_dbPath);

@@ -867,12 +867,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
     /// <summary>
     /// Decimal properties used to be indexed as <c>(double)value</c>. An index whose persisted
-    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is rebuilt from the
+    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding, or a full-text
+    /// index written in another format or holding keys it did not write, is rebuilt from the
     /// documents into a copy that queries don't see, the first time the collection is opened. Only
-    /// after the copy committed is it swapped in, with the current format, in one metadata save, and
+    /// after the copy committed is it swapped in, with its target format, in one metadata save, and
     /// the old tree freed. If the rebuild fails or is interrupted, the copy's pages are freed and the
-    /// old index stays registered in its old format, so the next open repeats the migration.
-    /// No-op for every other index.
+    /// old index stays registered as it was, so it still needs the migration (whatever triggered it)
+    /// and the next open repeats it. No-op for every other index.
     /// </summary>
     private void MigrateLegacyDecimalIndexes()
     {
