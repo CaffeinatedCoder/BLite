@@ -1090,7 +1090,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             index.FreeAllPages(_storage);
             index.Dispose();
             throw new InvalidOperationException(
-                $"Cannot build index '{name}' of collection '{_collectionName}' from the documents already in it: {ex.Message} " +
+                $"Cannot build index '{name}' of collection '{_collectionName}' from the documents already in it: {ex.Message.TrimEnd('.')}. " +
                 "Nothing was saved, but every open fails the same way until those documents can be indexed or the index " +
                 "is removed from the model (OnModelCreating).", ex);
         }

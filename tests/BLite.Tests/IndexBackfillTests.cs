@@ -88,6 +88,7 @@ public class IndexBackfillTests : IDisposable
         Assert.Contains("idx_vector", ex.Message);
         Assert.Contains("removed from the model", ex.Message);
         Assert.IsType<ArgumentException>(ex.InnerException); // the dimension mismatch
+        Assert.Contains($"{ex.InnerException!.Message.TrimEnd('.')}. Nothing was saved", ex.Message);
 
         // Nothing was registered, so the data stays readable and the next open tries again.
         using (var v1 = new IndexEvoV1DbContext(_dbPath))

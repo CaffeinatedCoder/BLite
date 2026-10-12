@@ -240,6 +240,62 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         }
     }
 
+    [Obsolete("Use model HasVectorIndex/HasSpatialIndex or CreateIndex(definition); will be removed in 6.0")]
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    public CollectionSecondaryIndex<TId, T> CreateVectorIndexUntyped(
+        LambdaExpression keySelector,
+        int dimensions,
+        VectorMetric metric = VectorMetric.Cosine,
+        string? name = null)
+    {
+        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
+        var indexName = name ?? GenerateIndexName(propertyPaths);
+
+        lock (_lock)
+        {
+            if (_indexes.TryGetValue(indexName, out var existing))
+                return existing;
+
+            var body = keySelector.Body;
+            if (body.Type != typeof(object))
+            {
+                body = Expression.Convert(body, typeof(object));
+            }
+
+            var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
+
+            var definition = new CollectionIndexDefinition<T>(indexName, propertyPaths, lambda, false, IndexType.Vector, false, dimensions, metric);
+            return CreateIndex(definition);
+        }
+    }
+
+    [Obsolete("Use model HasVectorIndex/HasSpatialIndex or CreateIndex(definition); will be removed in 6.0")]
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    public CollectionSecondaryIndex<TId, T> CreateSpatialIndexUntyped(
+        LambdaExpression keySelector,
+        string? name = null)
+    {
+        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
+        var indexName = name ?? GenerateIndexName(propertyPaths);
+
+        lock (_lock)
+        {
+            if (_indexes.TryGetValue(indexName, out var existing))
+                return existing;
+
+            var body = keySelector.Body;
+            if (body.Type != typeof(object))
+            {
+                body = Expression.Convert(body, typeof(object));
+            }
+            
+            var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
+
+            var definition = new CollectionIndexDefinition<T>(indexName, propertyPaths, lambda, false, IndexType.Spatial);
+            return CreateIndex(definition);
+        }
+    }
+
     /// <summary>
     /// Drops an existing index by name
     /// </summary>
