@@ -370,13 +370,17 @@ internal static class IndexOptimizer
                  foreach (var idx in indexes) { if (Matches(idx, member.Member.Name) && idx.Type == IndexType.BTree) { index = idx; break; } }
                  if (index != null && index.Type == IndexType.BTree)
                  {
-                     var nextPrefix = IncrementPrefix(prefix);
-                     return new OptimizationResult 
-                     { 
+                     // [prefix, upper bound): the scan also returns entries equal to the exclusive
+                     // upper bound (a string such as "p8" for "p7"), so the post-filter must run.
+                     return new OptimizationResult
+                     {
                          IndexName = index.Name,
                          MinValue = prefix,
-                         MaxValue = nextPrefix,
-                         IsRange = true
+                         MaxValue = PrefixUpperBound(prefix),
+                         IsRange = true,
+                         FilterCompleteness = FilterCompleteness.StrictBoundary,
+                         StartInclusive = true,
+                         EndInclusive = false
                      };
                  }
              }
@@ -492,12 +496,19 @@ internal static class IndexOptimizer
         return false;
     }
 
-    private static string IncrementPrefix(string prefix)
+    /// <summary>
+    /// Exclusive upper bound for the index keys of the strings starting with <paramref name="prefix"/>:
+    /// its UTF-8 bytes with the last byte incremented (UTF-8 never contains 0xFF). Every key holding those
+    /// bytes as a prefix sorts below it, every other key above the prefix sorts above it.
+    /// <c>null</c> (unbounded) for an empty prefix, and for one ending in a high surrogate, whose UTF-8
+    /// form is not a prefix of the strings that complete the surrogate pair.
+    /// </summary>
+    private static IndexKey? PrefixUpperBound(string prefix)
     {
-        if (string.IsNullOrEmpty(prefix)) return null!;
-        char lastChar = prefix[prefix.Length - 1];
-        if (lastChar == char.MaxValue) return prefix; // Cannot increment
-        return prefix.Substring(0, prefix.Length - 1) + (char)(lastChar + 1);
+        if (prefix.Length == 0 || char.IsHighSurrogate(prefix[prefix.Length - 1])) return null;
+        var bytes = System.Text.Encoding.UTF8.GetBytes(prefix);
+        bytes[bytes.Length - 1]++;
+        return new IndexKey(bytes);
     }
 
     [RequiresDynamicCode("Fallback expression evaluation uses Expression.Compile() which requires dynamic code generation.")]
