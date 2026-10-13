@@ -153,14 +153,24 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     /// <summary>
     /// Creates an index for <paramref name="definition"/> without registering or persisting it,
     /// so it can be filled before queries or the collection metadata see it. The index owns its
-    /// root page: hand it to <see cref="Register"/> or release it with
-    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/> (a spatial index cannot release
-    /// its pages yet, so an abandoned one leaks them).
+    /// root page: hand it to <see cref="Register"/> or <see cref="ReplaceIndex"/>, or release its
+    /// pages (a spatial index cannot enumerate its pages yet, so an abandoned one leaks them).
     /// </summary>
     internal CollectionSecondaryIndex<TId, T> CreateUnregistered(CollectionIndexDefinition<T> definition)
-        => new(definition, _storage, _mapper);
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
 
-    /// <summary>Registers an index built by <see cref="CreateUnregistered"/> and persists it.</summary>
+            return new CollectionSecondaryIndex<TId, T>(definition, _storage, _mapper);
+        }
+    }
+
+    /// <summary>
+    /// Registers an index built by <see cref="CreateUnregistered"/> and persists it. If the
+    /// metadata cannot be saved, the index is not registered and remains the caller's to release.
+    /// </summary>
     internal void Register(CollectionSecondaryIndex<TId, T> index)
     {
         lock (_lock)
@@ -170,9 +180,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             if (_indexes.ContainsKey(index.Name))
                 throw new InvalidOperationException($"Index '{index.Name}' already exists");
 
-            _indexes[index.Name] = index;
-            _cachedIndexInfo = null; // invalidate cache
-            SaveMetadata();
+            PublishLocked(index.Name, index, previous: null);
         }
     }
 
@@ -352,29 +360,10 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
-            var fresh = CreateUnregisteredCopy(name);
+            var fresh = CreateUnregistered(old.Definition);
             fresh.KeyFormat = old.KeyFormat;
             ReplaceIndex(name, fresh);
             return fresh;
-        }
-    }
-
-    /// <summary>
-    /// Creates an empty index with the same definition as <paramref name="name"/> without
-    /// registering it, so queries keep using the existing index while the copy is populated.
-    /// The copy owns its root page: hand it to <see cref="ReplaceIndex"/> or release it with
-    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/>.
-    /// </summary>
-    internal CollectionSecondaryIndex<TId, T> CreateUnregisteredCopy(string name)
-    {
-        lock (_lock)
-        {
-            if (_disposed)
-                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
-            if (!_indexes.TryGetValue(name, out var old))
-                throw new InvalidOperationException($"Index '{name}' does not exist");
-
-            return new CollectionSecondaryIndex<TId, T>(old.Definition, _storage, _mapper);
         }
     }
 
@@ -392,26 +381,40 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
-            _indexes[name] = fresh;
-            _cachedIndexInfo = null; // invalidate cache
-            RefreshHasUniqueBTreeIndex();
-
             // Persist the new root before freeing the old tree: a crash in between leaks the old
             // pages, whereas the reverse order would let the next open free them a second time.
-            try
-            {
-                SaveMetadata();
-            }
-            catch
-            {
-                // Keep the old index registered, matching the metadata on disk; the caller still
-                // owns the copy.
-                _indexes[name] = old;
-                UpdateMetadata();
-                throw;
-            }
+            PublishLocked(name, fresh, old);
             old.FreeAllPages(_storage);
             old.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Registers <paramref name="index"/> under <paramref name="name"/> in place of
+    /// <paramref name="previous"/> (null: none) and saves the metadata. If the save fails, the
+    /// previous registration is restored, so memory keeps matching the metadata on disk, and the
+    /// exception propagates. Must be called under <see cref="_lock"/>.
+    /// </summary>
+    private void PublishLocked(string name, CollectionSecondaryIndex<TId, T> index, CollectionSecondaryIndex<TId, T>? previous)
+    {
+        _indexes[name] = index;
+        _cachedIndexInfo = null; // invalidate cache
+        RefreshHasUniqueBTreeIndex();
+
+        try
+        {
+            SaveMetadata();
+        }
+        catch
+        {
+            if (previous != null)
+                _indexes[name] = previous;
+            else
+                _indexes.Remove(name);
+            _cachedIndexInfo = null;
+            RefreshHasUniqueBTreeIndex();
+            UpdateMetadata();
+            throw;
         }
     }
 
