@@ -48,6 +48,8 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
                 case "FirstOrDefault":
                 case "Single":
                 case "SingleOrDefault":
+                case "Last":
+                case "LastOrDefault":
                 case "Any":
                     VisitElementTerminal(node);
                     return node;
@@ -155,11 +157,12 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
     }
 
     /// <summary>
-    /// Handles <c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>, <c>SingleOrDefault</c> and
-    /// <c>Any</c>, with or without a predicate. A predicate on the entities themselves is folded
-    /// into the WHERE clause (<c>First(p)</c> is <c>Where(p).First()</c>), so the index planner
-    /// sees it, but only where <see cref="CanFoldPredicate"/> allows it. Overloads taking a
-    /// default value are left to the fallback pipeline.
+    /// Handles <c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>, <c>SingleOrDefault</c>,
+    /// <c>Last</c>, <c>LastOrDefault</c> and <c>Any</c>, with or without a predicate. A predicate
+    /// on the entities themselves is folded into the WHERE clause (<c>First(p)</c> is
+    /// <c>Where(p).First()</c>), so the index planner sees it, but only where
+    /// <see cref="CanFoldPredicate"/> allows it. Overloads taking a default value are left to the
+    /// fallback pipeline. <c>All(p)</c> is not handled here: it is not <c>Where(p).All()</c>.
     /// </summary>
     private void VisitElementTerminal(MethodCallExpression node)
     {
@@ -175,6 +178,7 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
         {
             AddPredicate(predicate);
             _model.ElementTerminal = node.Method.Name;
+            _model.FoldedTerminal = node;
         }
         else
         {
@@ -201,6 +205,7 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
             // Count(predicate) on the entities themselves is Where(predicate).Count().
             AddPredicate(predicate);
             _model.IsCountOnly = true;
+            _model.FoldedTerminal = node;
         }
         else
         {

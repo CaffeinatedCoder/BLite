@@ -217,10 +217,12 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // ── Element terminals: First / FirstOrDefault / Single / SingleOrDefault / Any ──
         // With only a WHERE in front, at most one (Single*: two) matching document decides the
         // result, so fetch just that many through the index-aware FetchAsync. Anything else in
-        // front (OrderBy, Select, Take, ...) goes through the general fallback as before.
+        // front (OrderBy, Select, Take, ...), and Last / LastOrDefault, which need every match,
+        // go through the general fallback.
         if (model.ElementTerminal is { } terminal)
         {
-            if (!model.HasComplexOperators && model.SelectClause == null && model.OrderByClause == null
+            if (terminal is not ("Last" or "LastOrDefault")
+                && !model.HasComplexOperators && model.SelectClause == null && model.OrderByClause == null
                 && !model.Take.HasValue && !model.Skip.HasValue && model.AggregateOp == null && !model.IsCountOnly)
             {
                 bool single = terminal is "Single" or "SingleOrDefault";
@@ -341,8 +343,9 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // FetchAsync applied the WHERE, so the replay drops the root-chain Where calls folded into
         // it. Re-evaluating them would change nothing except for VectorSearch, which only the index
         // can evaluate. Every other VectorSearch in the expression is still evaluated and throws.
+        // The same holds for a terminal predicate folded into the WHERE (First(p) after OrderBy).
         if (whereAlreadyApplied)
-            expression = DropAppliedWheres(expression).Expression;
+            expression = DropAppliedWheres(DropFoldedTerminalPredicate(expression, model.FoldedTerminal)).Expression;
 
         if (model.HasComplexOperators)
             return ExecuteViaEnumerableRewriter<TResult>(expression, sourceData);
@@ -701,6 +704,34 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             : call.Update(call.Object, [source, .. call.Arguments.Skip(1)]);
         return (rewritten, isFetchedSubset && s_subsetPreservingOperators.Contains(call.Method.Name));
     }
+
+    /// <summary>
+    /// Replaces the terminal whose predicate <see cref="BTreeExpressionVisitor"/> folded into
+    /// <see cref="QueryModel.WhereClause"/> (<c>Count(p)</c>, <c>First(p)</c>, ...) with its
+    /// parameterless overload. The visitor folds a predicate only when the terminal's source is the
+    /// root followed by plain Where and ordering calls, so the elements reaching the terminal are
+    /// fetched documents, which all satisfy the predicate already.
+    /// </summary>
+    [RequiresDynamicCode("BLite LINQ queries use Expression.Compile() and MakeGenericMethod which require dynamic code generation.")]
+    [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
+    private static Expression DropFoldedTerminalPredicate(Expression expression, MethodCallExpression? foldedTerminal)
+    {
+        if (foldedTerminal is null || !ReferenceEquals(expression, foldedTerminal))
+            return expression;
+
+        var name = foldedTerminal.Method.Name;
+        if (!s_parameterlessTerminals.TryGetValue(name, out var definition))
+        {
+            definition = typeof(Queryable).GetMethods().Single(m => m.Name == name && m.GetParameters().Length == 1);
+            s_parameterlessTerminals[name] = definition;
+        }
+
+        var parameterless = definition.MakeGenericMethod(foldedTerminal.Method.GetGenericArguments());
+        return Expression.Call(parameterless, foldedTerminal.Arguments[0]);
+    }
+
+    /// <summary>Generic definitions of the parameterless Queryable terminals, by name.</summary>
+    private static readonly ConcurrentDictionary<string, MethodInfo> s_parameterlessTerminals = new();
 
     /// <summary>Queryable operators whose output elements are a subset of their source's.</summary>
     private static readonly HashSet<string> s_subsetPreservingOperators =

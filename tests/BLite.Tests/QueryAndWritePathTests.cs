@@ -53,13 +53,27 @@ public class QueryAndWritePathTests : IDisposable
         Assert.False(count.HasComplexOperators);
         Assert.NotNull(count.WhereClause);
 
-        foreach (var name in new[] { "First", "FirstOrDefault", "Single", "SingleOrDefault", "Any" })
+        Assert.NotNull(count.FoldedTerminal);
+
+        foreach (var name in new[] { "First", "FirstOrDefault", "Single", "SingleOrDefault", "Last", "LastOrDefault", "Any" })
         {
             var model = Model(Expression.Call(typeof(Queryable), name, [typeof(PersonV2)], Q.Expression, Expression.Quote((Expression<Func<PersonV2, bool>>)(p => p.Age == 3))));
             Assert.Equal(name, model.ElementTerminal);
             Assert.False(model.HasComplexOperators);
             Assert.NotNull(model.WhereClause);
+            Assert.NotNull(model.FoldedTerminal);
         }
+    }
+
+    [Fact]
+    public void Model_AllPredicate_IsNeverFolded()
+    {
+        // All(p) is not Where(p).All(): it must see the documents that fail p.
+        var all = Model(Expression.Call(typeof(Queryable), "All", [typeof(PersonV2)],
+            Q.OrderBy(p => p.Name).Expression, Expression.Quote((Expression<Func<PersonV2, bool>>)(p => p.Age == 3))));
+        Assert.True(all.HasComplexOperators);
+        Assert.Null(all.WhereClause);
+        Assert.Null(all.FoldedTerminal);
     }
 
     [Fact]
@@ -173,6 +187,7 @@ public class QueryAndWritePathTests : IDisposable
             Q.SkipWhile(p => p.Age < 10).Expression, Expression.Quote(pred)));
         Assert.True(afterSkipWhile.HasComplexOperators);
         Assert.Null(afterSkipWhile.WhereClause);
+        Assert.Null(afterSkipWhile.FoldedTerminal);
 
         var afterIndexedWhere = Model(Expression.Call(typeof(Queryable), "Any", [typeof(PersonV2)],
             Q.Where((p, i) => i > 10).Expression, Expression.Quote(pred)));
@@ -187,6 +202,95 @@ public class QueryAndWritePathTests : IDisposable
 
         float[] query = [0f, 0f, 0f];
         Assert.Equal(3, _db.VectorItems.AsQueryable().Count(x => x.Embedding.VectorSearch(query, 3)));
+    }
+
+    [Fact]
+    public void Terminals_AfterOrderingWithPredicate_MatchLinqToObjects()
+    {
+        // The predicate is folded into the WHERE and dropped from the replay, but the ordering
+        // must still decide which matching document the terminal returns.
+        Assert.Equal(_people.OrderBy(p => p.Name).First(p => p.Age == 7).Name,
+                     Q.OrderBy(p => p.Name).First(p => p.Age == 7).Name);
+        Assert.Equal(_people.OrderBy(p => p.Name).FirstOrDefault(p => p.Age == 7)!.Name,
+                     Q.OrderBy(p => p.Name).FirstOrDefault(p => p.Age == 7)!.Name);
+        Assert.Null(Q.OrderBy(p => p.Name).FirstOrDefault(p => p.Age == 999));
+        Assert.Equal(_people.OrderBy(p => p.Name).Last(p => p.Age == 7).Name,
+                     Q.OrderBy(p => p.Name).Last(p => p.Age == 7).Name);
+        Assert.Equal(_people.OrderByDescending(p => p.Name).LastOrDefault(p => p.Age == 7)!.Name,
+                     Q.OrderByDescending(p => p.Name).LastOrDefault(p => p.Age == 7)!.Name);
+        Assert.Null(Q.OrderBy(p => p.Name).LastOrDefault(p => p.Age == 999));
+        Assert.Equal("p42", Q.OrderBy(p => p.Name).Single(p => p.Name == "p42").Name);
+        Assert.Null(Q.OrderBy(p => p.Name).SingleOrDefault(p => p.Name == "nobody"));
+        Assert.Throws<InvalidOperationException>(() => Q.OrderBy(p => p.Name).Single(p => p.Age == 7));
+        Assert.True(Q.OrderBy(p => p.Name).Any(p => p.Age == 49));
+        Assert.False(Q.OrderBy(p => p.Name).Any(p => p.Age == 50));
+
+        Assert.Equal(_people.OrderBy(p => p.Age).ThenByDescending(p => p.Name).First(p => p.Name.EndsWith("3")).Name,
+                     Q.OrderBy(p => p.Age).ThenByDescending(p => p.Name).First(p => p.Name.EndsWith("3")).Name);
+        Assert.Equal(_people.Where(p => p.Age > 10).OrderBy(p => p.Age).ThenBy(p => p.Name).Last(p => p.Age < 20).Name,
+                     Q.Where(p => p.Age > 10).OrderBy(p => p.Age).ThenBy(p => p.Name).Last(p => p.Age < 20).Name);
+        Assert.Equal(_people.OrderBy(p => p.Age).ThenBy(p => p.Name).Count(p => p.Age == 7),
+                     Q.OrderBy(p => p.Age).ThenBy(p => p.Name).Count(p => p.Age == 7));
+        Assert.Equal(_people.OrderBy(p => p.Age).ThenBy(p => p.Name).LongCount(p => p.Age == 7),
+                     Q.OrderBy(p => p.Age).ThenBy(p => p.Name).LongCount(p => p.Age == 7));
+
+        // All(p) is not folded and still sees every document.
+        Assert.True(Q.OrderBy(p => p.Name).All(p => p.Age < 50));
+        Assert.False(Q.OrderBy(p => p.Name).All(p => p.Age < 49));
+    }
+
+    // Titles run against the vector distance, so ordering by Title picks a different neighbour
+    // than the order the index returns them in: the 3 nearest to the origin are "j", "i", "h".
+    private static readonly float[] Origin = [0f, 0f, 0f];
+
+    private async Task InsertReverseTitledVectorsAsync()
+    {
+        for (int i = 0; i < 10; i++)
+            await _db.VectorItems.InsertAsync(new VectorEntity { Title = ((char)('j' - i)).ToString(), Embedding = [i, 0f, 0f] });
+    }
+
+    private IQueryable<VectorEntity> V => _db.VectorItems.AsQueryable();
+
+    [Fact]
+    public async Task ElementTerminals_AfterOrdering_WithVectorSearchPredicate_UseTheFoldedResult()
+    {
+        await InsertReverseTitledVectorsAsync();
+
+        Assert.Equal("h", V.OrderBy(x => x.Title).First(x => x.Embedding.VectorSearch(Origin, 3)).Title);
+        Assert.Equal(V.Where(x => x.Embedding.VectorSearch(Origin, 3)).OrderBy(x => x.Title).First().Title,
+                     V.OrderBy(x => x.Title).First(x => x.Embedding.VectorSearch(Origin, 3)).Title);
+        Assert.Equal(V.Where(x => x.Embedding.VectorSearch(Origin, 3)).OrderByDescending(x => x.Title).FirstOrDefault()!.Title,
+                     V.OrderByDescending(x => x.Title).FirstOrDefault(x => x.Embedding.VectorSearch(Origin, 3))!.Title);
+        Assert.Equal("j", V.OrderBy(x => x.Title).Last(x => x.Embedding.VectorSearch(Origin, 3)).Title);
+        Assert.Equal(V.Where(x => x.Embedding.VectorSearch(Origin, 3)).OrderBy(x => x.Title).Last().Title,
+                     V.OrderBy(x => x.Title).Last(x => x.Embedding.VectorSearch(Origin, 3)).Title);
+        Assert.Equal(V.Where(x => x.Embedding.VectorSearch(Origin, 3)).OrderByDescending(x => x.Title).LastOrDefault()!.Title,
+                     V.OrderByDescending(x => x.Title).LastOrDefault(x => x.Embedding.VectorSearch(Origin, 3))!.Title);
+        Assert.Equal("j", V.OrderBy(x => x.Title).Single(x => x.Embedding.VectorSearch(Origin, 1)).Title);
+        Assert.Equal("j", V.OrderBy(x => x.Title).SingleOrDefault(x => x.Embedding.VectorSearch(Origin, 1))!.Title);
+        Assert.Throws<InvalidOperationException>(() => V.OrderBy(x => x.Title).Single(x => x.Embedding.VectorSearch(Origin, 3)));
+        Assert.True(V.OrderBy(x => x.Title).Any(x => x.Embedding.VectorSearch(Origin, 3)));
+
+        // ThenBy is not modelled by the direct pipeline, so these go through the replay as well.
+        Assert.Equal(V.Where(x => x.Title != null && x.Embedding.VectorSearch(Origin, 3)).OrderBy(x => x.Title.Length).ThenBy(x => x.Title).First().Title,
+                     V.Where(x => x.Title != null).OrderBy(x => x.Title.Length).ThenBy(x => x.Title).First(x => x.Embedding.VectorSearch(Origin, 3)).Title);
+        Assert.Equal("h", V.OrderBy(x => x.Title.Length).ThenBy(x => x.Title).First(x => x.Embedding.VectorSearch(Origin, 3)).Title);
+        Assert.Equal(3, V.OrderBy(x => x.Title.Length).ThenBy(x => x.Title).Count(x => x.Embedding.VectorSearch(Origin, 3)));
+        Assert.Equal(3L, V.OrderBy(x => x.Title.Length).ThenBy(x => x.Title).LongCount(x => x.Embedding.VectorSearch(Origin, 3)));
+        Assert.True(V.OrderBy(x => x.Title.Length).ThenByDescending(x => x.Title).Any(x => x.Embedding.VectorSearch(Origin, 3)));
+    }
+
+    [Fact]
+    public async Task Terminals_WithUnfoldedVectorSearchPredicate_StillThrow()
+    {
+        await InsertReverseTitledVectorsAsync();
+
+        // All(p), and any predicate after an operator that blocks folding, is evaluated in the
+        // replay, where VectorSearch cannot run.
+        Assert.Throws<NotSupportedException>(() => V.OrderBy(x => x.Title).All(x => x.Embedding.VectorSearch(Origin, 3)));
+        Assert.Throws<NotSupportedException>(() => V.OrderBy(x => x.Title).SkipWhile(x => x.Title == "a").First(x => x.Embedding.VectorSearch(Origin, 3)));
+        Assert.Throws<NotSupportedException>(() => V.OrderBy(x => x.Title).Take(5).Count(x => x.Embedding.VectorSearch(Origin, 3)));
+        Assert.Throws<NotSupportedException>(() => V.GroupBy(x => x.Title).Count(g => g.First().Embedding.VectorSearch(Origin, 3)));
     }
 
     // ── Write path ──────────────────────────────────────────────────────────
