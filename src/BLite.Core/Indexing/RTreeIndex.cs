@@ -111,6 +111,49 @@ internal class RTreeIndex : IDisposable
         finally { ReturnPageBuffer(buffer); }
     }
 
+    /// <summary>
+    /// Returns all physical page IDs owned by this R-tree.
+    /// Used when dropping or rebuilding an index to free storage space.
+    /// </summary>
+    public IReadOnlyList<uint> CollectAllPages() => CollectAllPages(0);
+
+    /// <summary>
+    /// Like <see cref="CollectAllPages()"/>, but walks the tree as <paramref name="transactionId"/>
+    /// sees it, including nodes that transaction has written but not committed. <see cref="SplitNode"/>
+    /// allocates its pages outside the transaction and links them only from nodes written in it, so
+    /// after a rollback they can no longer be reached from the committed tree.
+    /// </summary>
+    internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
+    {
+        var pages = new List<uint>();
+        var seen = new HashSet<uint>();
+        var stack = new Stack<uint>();
+        stack.Push(_rootPageId);
+
+        var buffer = RentPageBuffer();
+        try
+        {
+            while (stack.Count > 0)
+            {
+                uint pageId = stack.Pop();
+                if (pageId == 0 || !seen.Add(pageId)) continue;
+                pages.Add(pageId);
+
+                _storage.ReadPage(pageId, transactionId == 0 ? null : transactionId, buffer);
+                if (SpatialPage.GetIsLeaf(buffer)) continue;
+
+                ushort count = SpatialPage.GetEntryCount(buffer);
+                for (int i = 0; i < count; i++)
+                {
+                    SpatialPage.ReadEntry(buffer, i, out _, out var pointer);
+                    stack.Push(pointer.PageId);
+                }
+            }
+        }
+        finally { ReturnPageBuffer(buffer); }
+        return pages;
+    }
+
     public void Insert(GeoBox mbr, DocumentLocation loc, ITransaction? transaction = null)
     {
         lock (_lock)

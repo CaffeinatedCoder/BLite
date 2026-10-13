@@ -663,24 +663,57 @@ public class VacuumTests : IDisposable
         }
     }
 
+    private static List<GeoEntity> GeoPoints(int n) => Enumerable.Range(0, n)
+        .Select(i => new GeoEntity { Name = $"g{i}", Location = (40.0 + (i % 100) * 0.01, 9.0 + (i / 100) * 0.01) })
+        .ToList();
+
     /// <summary>
-    /// Spatial indexes are not rebuilt (their pages cannot be enumerated and freed yet); the
-    /// existing R-Tree is kept and keeps answering queries.
+    /// A spatial index is rebuilt into a fresh tree like the other kinds, and every page of the
+    /// old tree, not just its root, goes back to the free list.
     /// </summary>
     [Fact]
-    public async Task Vacuum_RebuildIndexes_DocumentCollection_Spatial_IsKept()
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_Spatial_RebuildsTreeAndFreesOldPages()
     {
         using var db = new TestDbContext(_dbPath);
-        await db.GeoItems.InsertAsync(new GeoEntity { Name = "milan", Location = (45.46, 9.19) });
-        uint SpatialRoot() => db.Storage.GetAllCollectionsMetadata()
-            .SelectMany(m => m.Indexes).Single(i => i.Name == "idx_spatial").RootPageId;
+        await db.GeoItems.InsertBulkAsync(GeoPoints(3000));
+        await db.CheckpointAsync();
+        uint SpatialRoot() => db.Storage.GetCollectionMetadata("geo_items")!
+            .Indexes.Single(i => i.Name == "idx_spatial").RootPageId;
+        var rootBefore = SpatialRoot();
+        var oldPages = db.GeoItems.IndexManager.GetIndex("idx_spatial")!.CollectAllPages(0);
+        Assert.True(oldPages.Count > 1, "the index must span more than its root");
+
+        await db.GeoItems.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false });
+
+        Assert.NotEqual(rootBefore, SpatialRoot());
+        Assert.Equal(SpatialRoot(), db.GeoItems.IndexManager.GetIndex("idx_spatial")!.RootPageId);
+        (double, double) min = (40.0, 9.0), max = (40.095, 9.095); // the first 10x10 points of the grid
+        Assert.Equal(100, db.GeoItems.AsQueryable().Where(p => p.Location.Within(min, max)).ToList().Count);
+        await AssertPagesFreedAsync(db, oldPages);
+    }
+
+    /// <summary>
+    /// A spatial rebuild that fails part-way keeps the old tree and frees the half-built copy,
+    /// including the pages its splits added outside the transaction.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_RebuildIndexes_DocumentCollection_Spatial_FailedRebuild_KeepsIndexAndFreesCopy()
+    {
+        using var db = new TestDbContext(_dbPath);
+        await db.GeoItems.InsertBulkAsync(GeoPoints(6000));
+        await db.CheckpointAsync();
+        await CorruptLastDocumentAsync(db.GeoItems, db.Storage);
+        uint SpatialRoot() => db.Storage.GetCollectionMetadata("geo_items")!
+            .Indexes.Single(i => i.Name == "idx_spatial").RootPageId;
         var rootBefore = SpatialRoot();
 
-        await db.GeoItems.VacuumAsync(new VacuumOptions { RebuildIndexes = true });
+        await Assert.ThrowsAnyAsync<Exception>(() => db.GeoItems.VacuumAsync(new VacuumOptions { RebuildIndexes = true, TruncateFile = false }));
 
         Assert.Equal(rootBefore, SpatialRoot());
-        (double, double) min = (45.0, 9.0), max = (46.0, 10.0);
-        Assert.Equal("milan", Assert.Single(db.GeoItems.AsQueryable().Where(p => p.Location.Within(min, max)).ToList()).Name);
+        Assert.Equal(rootBefore, db.GeoItems.IndexManager.GetIndex("idx_spatial")!.RootPageId);
+        (double, double) min = (40.0, 9.0), max = (40.095, 9.095);
+        Assert.Equal(100, db.GeoItems.AsQueryable().Where(p => p.Location.Within(min, max)).ToList().Count);
+        await AssertCopyWasFreedAsync(db);
     }
 
     /// <summary>
@@ -784,19 +817,43 @@ public class VacuumTests : IDisposable
     /// </summary>
     private static async Task<int> CorruptLastDocumentAsync(TestDbContext db)
     {
-        var storage = db.Storage;
-        var primary = (BTreeIndex)typeof(DocumentCollection<ObjectId, PersonV2>)
+        var last = await CorruptLastDocumentAsync(db.PeopleV2, db.Storage);
+        return (last.Age + 1) % 90;
+    }
+
+    /// <summary>Corrupts the last document of <paramref name="collection"/> in primary-key order and returns it.</summary>
+    private static async Task<T> CorruptLastDocumentAsync<T>(DocumentCollection<ObjectId, T> collection, StorageEngine storage) where T : class
+    {
+        var primary = (BTreeIndex)typeof(DocumentCollection<ObjectId, T>)
             .GetField("_primaryIndex", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-            .GetValue(db.PeopleV2)!;
+            .GetValue(collection)!;
         var lastEntry = primary.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Backward).First();
         var location = lastEntry.Location;
-        var corruptedAge = (await db.PeopleV2.FindByIdAsync(lastEntry.Key.As<ObjectId>()))!.Age;
+        var last = (await collection.FindByIdAsync(lastEntry.Key.As<ObjectId>()))!;
         var page = new byte[storage.PageSize];
         storage.ReadPage(location.PageId, null, page);
         var slot = SlotEntry.ReadFrom(page.AsSpan(SlottedPageHeader.Size + location.SlotIndex * SlotEntry.Size));
         page.AsSpan(slot.Offset + 4, 12).Fill(0xFF); // invalid element types
         storage.WritePageImmediate(location.PageId, page);
-        return (corruptedAge + 1) % 90;
+        return last;
+    }
+
+    /// <summary>
+    /// Every page in <paramref name="pages"/> is either back on the free list (handed out next,
+    /// below the high-water mark) or still queued for the next WAL truncation.
+    /// </summary>
+    private static async Task AssertPagesFreedAsync(TestDbContext db, IReadOnlyCollection<uint> pages)
+    {
+        var storage = db.Storage;
+        await db.CheckpointAsync();
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        var queued = ((HashSet<uint>)typeof(StorageEngine).GetField("_pendingFreePages", flags)!.GetValue(storage)!).ToHashSet();
+        var highWater = ((IPageStorage)typeof(StorageEngine).GetField("_pageFile", flags)!.GetValue(storage)!).NextPageId;
+        var reused = new HashSet<uint>();
+        uint allocated;
+        while ((allocated = storage.AllocatePage()) < highWater) reused.Add(allocated);
+        var leaked = pages.Where(p => !reused.Contains(p) && !queued.Contains(p)).ToList();
+        Assert.True(leaked.Count == 0, $"{leaked.Count} of {pages.Count} pages were not freed: {string.Join(", ", leaked.Take(10))}");
     }
 
     /// <summary>

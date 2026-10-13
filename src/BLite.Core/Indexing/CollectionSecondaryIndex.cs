@@ -790,12 +790,12 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
 
     /// <summary>
     /// The pages of this index as <paramref name="transactionId"/> sees them (0: committed state).
-    /// Empty for a spatial index: <c>RTreeIndex</c> cannot enumerate its pages yet.
     /// </summary>
     internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
     {
         if (_btreeIndex != null) return _btreeIndex.CollectAllPages(transactionId);
         if (_vectorIndex != null) return _vectorIndex.CollectAllPages(transactionId);
+        if (_spatialIndex != null) return _spatialIndex.CollectAllPages(transactionId);
         return Array.Empty<uint>();
     }
 }
