@@ -40,6 +40,10 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         
         // Load existing metadata via storage
         _metadata = _storage.GetCollectionMetadata(_collectionName) ?? new CollectionMetadata { Name = _collectionName };
+
+        // Refuse a collection that requires features this version cannot maintain, before anything
+        // below writes to it.
+        CollectionFeatures.EnsureCanOpen(_metadata, _storage.IsReadOnly);
         
         // Initialize indexes from metadata. Root page ids are fixed for the lifetime of an index
         // (a root split rewrites the root page in place), so they only need persisting when the
@@ -154,7 +158,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     /// Creates an index for <paramref name="definition"/> without registering or persisting it,
     /// so it can be filled before queries or the collection metadata see it. The index owns its
     /// root page: hand it to <see cref="Register"/> or <see cref="ReplaceIndex"/>, or release its
-    /// pages (a spatial index cannot enumerate its pages yet, so an abandoned one leaks them).
+    /// pages.
     /// </summary>
     internal CollectionSecondaryIndex<TId, T> CreateUnregistered(CollectionIndexDefinition<T> definition)
     {

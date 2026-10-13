@@ -117,6 +117,14 @@ public sealed partial class StorageEngine : IDisposable
     internal bool UsesSeparateCollectionFiles => _collectionFiles != null;
 
     /// <summary>
+    /// Whether the database was opened read-only (<see cref="PageFileConfig.Access"/> is
+    /// <see cref="System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read"/>). Collections that
+    /// require features this version cannot maintain may still be opened for reading then
+    /// (see <see cref="CollectionFeatures"/>).
+    /// </summary>
+    internal bool IsReadOnly => _config.Access == System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read;
+
+    /// <summary>
     /// Returns the semaphore a <see cref="Collections.DocumentCollection{TId,T}"/> must hold for
     /// write operations. In single-file mode every collection of this engine gets the same
     /// instance, because they share the free-space index and the page allocator

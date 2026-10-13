@@ -721,9 +721,6 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 foreach (var index in _indexManager.GetAllIndexes())
                 {
-                    // RTreeIndex cannot enumerate its pages yet, so a rebuild would leak the
-                    // whole old tree on every vacuum. Spatial indexes are kept as they are.
-                    if (index.Definition.Type == IndexType.Spatial) continue;
                     await RebuildIndexFromScratchAsync(index, ct).ConfigureAwait(false);
                 }
             }
@@ -1944,7 +1941,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             // NEW: Buffer write in transaction or write immediately
             var writeOp = new WriteOperation(
                 documentId: ObjectId.Empty,
-                newValue: buffer.AsSpan(0, _storage.PageSize).ToArray(),
+                newValue: buffer.AsMemory(0, _storage.PageSize),
                 pageId: pageId,
                 type: OperationType.Insert
             );
