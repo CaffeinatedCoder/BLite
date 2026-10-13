@@ -364,147 +364,252 @@ public sealed partial class StorageEngine
             writer.Write(idx.KeyFormat);
 
         var newData = stream.ToArray();
+        if (newData.Length + SlotEntry.Size > PageSize - SlottedPageHeader.Size)
+            throw new InvalidOperationException(
+                $"Collection metadata for '{metadata.Name}' ({newData.Length} bytes) does not fit in a page.");
 
-        // ── Pass 1: walk the chain to find the existing entry and the first page
-        //           with enough free space to store the new serialised record. ──
+        var chain = LoadMetadataChain();
+        if (chain.Count == 0)
+            throw new InvalidOperationException("Page 1 is not a collection metadata page.");
+        var (foundPage, foundSlot) = FindMetadataRecord(chain, metadata.Name);
 
-        var loadedPages    = new List<(uint PageId, byte[] Buffer)>();
-        uint chainPageId   = 1;
-        int foundOnPageIdx = -1; // index into loadedPages
-        int foundSlotIndex = -1;
-        int bestWriteIdx   = -1; // first page with enough room
-
-        while (chainPageId != 0)
+        // ── 1. No larger than the stored record: overwrite it where it is ─────
+        // A single page write. Covers the frequent saves (sequence values, root page ids) whose
+        // record keeps its size, so they no longer leave a deleted record behind (#195).
+        if (foundPage >= 0)
         {
-            var buf    = new byte[PageSize];
-            ReadPage(chainPageId, null, buf);
-            int thisIdx = loadedPages.Count;
-            loadedPages.Add((chainPageId, buf));
-
-            var hdr = SlottedPageHeader.ReadFrom(buf);
-            if (hdr.PageType != PageType.Collection)
-                break;
-
-            // Locate existing slot for this collection name
-            if (foundSlotIndex == -1)
+            var (pageId, buffer) = chain[foundPage];
+            var slot = ReadSlot(buffer, foundSlot);
+            if (newData.Length <= slot.Length)
             {
-                for (ushort i = 0; i < hdr.SlotCount; i++)
-                {
-                    var so   = SlottedPageHeader.Size + (i * SlotEntry.Size);
-                    var slot = SlotEntry.ReadFrom(buf.AsSpan(so));
-                    if ((slot.Flags & SlotFlags.Deleted) != 0) continue;
+                newData.CopyTo(buffer.AsSpan(slot.Offset));
+                slot.Length = (ushort)newData.Length;
+                WriteSlot(buffer, foundSlot, slot);
+                WritePageImmediate(pageId, buffer);
 
-                    try
-                    {
-                        using var ms     = new MemoryStream(buf, slot.Offset, slot.Length, false);
-                        using var rdr    = new BinaryReader(ms);
-                        var existingName = rdr.ReadString();
-                        if (string.Equals(existingName, metadata.Name, StringComparison.OrdinalIgnoreCase))
-                        {
-                            foundOnPageIdx = thisIdx;
-                            foundSlotIndex = i;
-                            break;
-                        }
-                    }
-                    catch { }
-                }
+                // Shrink a chain grown by earlier releases (or by records that grew) once a page can go.
+                CompactMetadataChain(chain, onlyIfShorter: true);
+                return;
             }
-
-            // First page with enough room for the new entry
-            if (bestWriteIdx == -1 && hdr.AvailableFreeSpace >= newData.Length + SlotEntry.Size)
-                bestWriteIdx = thisIdx;
-
-            chainPageId = hdr.NextOverflowPage;
         }
 
-        // ── Pass 2: mark old entry as Deleted (in its in-memory buffer) ──
-        if (foundSlotIndex >= 0)
-        {
-            var (_, fbuf) = loadedPages[foundOnPageIdx];
-            var so   = SlottedPageHeader.Size + (foundSlotIndex * SlotEntry.Size);
-            var slot = SlotEntry.ReadFrom(fbuf.AsSpan(so));
-            slot.Flags |= SlotFlags.Deleted;
-            slot.WriteTo(fbuf.AsSpan(so));
-        }
+        // ── 2. Larger or new: reclaim dead space first, so the record goes into free space in the
+        //       chain before a page is appended ────────────────────────────────────────────────
+        chain = CompactMetadataChain(chain, onlyIfShorter: false);
+        (foundPage, foundSlot) = FindMetadataRecord(chain, metadata.Name);
 
-        // ── Pass 3: resolve write-target page ──
-        byte[] targetBuf;
-        uint   targetPageId;
+        // ── 3. Write the new record, then delete the old one: a crash in between leaves the old
+        //       record in place rather than neither ─────────────────────────────────────────────
+        int target = chain.FindIndex(p =>
+            SlottedPageHeader.ReadFrom(p.Buffer).AvailableFreeSpace >= newData.Length + SlotEntry.Size);
 
-        if (bestWriteIdx >= 0)
+        if (target < 0)
         {
-            (targetPageId, targetBuf) = loadedPages[bestWriteIdx];
+            // No room anywhere: append a page holding the record, then link it from the last page.
+            var newPageId = AllocatePage();
+            var newPage = new byte[PageSize];
+            NewMetadataPage(newPageId, 0).WriteTo(newPage);
+            AppendRecord(newPage, newData);
+            WritePageImmediate(newPageId, newPage);
+
+            var (lastId, lastBuf) = chain[chain.Count - 1];
+            var lastHdr = SlottedPageHeader.ReadFrom(lastBuf);
+            lastHdr.NextOverflowPage = newPageId;
+            lastHdr.WriteTo(lastBuf);
+            WritePageImmediate(lastId, lastBuf);
         }
         else
         {
-            // No existing page has room → allocate a new Collection overflow page
-            targetPageId = AllocatePage();
-            targetBuf = new byte[PageSize];
-            var newHdr = new SlottedPageHeader
+            AppendRecord(chain[target].Buffer, newData);
+            if (target == foundPage)
             {
-                PageId           = targetPageId,
-                PageType         = PageType.Collection,
-                SlotCount        = 0,
-                FreeSpaceStart   = SlottedPageHeader.Size,
-                FreeSpaceEnd     = (ushort)PageSize,
-                NextOverflowPage = 0,
-                TransactionId    = 0
-            };
-            newHdr.WriteTo(targetBuf);
-
-            // Append new page to the end of the chain
-            var (lastPid, lastBuf) = loadedPages[loadedPages.Count - 1];
-            var lastHdr = SlottedPageHeader.ReadFrom(lastBuf);
-            lastHdr.NextOverflowPage = targetPageId;
-            lastHdr.WriteTo(lastBuf);
-            WritePageImmediate(lastPid, lastBuf);
-
-            // Flush the deletion page if it differs from lastPage
-            if (foundSlotIndex >= 0 && foundOnPageIdx != loadedPages.Count - 1)
-            {
-                var (fpid, fbuf) = loadedPages[foundOnPageIdx];
-                WritePageImmediate(fpid, fbuf);
+                // Same page: one write covers both the new record and the deletion.
+                MarkSlotDeleted(chain[foundPage].Buffer, foundSlot);
+                foundPage = -1;
             }
-
-            loadedPages.Add((targetPageId, targetBuf));
+            WritePageImmediate(chain[target].PageId, chain[target].Buffer);
         }
 
-        // If deletion page != target page, flush it now
-        if (foundSlotIndex >= 0)
+        if (foundPage >= 0)
         {
-            var (fpid, fbuf) = loadedPages[foundOnPageIdx];
-            if (fpid != targetPageId)
-                WritePageImmediate(fpid, fbuf);
+            MarkSlotDeleted(chain[foundPage].Buffer, foundSlot);
+            WritePageImmediate(chain[foundPage].PageId, chain[foundPage].Buffer);
         }
-
-        // ── Pass 4: insert new slot into targetBuf ──
-        var th = SlottedPageHeader.ReadFrom(targetBuf);
-
-        // Defensive check (should not trigger given the logic above)
-        if (th.AvailableFreeSpace < newData.Length + SlotEntry.Size)
-            throw new InvalidOperationException(
-                $"Not enough space in Collection page {targetPageId} to save collection metadata.");
-
-        int docOff = th.FreeSpaceEnd - newData.Length;
-        newData.CopyTo(targetBuf.AsSpan(docOff));
-
-        int  newSlotOff = SlottedPageHeader.Size + (th.SlotCount * SlotEntry.Size);
-        var  newSlot    = new SlotEntry
-        {
-            Offset = (ushort)docOff,
-            Length = (ushort)newData.Length,
-            Flags  = SlotFlags.None
-        };
-        newSlot.WriteTo(targetBuf.AsSpan(newSlotOff));
-
-        th.SlotCount++;
-        th.FreeSpaceEnd   = (ushort)docOff;
-        th.FreeSpaceStart = (ushort)(SlottedPageHeader.Size + (th.SlotCount * SlotEntry.Size));
-        th.WriteTo(targetBuf);
-
-        WritePageImmediate(targetPageId, targetBuf);
         } // end try
         finally { _metadataLock.Release(); }
+    }
+
+    // ── Collection metadata chain (page 1 and its overflow pages) ────────────
+
+    /// <summary>Reads the Collection pages of the metadata chain, starting at page 1.</summary>
+    private List<(uint PageId, byte[] Buffer)> LoadMetadataChain()
+    {
+        var chain = new List<(uint PageId, byte[] Buffer)>();
+        uint pageId = 1;
+        while (pageId != 0)
+        {
+            var buffer = new byte[PageSize];
+            ReadPage(pageId, null, buffer);
+            var header = SlottedPageHeader.ReadFrom(buffer);
+            if (header.PageType != PageType.Collection)
+                break;
+            chain.Add((pageId, buffer));
+            pageId = header.NextOverflowPage;
+        }
+        return chain;
+    }
+
+    /// <summary>Finds the first live record of the named collection, or (-1, -1).</summary>
+    private static (int Page, int Slot) FindMetadataRecord(List<(uint PageId, byte[] Buffer)> chain, string name)
+    {
+        for (int p = 0; p < chain.Count; p++)
+        {
+            var buffer = chain[p].Buffer;
+            var header = SlottedPageHeader.ReadFrom(buffer);
+            for (int i = 0; i < header.SlotCount; i++)
+            {
+                var slot = ReadSlot(buffer, i);
+                if ((slot.Flags & SlotFlags.Deleted) != 0) continue;
+                if (string.Equals(TryReadRecordName(buffer, slot), name, StringComparison.OrdinalIgnoreCase))
+                    return (p, i);
+            }
+        }
+        return (-1, -1);
+    }
+
+    /// <summary>
+    /// Packs the live records of the chain into as few pages as possible, starting at page 1 and in
+    /// their current order, and frees the pages no longer needed. Deleted records, bytes left behind
+    /// by records overwritten with shorter ones, and duplicates of a record (kept: the first, as
+    /// lookups do) are dropped.
+    /// </summary>
+    /// <param name="onlyIfShorter">
+    /// Only rewrite when that frees at least one page; otherwise whenever there is anything to drop.
+    /// </param>
+    /// <returns>The chain as it is afterwards.</returns>
+    /// <remarks>
+    /// Pages are rewritten front to back and every record lands on its own page or an earlier one,
+    /// so all records are on some page after each write. A crash part-way can leave a record on
+    /// two pages; the copies are identical, readers take the first, and the next compaction drops
+    /// the other.
+    /// </remarks>
+    private List<(uint PageId, byte[] Buffer)> CompactMetadataChain(List<(uint PageId, byte[] Buffer)> chain, bool onlyIfShorter)
+    {
+        var records = new List<byte[]>();
+        var names   = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool anythingToDrop = false;
+
+        foreach (var (_, buffer) in chain)
+        {
+            var header = SlottedPageHeader.ReadFrom(buffer);
+            int liveBytes = 0;
+            for (int i = 0; i < header.SlotCount; i++)
+            {
+                var slot = ReadSlot(buffer, i);
+                if ((slot.Flags & SlotFlags.Deleted) != 0) { anythingToDrop = true; continue; }
+
+                var name = TryReadRecordName(buffer, slot);
+                if (name != null && !names.Add(name)) { anythingToDrop = true; continue; }
+
+                records.Add(buffer.AsSpan(slot.Offset, slot.Length).ToArray());
+                liveBytes += slot.Length;
+            }
+            if (PageSize - header.FreeSpaceEnd > liveBytes) anythingToDrop = true;
+        }
+
+        // Greedy packing in order needs no more pages than any in-order layout, the current one included.
+        var pages = new List<List<byte[]>> { new() };
+        int room = PageSize - SlottedPageHeader.Size;
+        foreach (var record in records)
+        {
+            int need = record.Length + SlotEntry.Size;
+            if (need > room)
+            {
+                pages.Add(new List<byte[]>());
+                room = PageSize - SlottedPageHeader.Size;
+            }
+            pages[pages.Count - 1].Add(record);
+            room -= need;
+        }
+
+        if (pages.Count >= chain.Count && (onlyIfShorter || !anythingToDrop))
+            return chain;
+
+        var result = new List<(uint PageId, byte[] Buffer)>(pages.Count);
+        for (int p = 0; p < pages.Count; p++)
+        {
+            var pageId = chain[p].PageId;
+            var next   = p + 1 < pages.Count ? chain[p + 1].PageId : 0u;
+            var buffer = new byte[PageSize];
+            NewMetadataPage(pageId, next).WriteTo(buffer);
+            foreach (var record in pages[p])
+                AppendRecord(buffer, record);
+            WritePageImmediate(pageId, buffer);
+            result.Add((pageId, buffer));
+        }
+
+        // Page 1 is always kept; the pages after the new end of the chain are no longer reachable.
+        for (int p = pages.Count; p < chain.Count; p++)
+            FreePage(chain[p].PageId);
+
+        return result;
+    }
+
+    private SlottedPageHeader NewMetadataPage(uint pageId, uint nextPageId) => new()
+    {
+        PageId           = pageId,
+        PageType         = PageType.Collection,
+        SlotCount        = 0,
+        FreeSpaceStart   = SlottedPageHeader.Size,
+        FreeSpaceEnd     = (ushort)PageSize,
+        NextOverflowPage = nextPageId,
+        TransactionId    = 0
+    };
+
+    /// <summary>Adds <paramref name="record"/> as a new slot; the caller checked that it fits.</summary>
+    private static void AppendRecord(byte[] page, byte[] record)
+    {
+        var header = SlottedPageHeader.ReadFrom(page);
+        int offset = header.FreeSpaceEnd - record.Length;
+        record.CopyTo(page.AsSpan(offset));
+        WriteSlot(page, header.SlotCount, new SlotEntry
+        {
+            Offset = (ushort)offset,
+            Length = (ushort)record.Length,
+            Flags  = SlotFlags.None
+        });
+        header.SlotCount++;
+        header.FreeSpaceEnd   = (ushort)offset;
+        header.FreeSpaceStart = (ushort)(SlottedPageHeader.Size + (header.SlotCount * SlotEntry.Size));
+        header.WriteTo(page);
+    }
+
+    private static void MarkSlotDeleted(byte[] page, int slotIndex)
+    {
+        var slot = ReadSlot(page, slotIndex);
+        slot.Flags |= SlotFlags.Deleted;
+        WriteSlot(page, slotIndex, slot);
+    }
+
+    private static SlotEntry ReadSlot(byte[] page, int slotIndex)
+        => SlotEntry.ReadFrom(page.AsSpan(SlottedPageHeader.Size + (slotIndex * SlotEntry.Size)));
+
+    private static void WriteSlot(byte[] page, int slotIndex, SlotEntry slot)
+        => slot.WriteTo(page.AsSpan(SlottedPageHeader.Size + (slotIndex * SlotEntry.Size)));
+
+    /// <summary>The collection name a record starts with, or <c>null</c> if the record is malformed.</summary>
+    private static string? TryReadRecordName(byte[] page, SlotEntry slot)
+    {
+        try
+        {
+            using var ms     = new MemoryStream(page, slot.Offset, slot.Length, false);
+            using var reader = new BinaryReader(ms);
+            return reader.ReadString();
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -544,10 +649,11 @@ public sealed partial class StorageEngine
                     if (!string.Equals(collName, name, StringComparison.OrdinalIgnoreCase))
                         continue;
 
+                    // Keep going: a crash while the chain was compacted can leave a second,
+                    // identical copy further on (see CompactMetadataChain).
                     slot.Flags |= SlotFlags.Deleted;
                     slot.WriteTo(buffer.AsSpan(slotOffset));
                     WritePageImmediate(pageId, buffer);
-                    return;
                 }
                 catch { }
             }
@@ -561,6 +667,9 @@ public sealed partial class StorageEngine
     public IReadOnlyList<CollectionMetadata> GetAllCollectionsMetadata()
     {
         var result = new List<CollectionMetadata>();
+        // One entry per collection: the first copy, as GetCollectionMetadata returns it (a crash
+        // while the chain was compacted can leave a second one; see CompactMetadataChain).
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var buffer = new byte[PageSize];
         uint pageId = 1;
 
@@ -584,7 +693,9 @@ public sealed partial class StorageEngine
                     using var reader = new BinaryReader(ms);
 
                     var collName = reader.ReadString();
+                    if (seen.Contains(collName)) continue;
                     result.Add(ReadCollectionMetadata(collName, reader));
+                    seen.Add(collName);
                 }
                 catch
                 {
