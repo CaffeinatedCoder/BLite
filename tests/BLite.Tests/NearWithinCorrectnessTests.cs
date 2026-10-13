@@ -199,8 +199,9 @@ public class NearWithinCorrectnessTests : IDisposable
         Assert.Contains("only one VectorSearch", ex.Message);
     }
 
-    // Only the VectorSearch in a Where that FetchAsync applied is served by the index. One in a
-    // projection, a group or an aggregate after the fetch must still throw, not match everything.
+    // Only the VectorSearch in a Where that FetchAsync applied (or in a terminal predicate folded
+    // into it) is served by the index. One in a projection, a group or an aggregate selector after
+    // the fetch must still throw, not match everything.
 
     private static readonly float[] Q = [0f, 0f, 0f];
 
@@ -272,14 +273,22 @@ public class NearWithinCorrectnessTests : IDisposable
             .Sum(x => x.Embedding.VectorSearch(Q, 1) ? 1 : 0));
     }
 
+    // Count(p) after a plain Where is folded into the WHERE (#180), so its VectorSearch is served
+    // by the index like any other: the vector term drives and Title != null is the post-filter.
     [Fact]
-    public async Task VectorSearch_InCountPredicate_AfterOtherWhere_Throws()
+    public async Task VectorSearch_InCountPredicate_AfterOtherWhere_IsFoldedIntoTheWhere()
     {
         await InsertVectorProbeDataAsync();
 
-        Assert.Throws<NotSupportedException>(() => _db.VectorItems.AsQueryable()
+        var folded = _db.VectorItems.AsQueryable()
             .Where(x => x.Title != null)
-            .Count(x => x.Embedding.VectorSearch(Q, 1)));
+            .Count(x => x.Embedding.VectorSearch(Q, 1));
+        var combined = _db.VectorItems.AsQueryable()
+            .Where(x => x.Title != null && x.Embedding.VectorSearch(Q, 1))
+            .Count();
+
+        Assert.Equal(combined, folded);
+        Assert.Equal(1, folded);
     }
 
     // ── DynamicCollection ───────────────────────────────────────────────────
