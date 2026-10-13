@@ -269,6 +269,20 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             return pushed;
         }
 
+        // ── Several query sources ─────────────────────────────────────────────
+        // A query that reads a queryable outside its main chain (q.Where(...).Concat(q), a
+        // self-join, a subquery inside a lambda) cannot be served by one filtered or paged
+        // fetch: the model mixes the clauses of the different uses, and EnumerableRewriter
+        // replaces every use of the root with the same source. Replay the whole query over
+        // the whole collection.
+        if (HasSecondaryQuery(expression))
+        {
+            var all = new List<T>();
+            await foreach (var item in _collection.FetchAsync(null, int.MaxValue, cancellationToken))
+                all.Add(item);
+            return ExecuteViaEnumerableRewriter<TResult>(expression, all);
+        }
+
         // 2. Data fetching.
         // When Take (+ optional Skip) is present without complex operators or ordering that
         // requires a full scan first, cap how many rows we need to materialise.
@@ -306,8 +320,8 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
                 // whole query over them. OrderBy is a stable sort, so the replay keeps the index
                 // order and its Skip/Take select the same window.
                 // This needs the root queryable to be the query's only source: EnumerableRewriter
-                // replaces every use of it with the prefix, so TryGetIndexWindow rejects a query
-                // that reads a queryable again after the window (Concat(q), Join(q, ...)).
+                // replaces every use of it with the prefix. A query that reads a queryable again
+                // (Concat(q), Join(q, ...)) took the HasSecondaryQuery path above.
                 var prefix = new List<T>(windowEnd);
                 await foreach (var item in _collection.QueryIndexAsync(orderOpt.IndexName, null, null, ascending, 0, windowEnd, cancellationToken))
                     prefix.Add(item);
@@ -487,12 +501,6 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         if (length == long.MaxValue) return false;
         if (i < calls.Count && calls[i].Method.Name is "ThenBy" or "ThenByDescending") return false;
 
-        // A second query source after the window (Concat(q), Join(q, ...), Union(q.Select(...))):
-        // the replay would read the window prefix for it, since every use of the root is replaced.
-        for (int j = i; j < calls.Count; j++)
-            for (int a = 1; a < calls[j].Arguments.Count; a++)
-                if (ContainsQueryableConstant(calls[j].Arguments[a])) return false;
-
         long end = start + length;
         if (end > int.MaxValue) return false;
         windowEnd = (int)end;
@@ -505,15 +513,27 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         return true;
     }
 
-    /// <summary>Whether <paramref name="expression"/> contains a constant holding an <see cref="IQueryable"/>, i.e. a query source.</summary>
-    private static bool ContainsQueryableConstant(Expression expression)
+    /// <summary>
+    /// Whether an operator of the main chain (the <c>Queryable</c> calls from the result down
+    /// to the root) has an argument other than its source that holds a queryable or calls a
+    /// <c>Queryable</c> operator: a second use of the root (<c>Concat(q)</c>, <c>Join(q, ...)</c>,
+    /// <c>Union(q.Select(...))</c>), another source, or a subquery inside a lambda.
+    /// </summary>
+    private static bool HasSecondaryQuery(Expression expression)
     {
-        var finder = new QueryableConstantFinder();
-        finder.Visit(expression);
-        return finder.Found;
+        var finder = new SecondaryQueryFinder();
+        for (var current = expression;
+             current is MethodCallExpression call && call.Method.DeclaringType == typeof(Queryable);
+             current = call.Arguments[0])
+        {
+            for (int i = 1; i < call.Arguments.Count && !finder.Found; i++)
+                finder.Visit(call.Arguments[i]);
+            if (finder.Found) return true;
+        }
+        return false;
     }
 
-    private sealed class QueryableConstantFinder : ExpressionVisitor
+    private sealed class SecondaryQueryFinder : ExpressionVisitor
     {
         public bool Found { get; private set; }
 
@@ -523,6 +543,16 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         {
             if (node.Value is IQueryable) Found = true;
             return node;
+        }
+
+        protected override Expression VisitMethodCall(MethodCallExpression node)
+        {
+            if (node.Method.DeclaringType == typeof(Queryable))
+            {
+                Found = true;
+                return node;
+            }
+            return base.VisitMethodCall(node);
         }
     }
 

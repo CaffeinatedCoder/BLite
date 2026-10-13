@@ -102,6 +102,16 @@ public class SelectTerminalTests : IDisposable
         ["OrderByIdx.Take.Count(correlated closure)"] = q => q.OrderBy(p => p.Age).Take(12).Count(x => q.Any(y => y.Age == x.Age + 1)),
         ["Count(correlated closure)"]                 = q => q.Count(x => q.Any(y => y.Age == x.Age + 1)),
 
+        // Outside the window path: a Where on one use of the root, or inside a lambda, must not
+        // filter the other uses.
+        ["Where.Concat(root).Count"]               = q => q.Where(p => p.Age < 10).Concat(q).Count(),
+        ["Concat(root.Where).Count"]               = q => q.Concat(q.Where(p => p.Age < 10)).Count(),
+        ["Where.Join(root).Count"]                 = q => q.Where(p => p.Age == 1).Join(q, a => a.Age, b => b.Age - 1, (a, b) => b.Name).Count(),
+        ["Concat(root).Sum(sel)"]                  = q => q.Concat(q).Sum(p => p.Age),
+        ["Take.Concat(root.Take).Count"]           = q => q.Take(5).Concat(q.Take(3)).Count(),
+        ["OrderByIdx.Take.Concat(root.Where).Sum"] = q => q.OrderBy(p => p.Age).Take(5).Concat(q.Where(p => p.Age >= 10)).Sum(p => p.Age),
+        ["Any(closure Where)"]                     = q => q.Any(x => x.Age == 0 && q.Where(y => y.Age == 49).Any()),
+
         // Parameterless Sum/Average after Select (non-generic Queryable overloads).
         ["Select(long).Sum"]           = q => q.Select(p => (long)p.Age).Sum(),
         ["Select(double).Average"]     = q => q.Select(p => (double)p.Age).Average(),
