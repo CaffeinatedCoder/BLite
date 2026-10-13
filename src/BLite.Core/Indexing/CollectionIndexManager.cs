@@ -25,6 +25,9 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     private readonly string _collectionName;
     private CollectionMetadata _metadata;
     private volatile IReadOnlyList<CollectionIndexInfo>? _cachedIndexInfo;
+    // Whether any index is a unique BTree index, so EnsureUniqueInAll can skip the loop.
+    // Refreshed under _lock whenever _indexes changes.
+    private volatile bool _hasUniqueBTreeIndex;
 
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     [RequiresUnreferencedCode("Index creation uses reflection (Expression.PropertyOrField) to access type members. Ensure all entity types and their members are preserved.")]
@@ -54,8 +57,18 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             rootAllocated |= index.RootPageId != idxMeta.RootPageId;
         }
 
+        RefreshHasUniqueBTreeIndex();
+
         if (rootAllocated)
             SaveMetadata();
+    }
+
+    private void RefreshHasUniqueBTreeIndex()
+    {
+        var any = false;
+        foreach (var index in _indexes.Values)
+            any |= index.IsUniqueBTree;
+        _hasUniqueBTreeIndex = any;
     }
 
     private void UpdateMetadata()
@@ -101,6 +114,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             var secondaryIndex = new CollectionSecondaryIndex<TId, T>(definition, _storage, _mapper);
             _indexes[definition.Name] = secondaryIndex;
             _cachedIndexInfo = null; // invalidate cache
+            RefreshHasUniqueBTreeIndex();
             
             // Persist metadata
             UpdateMetadata();
@@ -279,6 +293,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
                 index.Dispose();
                 _indexes.Remove(name);
                 _cachedIndexInfo = null; // invalidate cache
+                RefreshHasUniqueBTreeIndex();
                 
                 SaveMetadata(); // Save metadata after dropping index
                 return true;
@@ -343,6 +358,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
 
             _indexes[name] = fresh;
             _cachedIndexInfo = null; // invalidate cache
+            RefreshHasUniqueBTreeIndex();
 
             // Persist the new root before freeing the old tree: a crash in between leaks the old
             // pages, whereas the reverse order would let the next open free them a second time.
@@ -500,6 +516,32 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     }
 
     /// <summary>
+    /// Throws if <paramref name="document"/> would violate any unique index.
+    /// Call before any page is written, so a rejected write leaves nothing behind.
+    /// On update, pass the stored version as <paramref name="oldDocument"/>: only indexes whose
+    /// key changed are checked, so documents that already share a value can still be updated.
+    /// </summary>
+    /// <param name="document">Document about to be inserted or written by an update</param>
+    /// <param name="oldDocument">Stored version of the document on update; null on insert</param>
+    /// <param name="transaction">Transaction context</param>
+    public void EnsureUniqueInAll(T document, T? oldDocument, ITransaction transaction)
+    {
+        if (document == null)
+            throw new ArgumentNullException(nameof(document));
+
+        if (!_hasUniqueBTreeIndex)
+            return;
+
+        lock (_lock)
+        {
+            foreach (var index in _indexes.Values)
+            {
+                index.EnsureUnique(document, oldDocument, transaction);
+            }
+        }
+    }
+
+    /// <summary>
     /// Updates a document in all indexes
     /// </summary>
     /// <param name="oldDocument">Old version of document</param>
@@ -645,6 +687,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             }
             
             _indexes.Clear();
+            _hasUniqueBTreeIndex = false;
             _disposed = true;
         }
 
