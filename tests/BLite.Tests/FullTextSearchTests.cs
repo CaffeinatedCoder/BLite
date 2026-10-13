@@ -748,6 +748,87 @@ public class FullTextSearchTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A rebuild on open that fails late, after the new tree has split, frees every page of the
+    /// partial rebuild and keeps the old index: it is retried on each open without growing the
+    /// file, and succeeds once the document can be read again.
+    /// </summary>
+    [Fact]
+    public async Task Dynamic_RebuildOnOpen_ThatFailsLate_KeepsTheOldIndex_AndDoesNotGrowTheFile()
+    {
+        const int count = 3000;
+        uint root;
+        DocumentLocation last;
+        byte[] intact;
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            var col = engine.GetOrCreateCollection("notes");
+            await col.InsertBulkAsync(Enumerable.Range(0, count).Select(i => col.CreateDocument(["title", "text"], b => b
+                .AddString("title", $"n{i}").AddString("text", $"note number{i} about topic{i % 50} and more words"))).ToList());
+            await col.CreateFullTextIndexAsync("text");
+
+            var storage = engine.Storage;
+            var index = StoredFullTextIndex(storage, "notes", "idx_fts_text");
+            root = index.RootPageId;
+            // A foreign key makes the next open rebuild the index.
+            var txn = storage.BeginTransaction();
+            new BTreeIndex(storage, IndexOptions.CreateBTree("text"), root).Insert(new IndexKey("plain"), new DocumentLocation(1, 1), txn.TransactionId);
+            await txn.CommitAsync();
+            await engine.CheckpointAsync();
+
+            // Make the last document in primary-key order unreadable, so the rebuild fails only
+            // after thousands of inserts.
+            var primary = new BTreeIndex(storage, IndexOptions.CreateUnique("_id"), storage.GetCollectionMetadata("notes")!.PrimaryRootPageId);
+            last = primary.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Backward).First().Location;
+            intact = new byte[storage.PageSize];
+            storage.ReadPage(last.PageId, null, intact);
+            var corrupt = (byte[])intact.Clone();
+            var slot = SlotEntry.ReadFrom(corrupt.AsSpan(SlottedPageHeader.Size + last.SlotIndex * SlotEntry.Size));
+            corrupt.AsSpan(slot.Offset + 4, 12).Fill(0xFF); // invalid element types
+            storage.WritePageImmediate(last.PageId, corrupt);
+        }
+
+        var sizes = new List<long>();
+        for (int open = 0; open < 4; open++)
+        {
+            using (var engine = new BLiteEngine(_dbPath))
+                Assert.ThrowsAny<Exception>(() => engine.GetOrCreateCollection("notes"));
+            sizes.Add(new FileInfo(_dbPath).Length);
+
+            using (var engine = new BLiteEngine(_dbPath)) // the collection itself is not opened
+            {
+                // The old index is still the persisted one, foreign key and all, so the next open retries.
+                var stored = StoredFullTextIndex(engine.Storage, "notes", "idx_fts_text");
+                Assert.Equal(root, stored.RootPageId);
+                Assert.True(stored.HasForeignKeys());
+                Assert.Single(stored.Match("number7", null));
+            }
+        }
+        // The first failed open may extend the file; the following ones reuse the freed pages.
+        Assert.All(sizes.Skip(1), size => Assert.Equal(sizes[0], size));
+
+        using (var engine = new BLiteEngine(_dbPath))
+            engine.Storage.WritePageImmediate(last.PageId, intact);
+
+        uint rebuilt;
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            var col = engine.GetOrCreateCollection("notes");
+            var stored = StoredFullTextIndex(engine.Storage, "notes", "idx_fts_text");
+            rebuilt = stored.RootPageId;
+            Assert.NotEqual(root, rebuilt);
+            Assert.False(stored.HasForeignKeys());
+            Assert.Equal(count / 50, (await col.FullTextSearchAsync("idx_fts_text", "topic7", count).ToListAsync()).Count);
+        }
+
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            // Rebuilt once: the next open keeps the tree.
+            engine.GetOrCreateCollection("notes");
+            Assert.Equal(rebuilt, StoredFullTextIndex(engine.Storage, "notes", "idx_fts_text").RootPageId);
+        }
+    }
+
     [Fact]
     public async Task Dynamic_StalePostings_NeverSurfaceTheDocumentAtTheirLocation()
     {

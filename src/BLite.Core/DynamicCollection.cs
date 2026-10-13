@@ -72,6 +72,12 @@ public sealed class DynamicCollection : IDisposable
         public VectorSearchIndex? Vector { get; }
         public RTreeIndex? Spatial { get; }
         public FullTextIndex? FullText { get; }
+        /// <summary>
+        /// Key format of a full-text index's pages, persisted as its <see cref="IndexMetadata.KeyFormat"/>.
+        /// Kept per index so persisting the metadata never marks an index that still awaits its
+        /// rebuild as current.
+        /// </summary>
+        public byte KeyFormat { get; init; } = FullTextIndex.FormatVersion;
         public uint RootPageId => BTree?.RootPageId ?? Vector?.RootPageId ?? Spatial?.RootPageId ?? FullText?.RootPageId ?? 0;
 
         public DynamicSecondaryIndex(BTreeIndex btree, string fieldPath, IndexOptions options)
@@ -169,7 +175,7 @@ public sealed class DynamicCollection : IDisposable
                     {
                         var opts = IndexOptions.CreateBTree(idxMeta.PropertyPaths);
                         var fullText = new FullTextIndex(_storage, opts, idxMeta.RootPageId);
-                        _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(fullText, fieldPath, opts);
+                        _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(fullText, fieldPath, opts) { KeyFormat = idxMeta.KeyFormat };
                         if (idxMeta.KeyFormat != FullTextIndex.FormatVersion || fullText.HasForeignKeys())
                             staleFullTextIndexes.Add(idxMeta.Name);
                         break;
@@ -221,33 +227,91 @@ public sealed class DynamicCollection : IDisposable
     /// <summary>
     /// Rebuilds full-text index <paramref name="name"/> into a fresh tree, swaps it in once the
     /// rebuild committed, persists it with the current format version and frees the old tree.
+    /// If the rebuild or the swap fails, the fresh tree's pages are freed and the old index stays
+    /// persisted as it was, so the next open retries.
     /// </summary>
     private void RebuildFullTextIndex(string name)
     {
         var old = _secondaryIndexes[name];
         var fresh = new DynamicSecondaryIndex(new FullTextIndex(_storage, old.Options), old.FieldPath, old.Options);
+        // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+        Task.Run(() => FillUnregisteredFullTextIndexAsync(fresh)).GetAwaiter().GetResult();
+
+        var oldPages = old.FullText!.CollectAllPages();
+        PublishFullTextIndex(name, fresh, old);
+        foreach (var pageId in oldPages)
+            _storage.FreePage(pageId);
+    }
+
+    /// <summary>
+    /// Fills a full-text index that is not registered yet from every document, in its own
+    /// transaction, and commits it. If a document cannot be read or indexed, or the commit fails,
+    /// every page of the index is freed, including the pages its splits added, and the exception
+    /// propagates.
+    /// </summary>
+    private async Task FillUnregisteredFullTextIndexAsync(DynamicSecondaryIndex index)
+    {
         var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
         try
         {
             foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
             {
                 var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
-                if (doc != null) IndexInsert(fresh, doc, e.Location, transaction);
+                if (doc != null) IndexInsert(index, doc, e.Location, transaction);
             }
-            // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
-            Task.Run(async () => await transaction.CommitAsync()).GetAwaiter().GetResult();
+            await transaction.CommitAsync().ConfigureAwait(false);
         }
         catch
         {
-            Task.Run(async () => await transaction.RollbackAsync()).GetAwaiter().GetResult();
+            // Collect the pages through the transaction before rolling it back: pages added by
+            // splits are allocated outside the transaction but linked only from nodes written in
+            // it, so after the rollback they could not be found any more.
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = index.FullText!.CollectAllPages(transaction.TransactionId); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            try { await transaction.RollbackAsync().ConfigureAwait(false); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            FreePagesBestEffort(pages);
             throw;
         }
+    }
 
-        var oldPages = old.FullText!.CollectAllPages();
-        _secondaryIndexes[name] = fresh;
-        PersistIndexMetadata();
-        foreach (var pageId in oldPages)
-            _storage.FreePage(pageId);
+    /// <summary>
+    /// Registers the filled full-text index <paramref name="index"/> under <paramref name="name"/>
+    /// in place of <paramref name="previous"/> (null: none) and persists the metadata. If that
+    /// fails, the previous registration is restored, the index's pages are freed and the exception
+    /// propagates.
+    /// </summary>
+    private void PublishFullTextIndex(string name, DynamicSecondaryIndex index, DynamicSecondaryIndex? previous)
+    {
+        _secondaryIndexes[name] = index;
+        try
+        {
+            PersistIndexMetadata();
+        }
+        catch
+        {
+            if (previous != null) _secondaryIndexes[name] = previous;
+            else _secondaryIndexes.Remove(name);
+
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = index.FullText!.CollectAllPages(); }
+            catch { /* best-effort: never mask the original failure */ }
+            FreePagesBestEffort(pages);
+            throw;
+        }
+    }
+
+    private void FreePagesBestEffort(IReadOnlyList<uint> pages)
+    {
+        try
+        {
+            foreach (var pageId in pages)
+                _storage.FreePage(pageId);
+        }
+        catch { /* best-effort: never mask the original failure */ }
     }
 
     private void RebuildFreeSpaceIndex()
@@ -1854,25 +1918,10 @@ public sealed class DynamicCollection : IDisposable
             var opts = IndexOptions.CreateBTree(fieldPath);
             var entry = new DynamicSecondaryIndex(new FullTextIndex(_storage, opts), fieldPath, opts);
 
-            // Fill before registering, so a crash or a failure leaves no partial index persisted.
-            var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
-            try
-            {
-                foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
-                {
-                    var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
-                    if (doc != null) IndexInsert(entry, doc, e.Location, transaction);
-                }
-                await transaction.CommitAsync().ConfigureAwait(false);
-            }
-            catch
-            {
-                await transaction.RollbackAsync().ConfigureAwait(false);
-                throw;
-            }
-
-            _secondaryIndexes[name] = entry;
-            PersistIndexMetadata();
+            // Fill before registering, so a crash or a failure leaves no partial index persisted;
+            // a failed fill or registration frees the index's pages.
+            await FillUnregisteredFullTextIndexAsync(entry).ConfigureAwait(false);
+            PublishFullTextIndex(name, entry, previous: null);
         }
         finally
         {
@@ -1984,7 +2033,7 @@ public sealed class DynamicCollection : IDisposable
                     break;
                 case DynamicIndexKind.FullText:
                     idxMeta.Type = IndexType.FullText;
-                    idxMeta.KeyFormat = FullTextIndex.FormatVersion;
+                    idxMeta.KeyFormat = idx.KeyFormat;
                     break;
             }
 
