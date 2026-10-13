@@ -19,31 +19,6 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     private readonly DocumentCollection<TId, T> _collection;
     private readonly ValueConverterRegistry _converterRegistry;
 
-    // ── Reflection cache (computed once per TId+T combination) ────────────────
-    // BsonProjectionCompiler.TryCompile<T, TResult> generic method definition.
-    // Targets the 3-parameter overload (selectLambda, whereLambda, keyMap) so that
-    // the key map can be threaded in for offset-table fast paths.
-#pragma warning disable IL2026, IL2075
-    private static readonly MethodInfo s_tryCompileMethod =
-        typeof(BsonProjectionCompiler)
-            .GetMethods(BindingFlags.Static | BindingFlags.Public)
-            .Single(m => m.Name == nameof(BsonProjectionCompiler.TryCompile)
-                         && m.GetParameters().Length == 3);
-
-    // DocumentCollection<TId,T>.ScanAsync<TResult>(BsonReaderProjector<TResult>, CancellationToken) — generic overload.
-    private static readonly MethodInfo s_scanProjectorMethod =
-        typeof(DocumentCollection<TId, T>)
-            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
-            .Single(m => m.Name == "ScanAsync" && m.IsGenericMethodDefinition);
-#pragma warning restore IL2026, IL2075
-
-    // ── Per-projection-type MakeGenericMethod cache (Fase 3) ─────────────────
-    // Keyed on TProj. Avoids calling MakeGenericMethod on every query execution.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo>
-        s_compiledSelectMethods = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo>
-        s_compiledScanMethods = new();
-
     public BTreeQueryProvider(DocumentCollection<TId, T> collection, ValueConverterRegistry? registry = null)
     {
         _collection = collection;
@@ -254,18 +229,6 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             if (handled) return (TResult)value!;
         }
 
-        // ── Push-down SELECT (+ optional WHERE) ───────────────────────────────
-        // Single-pass BSON projection: no T instantiation, no EnumerableRewriter.
-        // Only applicable when there is no post-scan ordering or paging.
-        if (model.SelectClause is not null
-            && model.OrderByClause is null
-            && !model.Take.HasValue
-            && !model.Skip.HasValue)
-        {
-            var pushed = TryPushDownSelect<TResult>(model.SelectClause, model.WhereClause);
-            if (pushed is not null) return pushed;
-        }
-
         // 2. Data fetching.
         // When Take (+ optional Skip) is present without complex operators or ordering that
         // requires a full scan first, cap how many rows we need to materialise.
@@ -367,7 +330,7 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         if (model.Skip.HasValue) data = data.Skip(model.Skip.Value);
         if (model.Take.HasValue) data = data.Take(model.Take.Value);
 
-        // SELECT (with ORDER BY / SKIP / TAKE — rare path, push-down already handled the common case)
+        // SELECT
         if (model.SelectClause != null)
             return ProjectEnumerable<TResult>(data, model.SelectClause);
 
@@ -455,54 +418,6 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             source = where.Arguments[0];
         }
         return source is ConstantExpression { Value: IQueryable };
-    }
-
-    // ─── Push-down SELECT helper ──────────────────────────────────────────────
-
-    /// <summary>
-    /// Attempts to execute the query entirely via a single-pass BSON projection scan,
-    /// bypassing full <typeparamref name="T"/> deserialisation.
-    /// </summary>
-    /// <returns>The projected <c>IEnumerable&lt;TProj&gt;</c>, or <c>null</c> if push-down is
-    /// not applicable (caller should fall through to the standard path).</returns>
-    [RequiresDynamicCode("BLite LINQ queries use Expression.Compile() and MakeGenericMethod which require dynamic code generation.")]
-    [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
-    private TResult? TryPushDownSelect<TResult>(LambdaExpression selectLambda,
-                                                   LambdaExpression? whereLambda = null)
-    {
-        // We need TResult = IEnumerable<TProj> for some projection type TProj.
-        var resultType = typeof(TResult);
-        if (!resultType.IsGenericType) return default;
-        if (resultType.GetGenericTypeDefinition() != typeof(IEnumerable<>)) return default;
-
-        var projType = resultType.GetGenericArguments()[0];
-        if (projType == typeof(T)) return default; // not a real projection
-
-        // Compile the push-down projector via reflection (TProj is only known at runtime).
-        // BsonProjectionCompiler.TryCompile<T, TProj>(selectLambda, whereLambda?) handles
-        // both the pure-SELECT and the WHERE+SELECT cases in a single BSON pass.
-        object? projector;
-        try
-        {
-            var compileMethod = s_compiledSelectMethods.GetOrAdd(
-                projType,
-                t => s_tryCompileMethod.MakeGenericMethod(typeof(T), t));
-            projector = compileMethod.Invoke(null, [selectLambda, whereLambda, _collection.GetKeyMap()]);
-        }
-        catch { return default; }
-
-        if (projector is null) return default; // compilation soft-failed
-
-        // Invoke _collection.Scan<TProj>(projector) — MethodInfo cached per TProj.
-        try
-        {
-            var scanMethod = s_compiledScanMethods.GetOrAdd(
-                projType,
-                t => s_scanProjectorMethod.MakeGenericMethod(t));
-            var result = scanMethod.Invoke(_collection, [projector]);
-            return (TResult?)result;
-        }
-        catch { return default; }
     }
 
     // ─── Expression-tree helpers ──────────────────────────────────────────────

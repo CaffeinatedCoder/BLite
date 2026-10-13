@@ -185,6 +185,7 @@ namespace BLite.SourceGenerators
                         // Use hasCompilerGeneratedBackingField to detect that a private setter exists.
                         HasAnySetter = prop.SetMethod != null || hasCompilerGeneratedBackingField,
                         IsReadOnlyGetter = isReadOnlyGetter,
+                        IsAutoProperty = SyntaxHelper.IsAutoProperty(prop),
                         HasPrivateBackingFieldAccess = conventionalBackingField != null,
                         BackingFieldName = conventionalBackingField != null
                             ? conventionalBackingField.Name

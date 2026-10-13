@@ -22,6 +22,18 @@ public abstract class DocumentMapperBase<TId, T> : IDocumentMapper<TId, T> where
     public virtual IndexKey ToIndexKey(TId id) => IndexKey.Create(id);
     public virtual TId FromIndexKey(IndexKey key) => key.As<TId>();
 
+    /// <summary>
+    /// The BSON field <see cref="Serialize"/> stores <paramref name="propertyName"/> in, when
+    /// <see cref="Deserialize"/> gives the property exactly the value of that field (a plain
+    /// auto-property with no converter), so the value of the materialised property can be read from
+    /// the raw document instead; <c>null</c> when that does not hold or is not known.
+    /// </summary>
+    /// <remarks>
+    /// Generated mappers override this. The default returns <c>null</c>, so queries that could read a
+    /// property from raw BSON materialise the entities instead.
+    /// </remarks>
+    public virtual string? GetVerbatimFieldName(string propertyName) => null;
+
 #pragma warning disable IL2026
     public virtual IEnumerable<string> UsedKeys => GetSchema().GetAllKeys();
 #pragma warning restore IL2026

@@ -3502,10 +3502,18 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// the documents matching <paramref name="whereClause"/> without materialising them, with the
     /// result LINQ would compute over the entities. Returns <c>Handled = false</c> when the query
     /// must run the usual way.
+    /// <para>
+    /// Only for a property the mapper restores verbatim from a BSON field
+    /// (<see cref="DocumentMapperBase{TId, T}.GetVerbatimFieldName"/>): the stored value, in the
+    /// document or in an index key, is then the value of the materialised property. Ignored,
+    /// computed and converted properties, and ones whose accessors have logic, are materialised.
+    /// </para>
     /// <list type="number">
-    ///   <item>An <c>int</c>/<c>long</c> property with a B-Tree index, and no filter or one the same
-    ///         index covers exactly, is aggregated from the index keys alone (<c>Min</c>/<c>Max</c>
-    ///         read one entry).</item>
+    ///   <item>An <c>int</c>/<c>long</c> property with a B-Tree index on exactly that property, and
+    ///         no filter or one the same index covers exactly, is aggregated from the index keys
+    ///         alone (<c>Min</c>/<c>Max</c> read one entry). Keys are in value order, so a
+    ///         <c>Sum</c>/<c>Average</c> for which LINQ could overflow in one order but not in
+    ///         another is not taken from them.</item>
     ///   <item>Otherwise, when no index serves the filter, the property is read from the raw BSON
     ///         of each document in primary-key order, the order a scan yields the entities in. A
     ///         document without the field, or holding a type the entity would not be read from
@@ -3554,6 +3562,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         if (LinqAggregate<TValue>.ResultType(op, nullable) != resultType)
             return default;
 
+        // The field the mapper restores the property from unchanged. Without it, neither the raw
+        // field nor an index key (computed from the property when the document was written) is
+        // known to be the value the materialised entity returns.
+        var fieldName = (_mapper as DocumentMapperBase<TId, T>)?.GetVerbatimFieldName(property.Name);
+        if (fieldName == null)
+            return default;
+
         var plan = whereClause == null ? null : Query.IndexOptimizer.TryOptimize<T>(whereClause, GetIndexes(), ConverterRegistry);
 
         // Index keys hold the exact int/long value. Not for the other types: floating-point sums
@@ -3565,14 +3580,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 i.Definition.Type == IndexType.BTree
                 && !i.Definition.IsPrimary
                 && i.Definition.PropertyPaths.Length == 1
-                && i.Definition.PropertyPaths[0] == property.Name);
+                && i.Definition.PropertyPaths[0] == property.Name
+                && KeysAreValuesOf(i.Definition, property, typeof(TValue)));
 
             if (index != null)
             {
+                (bool Handled, object? Value) fromKeys = default;
                 if (whereClause == null)
-                    return AggregateIndexKeys<TValue>(op, nullable, index, null, null, true, true);
-
-                if (plan != null
+                {
+                    fromKeys = AggregateIndexKeys<TValue>(op, nullable, index, null, null, true, true);
+                }
+                else if (plan != null
                     && plan.IndexName == index.Name
                     && !plan.HasResiduePredicate
                     && !plan.IsVectorSearch
@@ -3580,13 +3598,18 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                     && plan.InValues == null
                     && plan.MinValue is not DBNull
                     && plan.MaxValue is not DBNull)
-                    return AggregateIndexKeys<TValue>(op, nullable, index, plan.MinValue, plan.MaxValue, plan.StartInclusive, plan.EndInclusive);
+                {
+                    fromKeys = AggregateIndexKeys<TValue>(op, nullable, index, plan.MinValue, plan.MaxValue, plan.StartInclusive, plan.EndInclusive);
+                }
+                if (fromKeys.Handled)
+                    return fromKeys;
+                // Otherwise aggregate the values in the order LINQ sees them, below.
             }
         }
 
         // An index serves the filter: fetching the matching documents through it is cheaper than
         // scanning them all, and keeps the order the values are aggregated in unchanged.
-        if (plan != null || IsRenamedInBson(property))
+        if (plan != null)
             return default;
 
         BsonReaderPredicate? predicate = null;
@@ -3596,7 +3619,25 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             if (predicate == null) return default;
         }
 
-        return await AggregateRawFieldAsync<TValue>(op, nullable, ProjectionAnalyzer.ToBsonName(property.Name), predicate, ct).ConfigureAwait(false);
+        return await AggregateRawFieldAsync<TValue>(op, nullable, fieldName, predicate, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the keys of the index <paramref name="definition"/> are the values of
+    /// <paramref name="property"/> itself (<c>x =&gt; x.Property</c>), encoded as
+    /// <paramref name="valueType"/>: the user key is encoded from the boxed value the selector
+    /// returns, so this fixes the key layout the index path decodes.
+    /// </summary>
+    private static bool KeysAreValuesOf(CollectionIndexDefinition<T> definition, System.Reflection.PropertyInfo property, Type valueType)
+    {
+        var body = definition.KeySelectorExpression.Body;
+        while (body is UnaryExpression { NodeType: ExpressionType.Convert } convert && convert.Type == typeof(object))
+            body = convert.Operand;
+
+        return body is MemberExpression { Member: System.Reflection.PropertyInfo keyProperty } access
+            && access.Expression == definition.KeySelectorExpression.Parameters[0]
+            && keyProperty.Name == property.Name
+            && (Nullable.GetUnderlyingType(access.Type) ?? access.Type) == valueType;
     }
 
     /// <summary>Aggregates the values of the index entries in the given range from their keys.</summary>
@@ -3610,7 +3651,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         bool endInclusive)
         where TValue : struct, IComparable<TValue>
     {
-        var aggregate = new LinqAggregate<TValue>(op, nullable, exactTotal: true);
+        var aggregate = new LinqAggregate<TValue>(op, nullable, anyOrder: true);
 
         if (op == AggregateOperator.Max)
         {
@@ -3626,7 +3667,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
         var visitor = new IndexKeyValueVisitor<TValue>(aggregate, stopAfterFirst: op == AggregateOperator.Min);
         index.ScanKeys(min, max, startInclusive, endInclusive, ref visitor);
-        return visitor.Malformed ? default : (true, aggregate.Result());
+        return visitor.Malformed || aggregate.DependsOnOrder ? default : (true, aggregate.Result());
     }
 
     /// <summary>
@@ -3657,10 +3698,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 return false;
             }
             _aggregate.Add(value);
-            return !_stopAfterFirst;
+            // Past an order-dependent sum the remaining keys cannot change the outcome.
+            return !_stopAfterFirst && !_aggregate.DependsOnOrder;
         }
 
-        /// <summary>Decodes the <see cref="IndexKey(int)"/> / <see cref="IndexKey(long)"/> prefix of a key.</summary>
+        /// <summary>
+        /// Decodes the <see cref="IndexKey(int)"/> / <see cref="IndexKey(long)"/> prefix of a
+        /// <c>[value][document id]</c> key. The index was checked to be keyed by a
+        /// <typeparamref name="TValue"/> (<see cref="KeysAreValuesOf"/>); a key not laid out that way
+        /// (no prefix byte, or no document id after the value) is reported as malformed rather than
+        /// decoded.
+        /// </summary>
         public static bool TryDecode(ReadOnlySpan<byte> key, out TValue value)
         {
             value = default;
@@ -3668,36 +3716,18 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
             if (typeof(TValue) == typeof(int))
             {
-                if (key.Length < 5) return false;
+                if (key.Length <= 5) return false;
                 value = (TValue)(object)(int)(BinaryPrimitives.ReadUInt32BigEndian(key.Slice(1)) ^ 0x8000_0000u);
                 return true;
             }
             if (typeof(TValue) == typeof(long))
             {
-                if (key.Length < 9) return false;
+                if (key.Length <= 9) return false;
                 value = (TValue)(object)(long)(BinaryPrimitives.ReadUInt64BigEndian(key.Slice(1)) ^ 0x8000_0000_0000_0000UL);
                 return true;
             }
             return false;
         }
-    }
-
-    /// <summary>
-    /// Whether <paramref name="property"/> is stored under a name other than the convention
-    /// <see cref="ProjectionAnalyzer.ToBsonName"/> follows, through the attributes the mapper
-    /// generator honours (<c>[BsonProperty]</c>, <c>[JsonPropertyName]</c>, <c>[Column]</c>).
-    /// </summary>
-    private static bool IsRenamedInBson(System.Reflection.PropertyInfo property)
-    {
-        foreach (var attribute in property.GetCustomAttributes(inherit: true))
-        {
-            var name = attribute.GetType().Name;
-            if (name is "BsonPropertyAttribute" or "BsonProperty"
-                or "JsonPropertyNameAttribute" or "JsonPropertyName"
-                or "ColumnAttribute" or "Column")
-                return true;
-        }
-        return false;
     }
 
     /// <summary>
@@ -3736,8 +3766,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
                 var reader = new BsonSpanReader(bson, keyMap);
                 reader.ReadDocumentSize();
-                if (!reader.TrySeekToField(fieldId, out var type) && !SeekField(ref reader, fieldName, out type))
-                    return false;
+                var firstElement = reader.Position;
+                if (!reader.TrySeekToField(fieldId, out var type))
+                {
+                    // No usable offset table entry: look for the field from the first element on.
+                    reader.Seek(firstElement);
+                    if (!SeekField(ref reader, fieldName, out type))
+                        return false;
+                }
 
                 if (type == BsonType.Null)
                     return nullable;

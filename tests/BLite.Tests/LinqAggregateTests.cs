@@ -157,20 +157,71 @@ public class LinqAggregateTests : IDisposable
         Assert.Equal((int.MaxValue + 1.0) / 2, db.Readings.AsQueryable().Average(r => r.Count));
     }
 
-    [Fact]
-    public async Task IndexKeySums_CheckOnlyTheTotalForOverflow()
+    [Theory]
+    // In primary-key order. LINQ overflows on a running total although the total fits.
+    [InlineData(new[] { int.MaxValue, 1, -2 }, true)]
+    [InlineData(new[] { int.MinValue, -1, 5 }, true)]
+    // The positive or negative values alone overflow, but no running total in this order does.
+    [InlineData(new[] { 5, int.MinValue, -1 }, false)]
+    [InlineData(new[] { -2, int.MaxValue, 1 }, false)]
+    public async Task IndexKeySums_OverflowWhereLinqDoes(int[] values, bool linqOverflows)
     {
-        // Index keys come in value order, not document order, so an index sum cannot reproduce an
-        // overflow of a running total that LINQ would hit before a later negative value: it returns
-        // the exact total when that fits, and throws when it does not.
+        // Index keys come in value order, not the order LINQ sees the entities in, and whether LINQ
+        // overflows depends on that order: such sums must not be taken from the keys.
         using var db = new AggregateDbContext(_dbPath);
-        foreach (var count in new[] { int.MaxValue, 1, -2 })
-            await db.Readings.InsertAsync(new Reading { Count = count, Units = count });
+        for (int i = 0; i < values.Length; i++)
+        {
+            long total = values[i] switch { int.MaxValue => long.MaxValue, int.MinValue => long.MinValue, var v => v };
+            await db.Readings.InsertAsync(new Reading { Id = new ObjectId(i + 1, 0), Count = values[i], Total = total });
+        }
 
-        // Whether LINQ overflows depends on the document order (int.MaxValue + 1 before the -2).
         var entities = db.Readings.AsQueryable().ToList();
-        Assert.True(Same(Run(() => entities.Sum(r => r.Units)), Run(() => db.Readings.AsQueryable().Sum(r => r.Units)))); // raw BSON, document order
-        Assert.Equal(int.MaxValue - 1, db.Readings.AsQueryable().Sum(r => r.Count));                                         // index keys: the exact total
+        Assert.Equal(values, entities.Select(r => r.Count)); // primary-key order
+        Assert.Equal(linqOverflows, Run(() => entities.Sum(r => r.Count)).Error == typeof(OverflowException));
+
+        var q = db.Readings.AsQueryable();
+        Assert.True(Same(Run(() => entities.Sum(r => r.Count)), Run(() => q.Sum(r => r.Count))));
+        Assert.True(Same(Run(() => entities.Sum(r => r.Total)), Run(() => q.Sum(r => r.Total))));
+        Assert.True(Same(Run(() => entities.Average(r => r.Total)), Run(() => q.Average(r => r.Total))));
+        Assert.Equal(entities.Average(r => r.Count), q.Average(r => r.Count));
+
+        // With a filter the index covers, the entities come in index order.
+        var filtered = q.Where(r => r.Count < 100).ToList();
+        Assert.True(Same(Run(() => filtered.Sum(r => r.Count)), Run(() => q.Where(r => r.Count < 100).Sum(r => r.Count))));
+        var filteredTotal = q.Where(r => r.Total < 100).ToList();
+        Assert.True(Same(Run(() => filteredTotal.Sum(r => r.Total)), Run(() => q.Where(r => r.Total < 100).Sum(r => r.Total))));
+    }
+
+    [Fact]
+    public async Task IndexOnAConvertedProperty_IsNotDecodedAsThePropertyType()
+    {
+        // The keys of this index are longs although its property path is the int Units.
+        using var db = new AggregateDbContext(_dbPath);
+        await db.Readings.CreateIndexAsync(r => (long)r.Units);
+        for (int i = 0; i < 10; i++)
+            await db.Readings.InsertAsync(Make(i));
+
+        var entities = db.Readings.AsQueryable().ToList();
+        var q = db.Readings.AsQueryable();
+        Assert.Equal(entities.Sum(r => r.Units), q.Sum(r => r.Units));
+        Assert.Equal(entities.Min(r => r.Units), q.Min(r => r.Units));
+        Assert.Equal(entities.Max(r => r.Units), q.Max(r => r.Units));
+    }
+
+    [Fact]
+    public async Task IndexKeySums_ThatCannotOverflow_AreTakenFromTheKeys()
+    {
+        using var db = new AggregateDbContext(_dbPath);
+        foreach (var count in new[] { int.MaxValue - 10, 4, -7, int.MinValue + 3, 6 })
+            await db.Readings.InsertAsync(new Reading { Count = count, Total = count });
+
+        var entities = db.Readings.AsQueryable().ToList();
+        var sum = await db.Readings.TryAggregateAsync(AggregateOperator.Sum, Selector("Count"), null, typeof(int));
+        Assert.True(sum.Handled);
+        Assert.Equal(entities.Sum(r => r.Count), sum.Value);
+        var average = await db.Readings.TryAggregateAsync(AggregateOperator.Average, Selector("Total"), null, typeof(double));
+        Assert.True(average.Handled);
+        Assert.Equal(entities.Average(r => r.Total), average.Value);
     }
 
     [Fact]
@@ -237,15 +288,188 @@ public class LinqAggregateTests : IDisposable
     }
 
     [Fact]
-    public async Task RenamedProperty_IsNotReadFromAnotherField()
+    public async Task RenamedProperty_IsReadFromItsOwnField()
     {
         using var db = new AggregateDbContext(_dbPath);
         for (int i = 0; i < 5; i++)
             await db.Readings.InsertAsync(Make(i));
 
-        Assert.False((await db.Readings.TryAggregateAsync(AggregateOperator.Sum, Selector("Level"), null, typeof(int))).Handled);
+        // Level is stored as "score" and Score as "level".
+        var level = await db.Readings.TryAggregateAsync(AggregateOperator.Sum, Selector("Level"), null, typeof(int));
+        var score = await db.Readings.TryAggregateAsync(AggregateOperator.Sum, Selector("Score"), null, typeof(int));
+        Assert.Equal((true, (object?)10), level);
+        Assert.Equal((true, (object?)510), score);
         Assert.Equal(10, db.Readings.AsQueryable().Sum(r => r.Level));
         Assert.Equal(510, db.Readings.AsQueryable().Sum(r => r.Score));
+    }
+
+    [Fact]
+    public async Task FieldAfterOthers_InDocumentsWithoutOffsetTable_IsFound()
+    {
+        using (var db = new AggregateDbContext(_dbPath))
+        {
+            for (int i = 0; i < 4; i++)
+                await db.Readings.InsertAsync(Make(i));
+        }
+
+        // The schemaless API writes no offset table, so the field is looked up by name, after the
+        // fields before it.
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            var col = engine.GetOrCreateCollection("readings");
+            for (int i = 0; i < 3; i++)
+            {
+                var units = 1000 * (i + 1);
+                await col.InsertAsync(col.CreateDocument(["_id", "tag", "units"], b =>
+                    b.AddObjectId("_id", ObjectId.NewObjectId()).AddString("tag", "x").AddInt32("units", units)));
+            }
+        }
+
+        using var reopened = new AggregateDbContext(_dbPath);
+        var entities = reopened.Readings.AsQueryable().ToList();
+        Assert.Equal(7, entities.Count);
+
+        var sum = await reopened.Readings.TryAggregateAsync(AggregateOperator.Sum, Selector("Units"), null, typeof(int));
+        Assert.True(sum.Handled);
+        Assert.Equal(entities.Sum(r => r.Units), sum.Value);
+        Expression<Func<Reading, bool>> tagX = r => r.Tag == "x";
+        var filtered = await reopened.Readings.TryAggregateAsync(AggregateOperator.Max, Selector("Units"), tagX, typeof(int));
+        Assert.Equal((true, (object?)3000), filtered);
+    }
+
+    /// <summary>Writes five <see cref="ShapeV1"/> documents and reopens them as <see cref="ShapeV2"/>.</summary>
+    private async Task<ShapeV2DbContext> ShapesWrittenBeforeTheyWereIgnoredAsync()
+    {
+        using (var v1 = new ShapeV1DbContext(_dbPath))
+        {
+            for (int i = 0; i < 5; i++)
+                await v1.Shapes.InsertAsync(new ShapeV1 { Count = i, Hidden = 100 + i, Unmapped = 200 + i, Gone = 1000 + i });
+        }
+        return new ShapeV2DbContext(_dbPath);
+    }
+
+    [Fact]
+    public async Task IgnoredProperty_OverDocumentsThatStillHoldTheField_IsMaterialised()
+    {
+        using var db = await ShapesWrittenBeforeTheyWereIgnoredAsync();
+        var shapes = db.Shapes.AsQueryable().ToList();
+        var q = db.Shapes.AsQueryable();
+
+        Assert.Equal(0, shapes.Sum(s => s.Hidden));
+        Assert.Equal(shapes.Sum(s => s.Hidden), q.Sum(s => s.Hidden));     // [BsonIgnore]
+        Assert.Equal(shapes.Max(s => s.Hidden), q.Max(s => s.Hidden));
+        Assert.Equal(shapes.Sum(s => s.Unmapped), q.Sum(s => s.Unmapped)); // [NotMapped]
+        Assert.Equal(shapes.Sum(s => s.Count), q.Sum(s => s.Count));
+    }
+
+    [Fact]
+    public async Task ComputedProperty_OverDocumentsThatStoredIt_IsMaterialised()
+    {
+        using var db = await ShapesWrittenBeforeTheyWereIgnoredAsync();
+        var shapes = db.Shapes.AsQueryable().ToList();
+        var q = db.Shapes.AsQueryable();
+
+        Assert.Equal(100, shapes.Sum(s => s.Gone));
+        Assert.Equal(shapes.Sum(s => s.Gone), q.Sum(s => s.Gone));
+        Assert.Equal(shapes.Min(s => s.Gone), q.Min(s => s.Gone));
+        Assert.Equal(shapes.Average(s => s.Gone), q.Average(s => s.Gone));
+    }
+
+    [Fact]
+    public async Task AccessorsWithLogic_AreMaterialised()
+    {
+        using var db = new VerbatimDbContext(_dbPath);
+        for (int i = 1; i <= 4; i++)
+            await db.Doubled.InsertAsync(new Doubled { G = i * 5, H = i * 7, Plain = i });
+
+        var doubled = db.Doubled.AsQueryable().ToList();
+        var q = db.Doubled.AsQueryable();
+
+        // G: getter with logic, indexed (index keys) and filtered on another property (raw BSON).
+        Assert.Equal(doubled.Sum(d => d.G), q.Sum(d => d.G));
+        Assert.Equal(doubled.Min(d => d.G), q.Min(d => d.G));
+        Assert.Equal(doubled.Max(d => d.G), q.Max(d => d.G));
+        Assert.Equal(doubled.Average(d => d.G), q.Average(d => d.G));
+        Assert.Equal(doubled.Where(d => d.Plain > 1).Sum(d => d.G), q.Where(d => d.Plain > 1).Sum(d => d.G));
+        Assert.Equal(doubled.Where(d => d.Plain > 1).Max(d => d.G), q.Where(d => d.Plain > 1).Max(d => d.G));
+        // The index on G holds the stored values, so the filter matches what the index says (as on
+        // main); the aggregate must still use the materialised values of those documents.
+        Assert.Equal(q.Where(d => d.G > 15).ToList().Sum(d => d.G), q.Where(d => d.G > 15).Sum(d => d.G));
+
+        // H: setter with logic, indexed long.
+        Assert.Equal(doubled.Sum(d => d.H), q.Sum(d => d.H));
+        Assert.Equal(doubled.Min(d => d.H), q.Min(d => d.H));
+        Assert.Equal(doubled.Max(d => d.H), q.Max(d => d.H));
+        Assert.Equal(doubled.Average(d => d.H), q.Average(d => d.H));
+
+        // A plain property next to them is still aggregated without materialising.
+        var plain = await db.Doubled.TryAggregateAsync(AggregateOperator.Sum, (Expression<Func<Doubled, int>>)(d => d.Plain), null, typeof(int));
+        Assert.Equal((true, (object?)10), plain);
+    }
+
+    [Fact]
+    public async Task PropertyNamedId_ThatIsNotTheKey_IsReadFromItsOwnField()
+    {
+        using var db = new VerbatimDbContext(_dbPath);
+        for (int i = 1; i <= 4; i++)
+            await db.Coded.InsertAsync(new Coded { Code = i, Id = i * 100 });
+
+        var coded = db.Coded.AsQueryable().ToList();
+        Assert.Equal(1000, coded.Sum(c => c.Id));
+        Assert.Equal(coded.Sum(c => c.Id), db.Coded.AsQueryable().Sum(c => c.Id));
+        Assert.Equal(coded.Max(c => c.Code), db.Coded.AsQueryable().Max(c => c.Code));
+
+        // Stored as "id", not "_id": still read from raw BSON.
+        var id = await db.Coded.TryAggregateAsync(AggregateOperator.Sum, (Expression<Func<Coded, int>>)(c => c.Id), null, typeof(int));
+        Assert.Equal((true, (object?)1000), id);
+    }
+
+    [Fact]
+    public async Task PropertySetThroughTheConstructor_IsMaterialised()
+    {
+        using var db = new VerbatimDbContext(_dbPath);
+        for (int i = 1; i <= 4; i++)
+            await db.Scaled.InsertAsync(new Scaled(i));
+
+        var scaled = db.Scaled.AsQueryable().ToList();
+        Assert.Equal(scaled.Sum(s => s.Amount), db.Scaled.AsQueryable().Sum(s => s.Amount));
+        Assert.Equal(scaled.Max(s => s.Amount), db.Scaled.AsQueryable().Max(s => s.Amount));
+    }
+
+    [Fact]
+    public void GeneratedMappers_NameTheFieldOnlyForPropertiesStoredVerbatim()
+    {
+        var reading = MapperOf<ObjectId, Reading>();
+        Assert.Equal("_id", reading.GetVerbatimFieldName("Id"));
+        Assert.Equal("count", reading.GetVerbatimFieldName("Count"));
+        Assert.Equal("maybeprice", reading.GetVerbatimFieldName("MaybePrice"));
+        Assert.Equal("score", reading.GetVerbatimFieldName("Level")); // [Column("score")]
+        Assert.Equal("level", reading.GetVerbatimFieldName("Score"));
+        Assert.Null(reading.GetVerbatimFieldName("NoSuchProperty"));
+
+        var shape = MapperOf<ObjectId, ShapeV2>();
+        Assert.Equal("count", shape.GetVerbatimFieldName("Count"));
+        Assert.Null(shape.GetVerbatimFieldName("Hidden"));   // [BsonIgnore]
+        Assert.Null(shape.GetVerbatimFieldName("Unmapped")); // [NotMapped]
+        Assert.Null(shape.GetVerbatimFieldName("Gone"));     // computed
+
+        var doubled = MapperOf<ObjectId, Doubled>();
+        Assert.Null(doubled.GetVerbatimFieldName("G")); // getter with logic
+        Assert.Null(doubled.GetVerbatimFieldName("H")); // setter with logic
+        Assert.Equal("plain", doubled.GetVerbatimFieldName("Plain"));
+
+        var coded = MapperOf<int, Coded>();
+        Assert.Equal("_id", coded.GetVerbatimFieldName("Code"));
+        Assert.Equal("id", coded.GetVerbatimFieldName("Id"));
+
+        Assert.Null(MapperOf<ObjectId, Scaled>().GetVerbatimFieldName("Amount")); // set through the constructor
+    }
+
+    private static DocumentMapperBase<TId, TEntity> MapperOf<TId, TEntity>() where TEntity : class
+    {
+        var type = typeof(VerbatimDbContext).Assembly.GetTypes()
+            .First(t => !t.IsAbstract && typeof(DocumentMapperBase<TId, TEntity>).IsAssignableFrom(t));
+        return (DocumentMapperBase<TId, TEntity>)Activator.CreateInstance(type)!;
     }
 
     [Fact]
