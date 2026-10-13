@@ -210,6 +210,10 @@ public sealed class DynamicCollection : IDisposable
                 rootsChanged = true;
             }
         }
+        // Re-record the features the indexes require if a release that predates them rewrote the
+        // record and dropped them (a read-only open cannot, and the indexes still protect it).
+        if (!_storage.IsReadOnly && CollectionFeatures.SyncIndexFeatures(metadata))
+            rootsChanged = true;
         // Only the root ids are patched in place so index entries this constructor does not
         // restore (unknown types, no property paths) are preserved as stored.
         if (rootsChanged)
@@ -1898,6 +1902,11 @@ public sealed class DynamicCollection : IDisposable
     /// Creates a full-text index on a string field (dot-notation for nested fields), filled from
     /// the documents already in the collection. Search it with <see cref="FullTextSearchAsync"/>.
     /// The default name is <c>idx_fts_{field}</c>.
+    /// <para>
+    /// Compatibility: the collection records that it requires full-text indexes, so BLite 5.3 and
+    /// later versions without them refuse to open it. Older releases cannot refuse: do not open a
+    /// database with full-text indexes for writing with BLite &lt; 5.3.
+    /// </para>
     /// </summary>
     public async Task CreateFullTextIndexAsync(string fieldPath, string? name = null)
     {
@@ -2039,6 +2048,7 @@ public sealed class DynamicCollection : IDisposable
 
             metadata.Indexes.Add(idxMeta);
         }
+        CollectionFeatures.SyncIndexFeatures(metadata);
 
         _storage.SaveCollectionMetadata(metadata);
     }

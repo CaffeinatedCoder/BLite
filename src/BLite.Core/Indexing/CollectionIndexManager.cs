@@ -63,7 +63,9 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
 
         RefreshHasUniqueBTreeIndex();
 
-        if (rootAllocated)
+        // Re-record the features the indexes require if a release that predates them rewrote the
+        // record and dropped them (a read-only open cannot, and the indexes still protect it).
+        if (rootAllocated || (!_storage.IsReadOnly && CollectionFeatures.SyncIndexFeatures(_metadata)))
             SaveMetadata();
     }
 
@@ -93,6 +95,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
                 KeyFormat = index.KeyFormat
             });
         }
+        CollectionFeatures.SyncIndexFeatures(_metadata);
     }
 
     /// <summary>

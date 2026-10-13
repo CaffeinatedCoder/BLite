@@ -1003,6 +1003,11 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// noticeably more than without the index; insert and update in batches
     /// (<c>InsertBulkAsync</c> or one explicit transaction) where possible.
     /// </para>
+    /// <para>
+    /// Compatibility: the collection records that it requires full-text indexes, so BLite 5.3 and
+    /// later versions without them refuse to open it. Older releases cannot refuse: do not open a
+    /// database with full-text indexes for writing with BLite &lt; 5.3.
+    /// </para>
     /// </summary>
     /// <exception cref="InvalidOperationException">An index of that name exists and is not a full-text index.</exception>
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]

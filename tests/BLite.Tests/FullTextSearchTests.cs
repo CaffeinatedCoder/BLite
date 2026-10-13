@@ -851,4 +851,148 @@ public class FullTextSearchTests : IDisposable
         var top1 = await col.FullTextSearchAsync("idx_fts_text", "more", 1).ToListAsync();
         Assert.Equal("other", Assert.Single(top1).Document.TryGetString("title", out var o) ? o : null);
     }
+
+    // ── Required feature ────────────────────────────────────────────────────
+
+    private static bool RequiresFullText(StorageEngine storage, string collection)
+        => storage.GetCollectionMetadata(collection)!.RequiredFeatures.Contains(CollectionFeatures.FullTextIndexes);
+
+    [Fact]
+    public async Task RequiredFeature_IsRecordedForModelDeclaredIndexes_AndClearedWithTheLastOne()
+    {
+        using (var db = new FullTextDbContext(_dbPath))
+        {
+            await SeedAsync(db);
+            Assert.True(RequiresFullText(db.Storage, "articles"));
+        }
+
+        using (var db = new FullTextNoIndexDbContext(_dbPath)) // the indexes stay, so does the feature
+        {
+            Assert.True(RequiresFullText(db.Storage, "articles"));
+            Assert.True(await db.Articles.DropIndexAsync("idx_fts_Title"));
+            Assert.True(RequiresFullText(db.Storage, "articles")); // idx_fts_Body is left
+            Assert.True(await db.Articles.DropIndexAsync("idx_fts_Body"));
+            Assert.False(RequiresFullText(db.Storage, "articles"));
+        }
+
+        using (var db = new FullTextNoIndexDbContext(_dbPath))
+            Assert.False(RequiresFullText(db.Storage, "articles"));
+    }
+
+    [Fact]
+    public async Task RequiredFeature_IsRecordedByCreateFullTextIndexAsync_AndSurvivesReopen()
+    {
+        using (var db = new FullTextNoIndexDbContext(_dbPath))
+        {
+            await db.Articles.InsertAsync(A("fox", "The quick brown fox"));
+            Assert.False(RequiresFullText(db.Storage, "articles"));
+            await db.Articles.CreateFullTextIndexAsync(a => a.Body);
+            Assert.True(RequiresFullText(db.Storage, "articles"));
+        }
+
+        using (var db = new FullTextNoIndexDbContext(_dbPath))
+        {
+            Assert.True(RequiresFullText(db.Storage, "articles"));
+            Assert.True(await db.Articles.DropIndexAsync("idx_fts_Body"));
+            Assert.False(RequiresFullText(db.Storage, "articles"));
+        }
+    }
+
+    [Fact]
+    public async Task Dynamic_RequiredFeature_IsRecordedOnCreate_SurvivesReopen_AndIsClearedWithTheLastIndex()
+    {
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            var col = engine.GetOrCreateCollection("notes");
+            await col.InsertAsync(col.CreateDocument(["title", "text"], b => b.AddString("title", "a").AddString("text", "plain words")));
+            await col.CreateIndexAsync("title");
+            Assert.False(RequiresFullText(engine.Storage, "notes"));
+            await col.CreateFullTextIndexAsync("text");
+            await col.CreateFullTextIndexAsync("title", "idx_fts_title");
+            Assert.True(RequiresFullText(engine.Storage, "notes"));
+        }
+
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            var col = engine.GetOrCreateCollection("notes");
+            Assert.True(RequiresFullText(engine.Storage, "notes"));
+            Assert.True(col.DropIndex("idx_fts_text"));
+            Assert.True(RequiresFullText(engine.Storage, "notes"));
+            Assert.True(col.DropIndex("idx_fts_title"));
+            Assert.False(RequiresFullText(engine.Storage, "notes"));
+        }
+
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            engine.GetOrCreateCollection("notes");
+            Assert.False(RequiresFullText(engine.Storage, "notes"));
+        }
+    }
+
+    /// <summary>
+    /// A release that predates the feature rewrites the record without it (5.2.x drops the trailing
+    /// section); the next read-write open records it again, a read-only open leaves the file alone.
+    /// </summary>
+    [Fact]
+    public async Task RequiredFeature_DroppedByAnOlderRelease_IsRecordedAgainOnTheNextReadWriteOpen()
+    {
+        static void DropFeature(string path, string collection)
+        {
+            using var storage = new StorageEngine(path, PageFileConfig.Default);
+            var meta = storage.GetCollectionMetadata(collection)!;
+            Assert.Equal(1, meta.RequiredFeatures.RemoveAll(f => f.Id == CollectionFeatures.FullTextIndexes.Id));
+            storage.SaveCollectionMetadata(meta);
+        }
+
+        using (var db = new FullTextDbContext(_dbPath))
+            await SeedAsync(db);
+        await SeedNotesAsync(_dbPath);
+        DropFeature(_dbPath, "articles");
+        DropFeature(_dbPath, "notes");
+
+        var readOnly = PageFileConfig.Default with { Access = System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read, AllowMultiProcessAccess = true };
+        using (var engine = new BLiteEngine(_dbPath, readOnly))
+        {
+            engine.GetOrCreateCollection("notes");
+            Assert.False(RequiresFullText(engine.Storage, "notes"));
+        }
+
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            engine.GetOrCreateCollection("notes");
+            Assert.True(RequiresFullText(engine.Storage, "notes"));
+        }
+        // Last: the typed context drops "notes", which it does not map.
+        using (var db = new FullTextNoIndexDbContext(_dbPath))
+            Assert.True(RequiresFullText(db.Storage, "articles"));
+    }
+
+    /// <summary>
+    /// What a version without full-text indexes makes of the record: it refuses to open the
+    /// collection, read-only included, from the recorded feature alone (a version that knew type 6
+    /// but not the feature) and from the index type alone (one whose metadata lost the feature).
+    /// </summary>
+    [Fact]
+    public async Task RequiredFeature_IsNeededToOpen_SoAVersionWithoutFullTextRefusesEvenReadOnly()
+    {
+        using (var db = new FullTextDbContext(_dbPath))
+            await SeedAsync(db);
+        await SeedNotesAsync(_dbPath);
+
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+        foreach (var name in new[] { "articles", "notes" })
+        {
+            var meta = storage.GetCollectionMetadata(name)!;
+            Assert.Equal(FeatureRequirement.Open, Assert.Single(meta.RequiredFeatures, f => f.Id == "fulltext-index").Requirement);
+            Assert.True(CollectionFeatures.CanOpen(meta, readOnly: false)); // this version knows it
+
+            var featureOnly = CollectionFeatures.Unsupported(meta, readOnly: true, new HashSet<string>(), (byte)IndexType.FullText);
+            Assert.Equal(CollectionFeatures.FullTextIndexes, Assert.Single(featureOnly));
+
+            meta.RequiredFeatures.Clear();
+            var typeOnly = CollectionFeatures.Unsupported(meta, readOnly: true, new HashSet<string>(), (byte)IndexType.Spatial);
+            Assert.NotEmpty(typeOnly);
+            Assert.All(typeOnly, f => Assert.Equal(FeatureRequirement.Open, f.Requirement));
+        }
+    }
 }
