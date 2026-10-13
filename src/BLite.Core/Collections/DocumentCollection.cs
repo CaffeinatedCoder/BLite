@@ -745,7 +745,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             if (options?.RebuildIndexes == true)
             {
                 foreach (var index in _indexManager.GetAllIndexes())
-                    await RebuildIndexAsync(index, ct).ConfigureAwait(false);
+                {
+                    // RTreeIndex cannot enumerate its pages yet, so a rebuild would leak the
+                    // whole old tree on every vacuum. Spatial indexes are kept as they are.
+                    if (index.Definition.Type == IndexType.Spatial) continue;
+                    await RebuildIndexFromScratchAsync(index.Name, ct).ConfigureAwait(false);
+                }
             }
 
             success = true;
@@ -1631,35 +1636,100 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         }
     }
 
+    /// <summary>
+    /// Populates an empty copy of index <paramref name="name"/> from the documents and swaps it in
+    /// only after the rebuild committed; the old tree is then freed. If any document cannot be
+    /// loaded or indexed, the rebuild fails and the existing index stays in place untouched,
+    /// instead of being replaced by an incomplete one.
+    /// </summary>
+    private async Task RebuildIndexFromScratchAsync(string name, CancellationToken ct)
+    {
+        var fresh = _indexManager.CreateUnregisteredCopy(name);
+        var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        try
+        {
+            await FillIndexAsync(fresh, transaction, skipUnreadableDocuments: false, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct);
+        }
+        catch
+        {
+            // Collect the copy's pages through the transaction before rolling it back: pages added
+            // by splits are allocated outside the transaction but linked only from nodes written
+            // in it, so after the rollback they could not be found any more.
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = fresh.CollectAllPages(transaction.TransactionId); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            try { await transaction.RollbackAsync(); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            FreeUnregisteredCopy(fresh, pages);
+            throw;
+        }
+
+        try
+        {
+            _indexManager.ReplaceIndex(name, fresh);
+        }
+        catch
+        {
+            // The copy is committed but, unless the swap itself went through, nothing refers to it.
+            if (!ReferenceEquals(_indexManager.GetIndex(name), fresh))
+            {
+                IReadOnlyList<uint> pages = Array.Empty<uint>();
+                try { pages = fresh.CollectAllPages(0); }
+                catch { /* best-effort: never mask the original failure */ }
+                FreeUnregisteredCopy(fresh, pages);
+            }
+            throw;
+        }
+    }
+
+    private void FreeUnregisteredCopy(CollectionSecondaryIndex<TId, T> copy, IReadOnlyList<uint> pages)
+    {
+        try
+        {
+            foreach (var pageId in pages)
+                _storage.FreePage(pageId);
+        }
+        catch { /* best-effort: never mask the original failure */ }
+        copy.Dispose();
+    }
+
     private async Task RebuildIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct = default, bool skipUnreadableDocuments = true)
     {
         var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
         try
         {
-            // Iterate all documents in the collection via primary index
-            foreach (var entry in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
-            {
-                ct.ThrowIfCancellationRequested();
-                try
-                {
-                    var document = await FindByLocationAsync(entry.Location, transaction.TransactionId, ct);
-                    if (document != null)
-                    {
-                        index.Insert(document, entry.Location, transaction);
-                    }
-                }
-                catch when (skipUnreadableDocuments)
-                {
-                    // Skip documents that fail to load or index
-                    // Production: should log errors
-                }
-            }
+            await FillIndexAsync(index, transaction, skipUnreadableDocuments, ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct);
         }
         catch
         {
             await transaction.RollbackAsync();
             throw;
+        }
+    }
+
+    private async Task FillIndexAsync(CollectionSecondaryIndex<TId, T> index, ITransaction transaction, bool skipUnreadableDocuments, CancellationToken ct)
+    {
+        // Iterate all documents in the collection via primary index
+        foreach (var entry in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var document = await FindByLocationAsync(entry.Location, transaction.TransactionId, ct);
+                if (document != null)
+                {
+                    index.Insert(document, entry.Location, transaction);
+                }
+            }
+            catch when (skipUnreadableDocuments)
+            {
+                // Skip documents that fail to load or index
+                // Production: should log errors
+            }
         }
     }
 
@@ -2230,6 +2300,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             ? ValueStopwatch.StartNew()
             : default;
         // ────────────────────────────────────────────────────────────────────
+
+        // Unique secondary indexes are checked before any page is written.
+        _indexManager.EnsureUniqueInAll(entity, null, transaction);
 
         DocumentLocation location;
         if (_isTimeSeries)
@@ -2819,6 +2892,10 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var oldEntity = await FindByLocation(oldLocation, transaction);
         if (oldEntity == null) return false;
 
+        // Unique secondary indexes are checked before any page is written; only those whose
+        // key changed, so documents that already share a value can still be updated.
+        _indexManager.EnsureUniqueInAll(entity, oldEntity, transaction);
+
         // Read old page
         var pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
@@ -2846,8 +2923,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             else
             {
-                // Delete old + insert new
-                await DeleteCore(id, transaction, notifyCdc: false);
+                // Delete old + insert new. Secondary indexes are moved below, so an entry whose
+                // key did not change is re-pointed rather than deleted and inserted again.
+                await DeleteCore(id, transaction, notifyCdc: false, deleteFromIndexes: false);
 
                 DocumentLocation newLocation;
                 if (bytesWritten + SlotEntry.Size <= _maxDocumentSizeForSinglePage)
@@ -2864,9 +2942,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
 
                 _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
-                // DeleteCore already removed all secondary index entries for this document.
-                // We only need to insert the new entries at the new physical location.
-                _indexManager.InsertIntoAll(entity, newLocation, transaction);
+                _indexManager.UpdateInAll(oldEntity, entity, oldLocation, newLocation, transaction);
 
                 // Notify CDC
                 await NotifyCdc(OperationType.Update, id, transaction, docData);
@@ -3126,17 +3202,20 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         return deleteCount;
     }
 
-    private async Task<bool> DeleteCore(TId id, ITransaction transaction, bool notifyCdc = true)
+    private async Task<bool> DeleteCore(TId id, ITransaction transaction, bool notifyCdc = true, bool deleteFromIndexes = true)
     {
         var key = _mapper.ToIndexKey(id);
         if (!_primaryIndex.TryFind(key, out var location, transaction.TransactionId))
             return false;
 
         // Notify secondary indexes BEFORE deleting document from storage
-        var entity = await FindByLocation(location, transaction);
-        if (entity != null)
+        if (deleteFromIndexes)
         {
-            _indexManager.DeleteFromAll(entity, location, transaction);
+            var entity = await FindByLocation(location, transaction);
+            if (entity != null)
+            {
+                _indexManager.DeleteFromAll(entity, location, transaction);
+            }
         }
 
         // Read page
@@ -3844,8 +3923,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 if (indexOpt.IsVectorSearch)
                 {
+                    // The index satisfied the VectorSearch term; the post-filter checks the rest.
+                    // Compiled lazily, like GetCompiled(), only when a candidate needs it.
+                    bool exact = indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact;
+                    Func<T, bool>? residual = null;
                     await foreach (var item in VectorSearchAsync(indexOpt.IndexName, indexOpt.VectorQuery!, indexOpt.K, ct: ct))
-                        if (indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact || GetCompiled()(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
+                    {
+                        if (!exact && !(residual ??= ((System.Linq.Expressions.Expression<Func<T, bool>>)Query.IndexOptimizer.WithoutCall(whereClause, indexOpt.VectorSearchCall!)).Compile())(item))
+                            continue;
+                        yield return item;
+                        if (++yielded >= fetchLimit) yield break;
+                    }
                 }
                 else if (indexOpt.IsSpatialSearch)
                 {
