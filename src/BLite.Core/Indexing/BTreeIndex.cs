@@ -78,6 +78,15 @@ public sealed class BTreeIndex
     public uint RootPageId => _rootPageId;
 
     /// <summary>
+    /// The largest key that fits in a node page on its own: page header (32) + node header (20)
+    /// + the leftmost child pointer of an internal node (4) + one entry (4-byte length, key,
+    /// 4-byte child pointer). A larger key can never be inserted, so the collections reject it
+    /// before writing anything. Nodes split by entry count, not by size, so many keys below
+    /// this limit can still overflow a node; that is caught as a failure during the write.
+    /// </summary>
+    internal int MaxKeySize => _storage.PageSize - 32 - 20 - 4 - 4 - 4;
+
+    /// <summary>
     /// Reads a page using StorageEngine for transaction isolation.
     /// Implements "Read Your Own Writes" isolation.
     /// </summary>

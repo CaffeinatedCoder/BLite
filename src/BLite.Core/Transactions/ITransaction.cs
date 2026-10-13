@@ -16,6 +16,30 @@ namespace BLite.Core.Transactions;
 ///     txn.Commit();
 /// }
 /// </example>
+/// <remarks>
+/// <para>
+/// When a collection write method that was passed this transaction fails, what the caller can
+/// rely on depends on the exception:
+/// </para>
+/// <list type="bullet">
+///   <item><description>
+///     <see cref="BLiteValidationException"/> (duplicate primary or unique key, vector dimension
+///     mismatch, document or index key too large): the input was rejected before anything was
+///     written. The transaction is still <see cref="TransactionState.Active"/>; earlier writes in it
+///     are intact and can be committed. For a bulk method this holds only if the first document
+///     was rejected; otherwise the transaction is rolled back as below.
+///   </description></item>
+///   <item><description>
+///     Any other exception thrown while the method was writing: the write may have been applied
+///     to the data page and some indexes but not others, so the method rolls the transaction back
+///     (<see cref="State"/> becomes <see cref="TransactionState.Aborted"/>). Later writes with it
+///     throw <see cref="InvalidOperationException"/>, and so does <see cref="CommitAsync"/>.
+///   </description></item>
+/// </list>
+/// <para>
+/// There are no per-operation savepoints: a write that succeeded cannot be undone on its own.
+/// </para>
+/// </remarks>
 public interface ITransaction : IDisposable
 {
     /// <summary>

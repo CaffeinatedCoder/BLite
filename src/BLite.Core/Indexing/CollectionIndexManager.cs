@@ -542,6 +542,25 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     }
 
     /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="document"/>'s key could not
+    /// be written to one of the indexes (vector dimension mismatch, key too large).
+    /// Call before any page is written, together with <see cref="EnsureUniqueInAll"/>.
+    /// </summary>
+    public void ValidateKeysInAll(T document)
+    {
+        if (document == null)
+            throw new ArgumentNullException(nameof(document));
+
+        lock (_lock)
+        {
+            foreach (var index in _indexes.Values)
+            {
+                index.ValidateKey(document);
+            }
+        }
+    }
+
+    /// <summary>
     /// Updates a document in all indexes
     /// </summary>
     /// <param name="oldDocument">Old version of document</param>

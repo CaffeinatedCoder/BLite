@@ -535,9 +535,46 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             if (s_fixedSizeId && idPart.Length != ownIdKey.Data.Length)
                 continue;
 
-            throw new InvalidOperationException(
+            throw new BLiteValidationException(
                 $"Duplicate key violation for unique index '{_definition.Name}'");
         }
+    }
+
+    /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="document"/>'s key could not
+    /// be written to this index: a vector whose length differs from the index dimensions, or a
+    /// B-Tree key larger than a node page. Called before any page is written, so a rejected write
+    /// leaves nothing behind instead of failing halfway through the indexes.
+    /// </summary>
+    internal void ValidateKey(T document)
+    {
+        if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
+            return; // null keys are not indexed
+
+        if (_vectorIndex != null)
+        {
+            if (keyValue is float[] singleVector)
+                ValidateVector(singleVector);
+            else if (keyValue is IEnumerable<float[]> vectors)
+                foreach (var v in vectors) ValidateVector(v);
+        }
+        else if (_btreeIndex != null && !keyValue.GetType().IsValueType)
+        {
+            // Value-type keys (numbers, dates, Guid, ObjectId, enums) have a small fixed size;
+            // only strings, byte arrays and the ToString fallback can grow past a page.
+            var keyLength = ConvertToIndexKey(keyValue).Data.Length
+                            + _mapper.ToIndexKey(_mapper.GetId(document)).Data.Length;
+            if (keyLength > _btreeIndex.MaxKeySize)
+                throw new BLiteValidationException(
+                    $"Key of {keyLength} bytes is too large for index '{_definition.Name}' (maximum {_btreeIndex.MaxKeySize} bytes).");
+        }
+    }
+
+    private void ValidateVector(float[] vector)
+    {
+        if (vector.Length != _definition.Dimensions)
+            throw new BLiteValidationException(
+                $"Vector dimension mismatch for index '{_definition.Name}'. Expected {_definition.Dimensions}, got {vector.Length}");
     }
 
     // [user key][one byte]: a range bound between the entries of user key and those of longer values.

@@ -755,10 +755,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         => TruncateAsync(null, ct);
 
     /// <inheritdoc cref="TruncateAsync(CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async Task<int> TruncateAsync(ITransaction? transaction, CancellationToken ct = default)
     {
         int deleted = 0;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct).ConfigureAwait(false))
             throw new TimeoutException("Timed out acquiring collection lock (TruncateAsync).");
@@ -790,10 +797,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 if (autoCommit)
                     await transaction.CommitAsync(ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit)
-                    await transaction.RollbackAsync().ConfigureAwait(false);
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2062,6 +2068,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously inserts a new document into the collection
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<TId> InsertAsync(T entity, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entity == null) throw new ArgumentNullException(nameof(entity));
@@ -2069,6 +2083,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var sw = _storage.MetricsDispatcher != null ? ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Insert).");
@@ -2095,9 +2111,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = true;
                 return id;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2119,12 +2135,22 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously inserts multiple documents in a single transaction.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<List<TId>> InsertBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
 
         var entityList = entities.ToList();
         var ids = new List<TId>(entityList.Count);
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (InsertBulk).");
@@ -2151,9 +2177,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
                 return ids;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: ids.Count > 0);
                 throw;
             }
         }
@@ -2264,8 +2290,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             : default;
         // ────────────────────────────────────────────────────────────────────
 
-        // Unique secondary indexes are checked before any page is written.
+        // Everything that can reject the document is checked before any page is written, so a
+        // rejected insert leaves nothing behind (BLiteValidationException keeps the transaction usable).
+        var key = _mapper.ToIndexKey(id);
+        ValidatePrimaryKeyForInsert(id, key, transaction);
         _indexManager.EnsureUniqueInAll(entity, null, transaction);
+        _indexManager.ValidateKeysInAll(entity);
 
         DocumentLocation location;
         if (_isTimeSeries)
@@ -2289,7 +2319,6 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             location = new DocumentLocation(pageId, slotIndex);
         }
 
-        var key = _mapper.ToIndexKey(id);
         _primaryIndex.Insert(key, location, transaction.TransactionId);
         _indexManager.InsertIntoAll(entity, location, transaction);
 
@@ -2323,6 +2352,21 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
         // Notify CDC
         await NotifyCdc(OperationType.Insert, id, transaction, docData);
+    }
+
+    /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="key"/> cannot be inserted
+    /// into the primary index: it is already taken, or it is larger than a node page.
+    /// </summary>
+    private void ValidatePrimaryKeyForInsert(TId id, IndexKey key, ITransaction transaction)
+    {
+        if (key.Data.Length > _primaryIndex.MaxKeySize)
+            throw new BLiteValidationException(
+                $"Id of {key.Data.Length} bytes is too large for the primary index of collection '{_collectionName}' (maximum {_primaryIndex.MaxKeySize} bytes).");
+
+        if (_primaryIndex.TryFind(key, out _, transaction.TransactionId))
+            throw new BLiteValidationException(
+                $"Duplicate key violation: a document with id '{id}' already exists in collection '{_collectionName}'.");
     }
 
     /// <summary>
@@ -2686,6 +2730,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously updates an existing document in the collection
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<bool> UpdateAsync(T entity, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entity == null) throw new ArgumentNullException(nameof(entity));
@@ -2693,6 +2745,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var sw = _storage.MetricsDispatcher != null ? ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Update).");
@@ -2707,9 +2761,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = result;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2731,6 +2785,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously updates multiple documents in a single transaction.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<int> UpdateBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
@@ -2738,6 +2800,10 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var entityList = entities.ToList();
         int updateCount = 0;
         bool autoCommit = transaction == null;
+        // Documents of this call written so far: a failure after the first one must roll back.
+        var progress = new StrongBox<int>();
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (UpdateBulk).");
@@ -2747,13 +2813,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         {
             try
             {
-                updateCount = await UpdateBulkInternal(entityList, transaction);
+                updateCount = await UpdateBulkInternal(entityList, transaction, progress);
                 if (autoCommit) await transaction.CommitAsync(ct);
                 return updateCount;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: progress.Value > 0);
                 throw;
             }
         }
@@ -2763,7 +2829,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         }
     }
 
-    private async Task<int> UpdateBulkInternal(List<T> entityList, ITransaction transaction)
+    private async Task<int> UpdateBulkInternal(List<T> entityList, ITransaction transaction, StrongBox<int> progress)
     {
         int updateCount = 0;
         const int BATCH_SIZE = 50;
@@ -2805,7 +2871,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 try
                 {
                     if (await UpdateDataCore(id, entity, docData, transaction, length))
-                        updateCount++;
+                        progress.Value = ++updateCount;
                 }
                 finally
                 {
@@ -2855,9 +2921,11 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var oldEntity = await FindByLocation(oldLocation, transaction);
         if (oldEntity == null) return false;
 
-        // Unique secondary indexes are checked before any page is written; only those whose
-        // key changed, so documents that already share a value can still be updated.
+        // Everything that can reject the document is checked before any page is written.
+        // Unique indexes only where the key changed, so documents that already share a value
+        // can still be updated.
         _indexManager.EnsureUniqueInAll(entity, oldEntity, transaction);
+        _indexManager.ValidateKeysInAll(entity);
 
         // Read old page
         var pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
@@ -2927,6 +2995,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         => UpsertAsync(entity, null, ct);
 
     /// <inheritdoc cref="UpsertAsync(T, CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<UpsertResult<TId>> UpsertAsync(T entity, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entity == null) throw new ArgumentNullException(nameof(entity));
@@ -2935,6 +3011,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         bool success = false;
         bool inserted = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Upsert).");
@@ -2961,9 +3039,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = true;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2990,6 +3068,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         => UpsertBulkAsync(entities, null, ct);
 
     /// <inheritdoc cref="UpsertBulkAsync(IEnumerable{T}, CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<List<UpsertResult<TId>>> UpsertBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
@@ -2997,6 +3083,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var entityList = entities.ToList();
         var results = new List<UpsertResult<TId>>(entityList.Count);
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (UpsertBulk).");
@@ -3027,9 +3115,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
                 return results;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: results.Count > 0);
                 throw;
             }
         }
@@ -3080,11 +3168,18 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously deletes a document by its primary key.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async ValueTask<bool> DeleteAsync(TId id, ITransaction? transaction, CancellationToken ct = default)
     {
         var sw = _storage.MetricsDispatcher != null ? ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Delete).");
@@ -3099,9 +3194,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = result;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -3123,12 +3218,19 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously deletes multiple documents in a single transaction.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async ValueTask<int> DeleteBulkAsync(IEnumerable<TId> ids, ITransaction? transaction, CancellationToken ct = default)
     {
         if (ids == null) throw new ArgumentNullException(nameof(ids));
 
         int deleteCount = 0;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (DeleteBulk).");
@@ -3142,9 +3244,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 if (autoCommit) await transaction.CommitAsync(ct);
                 return deleteCount;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -3769,7 +3871,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         }
 
         rentedBuffer = null!; // specific compiler satisfaction, though we throw
-        throw new InvalidOperationException($"Document too large. Maximum size allowed is 16MB.");
+        throw new BLiteValidationException($"Document too large. Maximum size allowed is 16MB.");
     }
 
     /// <summary>
