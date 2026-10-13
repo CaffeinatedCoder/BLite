@@ -1917,7 +1917,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             // NEW: Buffer write in transaction or write immediately
             var writeOp = new WriteOperation(
                 documentId: ObjectId.Empty,
-                newValue: buffer.AsSpan(0, _storage.PageSize).ToArray(),
+                newValue: buffer.AsMemory(0, _storage.PageSize),
                 pageId: pageId,
                 type: OperationType.Insert
             );
