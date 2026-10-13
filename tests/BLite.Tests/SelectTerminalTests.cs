@@ -96,6 +96,12 @@ public class SelectTerminalTests : IDisposable
         ["OrderByIdx.Take.Select.Union(root).Count"]  = q => q.OrderBy(p => p.Age).Take(5).Select(p => p.Age).Union(q.Select(p => p.Age)).Count(),
         ["OrderByIdx.Take.Join(root).Count"]          = q => q.OrderBy(p => p.Age).Take(5).Join(q, a => a.Age, b => b.Age, (a, b) => b.Name).Count(),
 
+        // A lambda that captures the queryable reads it through a closure field, not a constant,
+        // so the replay does not replace it with the prefix: it runs as its own query.
+        ["OrderByIdx.Take.Count(closure root)"]       = q => q.OrderBy(p => p.Age).Take(12).Count(x => q.Any(y => y.Age == 49)),
+        ["OrderByIdx.Take.Count(correlated closure)"] = q => q.OrderBy(p => p.Age).Take(12).Count(x => q.Any(y => y.Age == x.Age + 1)),
+        ["Count(correlated closure)"]                 = q => q.Count(x => q.Any(y => y.Age == x.Age + 1)),
+
         // Parameterless Sum/Average after Select (non-generic Queryable overloads).
         ["Select(long).Sum"]           = q => q.Select(p => (long)p.Age).Sum(),
         ["Select(double).Average"]     = q => q.Select(p => (double)p.Age).Average(),
