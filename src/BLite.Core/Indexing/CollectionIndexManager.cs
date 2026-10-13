@@ -348,26 +348,6 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     }
 
     /// <summary>
-    /// Replaces an index with an empty one of the same definition, freeing the old tree's pages.
-    /// The new index keeps the old <see cref="CollectionSecondaryIndex{TId,T}.KeyFormat"/>: the
-    /// caller repopulates it and then records the new format with <see cref="SetKeyFormat"/>, so an
-    /// interrupted rebuild is simply redone on the next open.
-    /// </summary>
-    internal CollectionSecondaryIndex<TId, T> RecreateIndex(string name)
-    {
-        lock (_lock)
-        {
-            if (!_indexes.TryGetValue(name, out var old))
-                throw new InvalidOperationException($"Index '{name}' does not exist");
-
-            var fresh = CreateUnregistered(old.Definition);
-            fresh.KeyFormat = old.KeyFormat;
-            ReplaceIndex(name, fresh);
-            return fresh;
-        }
-    }
-
-    /// <summary>
     /// Registers <paramref name="fresh"/> under <paramref name="name"/>, persists its root page
     /// and frees the pages of the index it replaces. If the metadata cannot be saved, the old
     /// index stays registered and <paramref name="fresh"/> remains the caller's to release.

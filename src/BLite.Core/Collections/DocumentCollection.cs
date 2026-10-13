@@ -870,10 +870,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
     /// <summary>
     /// Decimal properties used to be indexed as <c>(double)value</c>. An index whose persisted
-    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is replaced by an
-    /// empty tree, repopulated from the documents and then marked with the current format, the first
-    /// time the collection is opened. The format is recorded only after the rebuild committed, so a
-    /// crash in between just repeats the migration on the next open. No-op for every other index.
+    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is rebuilt from the
+    /// documents into a copy that queries don't see, the first time the collection is opened. Only
+    /// after the copy committed is it swapped in, with the current format, in one metadata save, and
+    /// the old tree freed. If the rebuild fails or is interrupted, the copy's pages are freed and the
+    /// old index stays registered in its old format, so the next open repeats the migration.
+    /// No-op for every other index.
     /// </summary>
     private void MigrateLegacyDecimalIndexes()
     {
@@ -884,12 +886,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             var name = index.Name;
             try
             {
-                var fresh = _indexManager.RecreateIndex(name);
+                var fresh = _indexManager.CreateUnregistered(index.Definition);
+                fresh.KeyFormat = IndexMetadata.CurrentKeyFormat;
                 // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
                 // A document that cannot be loaded fails the migration rather than silently leaving
                 // the rebuilt index incomplete.
-                Task.Run(() => RebuildIndexAsync(fresh, skipUnreadableDocuments: false)).GetAwaiter().GetResult();
-                _indexManager.SetKeyFormat(name, IndexMetadata.CurrentKeyFormat);
+                Task.Run(() => FillUnregisteredIndexAsync(fresh, CancellationToken.None)).GetAwaiter().GetResult();
+                PublishFilledIndex(fresh, copy => _indexManager.ReplaceIndex(name, copy));
             }
             catch (Exception ex)
             {
