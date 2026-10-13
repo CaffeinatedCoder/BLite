@@ -296,6 +296,9 @@ public abstract partial class DocumentDbContext : IDocumentDbContext
         if (_disposed)
             throw new ObjectDisposedException(nameof(DocumentDbContext));
 
+        // Multi-process mode: also creates the configured indexes under the open lock (#216).
+        using var openLock = _storage.EnterOpenLock();
+
         string? customName = null;
         EntityTypeBuilder<T>? builder = null;
 
@@ -338,6 +341,9 @@ public abstract partial class DocumentDbContext : IDocumentDbContext
     private void DropOrphanCollections()
     {
         if (_storage == null) return; // parameterless remote-context constructor
+
+        // Multi-process mode: reads and rewrites the catalog under the open lock (#216).
+        using var openLock = _storage.EnterOpenLock();
 
         // Build the set of collection names that this context knows about.
         var registeredNames = new HashSet<string>(
@@ -430,6 +436,9 @@ public abstract partial class DocumentDbContext : IDocumentDbContext
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(DocumentDbContext));
+
+        // Multi-process mode: also creates the configured indexes under the open lock (#216).
+        using var openLock = _storage.EnterOpenLock();
 
         string? customName = null;
         EntityTypeBuilder<T>? builder = null;

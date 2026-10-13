@@ -89,6 +89,53 @@ public sealed class MultiProcessConcurrentCreateTests : IDisposable
         await AssertUsable(dbPath, "after a crash during create");
     }
 
+    [Fact]
+    public void PagesAnotherEngineAddedPastThisEnginesMap_CanBeWrittenAndRead()
+    {
+        var dbPath = Path.Combine(_tempDir, "grow.db");
+        using var a = new StorageEngine(dbPath, MultiProcess);
+        using var b = new StorageEngine(dbPath, MultiProcess);
+
+        // A grows the file well past the end of B's memory map.
+        uint last = 0;
+        for (int i = 0; i < 100; i++) last = a.AllocatePage();
+        a.WritePageImmediate(last - 1, Filled(a.PageSize, 0xA1));
+
+        // B must map the grown file instead of writing / reading past its map, which threw
+        // UnauthorizedAccessException (write) or killed the process with an
+        // AccessViolationException (read).
+        b.WritePageImmediate(last, Filled(b.PageSize, 0xB2));
+        var buffer = new byte[b.PageSize];
+        b.ReadPage(last - 1, null, buffer);
+        Assert.Equal(Filled(b.PageSize, 0xA1), buffer);
+        a.ReadPage(last, null, buffer);
+        Assert.Equal(Filled(a.PageSize, 0xB2), buffer);
+    }
+
+    [Fact]
+    public void DictionaryKeysAddedByAnotherEngine_KeepTheirIds()
+    {
+        var dbPath = Path.Combine(_tempDir, "dict.db");
+        using var a = new StorageEngine(dbPath, MultiProcess);
+        using var b = new StorageEngine(dbPath, MultiProcess);
+
+        ushort alpha = a.GetOrAddDictionaryEntry("alpha");
+
+        // B loaded the dictionary before A added "alpha". It must not give "alpha"'s id to
+        // another key, and must resolve "alpha" to the id A gave it.
+        ushort beta = b.GetOrAddDictionaryEntry("beta");
+        Assert.NotEqual(alpha, beta);
+        Assert.Equal(alpha, b.GetOrAddDictionaryEntry("alpha"));
+        Assert.Equal(beta, a.GetOrAddDictionaryEntry("beta"));
+    }
+
+    private static byte[] Filled(int size, byte value)
+    {
+        var page = new byte[size];
+        Array.Fill(page, value);
+        return page;
+    }
+
     private static async Task AssertUsable(string dbPath, string name)
     {
         using (var ctx = new TestDbContext(dbPath, MultiProcess))

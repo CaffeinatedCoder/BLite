@@ -26,6 +26,12 @@ public sealed partial class StorageEngine : IDisposable
     // PageFileConfig.AllowMultiProcessAccess is true and disposed in Dispose.
     // See roadmap/v5/MULTI_PROCESS_WAL.md for the full design.
     private readonly Transactions.WalSharedMemory? _shm;
+
+    // Holds of the SHM open lock by this engine (#216, see EnterOpenLock). The engine takes the
+    // OS-level lock on the first hold and releases it with the last one, so nested or concurrent
+    // holds from its own threads never wait for each other. Guarded by _openLockGate.
+    private readonly object _openLockGate = new();
+    private int _openLockHolds;
     private CDC.ChangeStreamDispatcher? _cdc;
     private volatile Metrics.MetricsDispatcher? _metrics;
     
@@ -141,11 +147,79 @@ public sealed partial class StorageEngine : IDisposable
     /// </summary>
     internal Transactions.WalSharedMemory? SharedMemory => _shm;
 
+    // ── Cross-process open lock (multi-process mode, #216) ───────────────────
+
+    /// <summary>
+    /// Holds the SHM open lock (<see cref="Transactions.WalSharedMemory.AcquireOpenLock"/>) until
+    /// the returned scope is disposed; a no-op in single-process mode. Besides the constructor,
+    /// everything that creates or changes shared structures directly in the page file rather than
+    /// through the WAL takes it: creating collections (catalog entries, schema pages, index
+    /// roots) and adding dictionary keys. Otherwise two processes creating the same collections
+    /// read each other's half-written catalog and allocate the same page ids.
+    /// <para>
+    /// Holds by this engine's own threads share one OS-level lock (taken on the first hold,
+    /// released with the last), so they nest and never wait for each other. When the OS-level
+    /// lock is taken, the page files first pick up what other processes did meanwhile
+    /// (<see cref="PageFile.RefreshAllocationState"/>).
+    /// </para>
+    /// </summary>
+    internal OpenLockScope EnterOpenLock()
+    {
+        if (_shm == null) return default;
+        EnterOpenLockCore();
+        return new OpenLockScope(this);
+    }
+
+    private void EnterOpenLockCore()
+    {
+        lock (_openLockGate)
+        {
+            if (_openLockHolds == 0)
+            {
+                _shm!.AcquireOpenLock();
+                try
+                {
+                    // Null while the constructor opens them: they are then read fresh anyway.
+                    (_pageFile as PageFile)?.RefreshAllocationState();
+                    (_indexFile as PageFile)?.RefreshAllocationState();
+                    if (_collectionFiles != null)
+                        foreach (var lazy in _collectionFiles.Values)
+                            if (lazy.IsValueCreated && lazy.Value is PageFile collectionFile)
+                                collectionFile.RefreshAllocationState();
+                }
+                catch
+                {
+                    _shm.ReleaseOpenLock();
+                    throw;
+                }
+            }
+            _openLockHolds++;
+        }
+    }
+
+    private void ExitOpenLock()
+    {
+        lock (_openLockGate)
+        {
+            if (--_openLockHolds == 0)
+                _shm!.ReleaseOpenLock();
+        }
+    }
+
+    /// <summary>Scope returned by <see cref="EnterOpenLock"/>; disposing it ends the hold.</summary>
+    internal readonly struct OpenLockScope : IDisposable
+    {
+        private readonly StorageEngine? _engine;
+        internal OpenLockScope(StorageEngine engine) => _engine = engine;
+        public void Dispose() => _engine?.ExitOpenLock();
+    }
+
     public StorageEngine(string databasePath, PageFileConfig config)
     {
         config = config.Normalize();
         _config = config;
         ICryptoProvider? walCryptoProvider = null;
+        bool holdsOpenLock = false;
         try
         {
             // Use WalPath if specified, otherwise derive from databasePath (default behavior unchanged)
@@ -155,6 +229,34 @@ public sealed partial class StorageEngine : IDisposable
             var walDirectory = Path.GetDirectoryName(walPath);
             if (!string.IsNullOrWhiteSpace(walDirectory))
                 Directory.CreateDirectory(walDirectory);
+
+            // ── Multi-process WAL coordination (opt-in) ─────────────────────────
+            // When AllowMultiProcessAccess is true, open the .wal-shm sidecar that
+            // coordinates cross-process writers / readers (see roadmap/v5/MULTI_PROCESS_WAL.md).
+            // The SHM file lives next to the WAL so both have the same lifetime.
+            if (config.AllowMultiProcessAccess)
+            {
+                var shmPath = walPath + "-shm";
+                _shm = Transactions.WalSharedMemory.Open(shmPath, config.PageSize);
+                _walOffsets = new ConcurrentDictionary<uint, long>();
+
+                // If a previous writer crashed without releasing the writer lock, the
+                // recorded PID will not be alive — clear it so this process (or another)
+                // can re-acquire the lock. The OS-level mutex / OFD lock has already been
+                // auto-released by the kernel; this only clears our PID stamp.
+                _shm.ForceClearStaleWriter();
+
+                // Everything from here to the end of the constructor creates or reads the
+                // database files' initial state: the page file (created if missing, header),
+                // the index file, WAL recovery, and the dictionary / KV roots. Without the
+                // open lock, a second process opening a new database at the same moment reads
+                // a header that is not written yet, or a page that the first process wrote past
+                // the end of its own memory map (#216). Released at the end of the constructor.
+                // A process that waits here then finds the files initialised and opens them
+                // normally. Single-process mode needs no lock: FileShare.None excludes others.
+                EnterOpenLockCore();
+                holdsOpenLock = true;
+            }
 
             // Initialize storage infrastructure
             _pageFile = new PageFile(databasePath, config);
@@ -203,23 +305,6 @@ public sealed partial class StorageEngine : IDisposable
             _activeTransactions = new ConcurrentDictionary<ulong, Transaction>();
             _nextTransactionId = 0; // Interlocked.Increment pre-increments, so first txnId == 1.
 
-            // ── Multi-process WAL coordination (opt-in) ─────────────────────────
-            // When AllowMultiProcessAccess is true, open the .wal-shm sidecar that
-            // coordinates cross-process writers / readers (see roadmap/v5/MULTI_PROCESS_WAL.md).
-            // The SHM file lives next to the WAL so both have the same lifetime.
-            if (config.AllowMultiProcessAccess)
-            {
-                var shmPath = walPath + "-shm";
-                _shm = Transactions.WalSharedMemory.Open(shmPath, config.PageSize);
-                _walOffsets = new ConcurrentDictionary<uint, long>();
-
-                // If a previous writer crashed without releasing the writer lock, the
-                // recorded PID will not be alive — clear it so this process (or another)
-                // can re-acquire the lock. The OS-level mutex / OFD lock has already been
-                // auto-released by the kernel; this only clears our PID stamp.
-                _shm.ForceClearStaleWriter();
-            }
-
             // Admission gate: limits concurrent commit pressure on WAL/commit locks.
             _writerGate = config.LockTimeout.MaxConcurrentWriters > 0
                 ? new SemaphoreSlim(config.LockTimeout.MaxConcurrentWriters, config.LockTimeout.MaxConcurrentWriters)
@@ -245,6 +330,12 @@ public sealed partial class StorageEngine : IDisposable
             
             InitializeDictionary();
             InitializeKv();
+
+            if (holdsOpenLock)
+            {
+                holdsOpenLock = false;
+                ExitOpenLock();
+            }
             
             // Create and start checkpoint manager
             // _checkpointManager = new Transactions.CheckpointManager(this);
@@ -252,6 +343,8 @@ public sealed partial class StorageEngine : IDisposable
         }
         catch
         {
+            if (holdsOpenLock)
+                try { ExitOpenLock(); } catch { /* best-effort */ }
             try { _writerCts.Cancel(); } catch { /* best-effort */ }
             try { _writerTask?.Wait(TimeSpan.FromSeconds(5)); } catch { /* best-effort */ }
             try { _wal?.Dispose(); } catch { /* best-effort */ }

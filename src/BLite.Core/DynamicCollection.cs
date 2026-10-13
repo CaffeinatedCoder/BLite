@@ -109,6 +109,10 @@ public sealed class DynamicCollection : IDisposable
         _fsi = freeSpaceIndex ?? new FreeSpaceIndex(_storage.PageSize);
         _isPageLocked = _storage.IsPageLocked;
 
+        // Multi-process mode: create or open the catalog entry and index roots of the collection
+        // under the cross-process open lock (#216). No-op in single-process mode.
+        using var openLock = _storage.EnterOpenLock();
+
         // Load or create collection metadata
         var metadata = _storage.GetCollectionMetadata(_collectionName);
         uint primaryRootPageId = 0;

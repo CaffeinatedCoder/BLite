@@ -301,6 +301,18 @@ public sealed class PageFile : IPageStorage
     // CreateViewAccessor-per-read (which allocates an object + 16 KB temp array each time).
     private MemoryMappedViewAccessor? _readAccessor;
 
+    // Bytes covered by _mappedFile / _readAccessor, i.e. the file length when they were
+    // created (MapCore). Every page access is checked against this rather than against the
+    // file length: with AllowMultiProcessAccess another process can grow the file past this
+    // instance's map, and touching a page there through the map faults the process (#216).
+    // Written under the _rwLock write lock.
+    private long _mappedLength;
+
+    // File length as of the last time this instance sized the file itself or took stock of it
+    // (Open, RefreshAllocationState). If the file is longer now, another process has grown it
+    // and allocates in the added block, so _nextPageId must skip past it. Guarded by _rwLock.
+    private long _allocationViewLength;
+
     // ── Encryption ────────────────────────────────────────────────────────────
     // Null means no encryption (zero overhead, unchanged file format).
     // Non-null means page I/O is transparently encrypted/decrypted.
@@ -390,7 +402,7 @@ public sealed class PageFile : IPageStorage
                 FileOptions.Asynchronous);
 #endif
 
-            bool isNew = !fileExists || _fileStream.Length == 0;
+            bool isNew = !fileExists || _fileStream.Length == 0 || (!isReadOnlyAccess && IsUnwrittenNewFile());
 
             if (isNew)
             {
@@ -469,19 +481,9 @@ public sealed class PageFile : IPageStorage
 
             // Calculate next page ID accounting for the crypto header and physical page size.
             _nextPageId = checked((uint)(dataLength / _physicalPageSize));
+            _allocationViewLength = _fileStream.Length;
 
-            _mappedFile = MemoryMappedFile.CreateFromFile(
-                _fileStream,
-                null,
-                _fileStream.Length,
-                _config.Access,
-                HandleInheritability.None,
-                leaveOpen: true);
-
-            // Persistent read accessor — covers the whole mapped region (size=0 means entire file).
-            // Used by ReadPageCore for zero-alloc reads via AcquirePointer.
-            _readAccessor?.Dispose();
-            _readAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            MapCore();
 
             if (isNew)
             {
@@ -505,6 +507,27 @@ public sealed class PageFile : IPageStorage
         {
             _rwLock.ExitWriteLock();
         }
+    }
+
+    /// <summary>
+    /// True for a file whose creator sized it and died before writing its header: exactly the
+    /// initial size of a new plain file, with pages 0 and 1 still all zeros (a written header
+    /// page never is: it carries <see cref="PageType.Header"/> and the page size). Such a file
+    /// is initialised again instead of failing with a page-size mismatch. Nobody else can be
+    /// initialising it right now: single-process mode opens it with <see cref="FileShare.None"/>,
+    /// and multi-process mode opens it under the SHM open lock (#216).
+    /// </summary>
+    private bool IsUnwrittenNewFile()
+    {
+        if (_cryptoProvider != null || _fileStream!.Length != AlignToBlock((long)_physicalPageSize * 2))
+            return false;
+
+        var firstPages = new byte[_physicalPageSize * 2];
+        ReadBytesFromStream(_fileStream, 0, firstPages);
+        _fileStream.Position = 0;
+        foreach (var b in firstPages)
+            if (b != 0) return false;
+        return true;
     }
 
     /// <summary>
@@ -599,10 +622,12 @@ public sealed class PageFile : IPageStorage
     // A page id past the end of the mapping would turn the memcpy below into an
     // AccessViolationException, which tears the whole process down with no way to
     // catch it. Surfacing it as a regular exception keeps the fault in the caller.
+    // Checked against the mapping, not the file: another process may have grown the file
+    // past it (#216); the public entry points remap first (EnsureMapped / EnsureCapacityCore).
     private long CheckedPageOffset(uint pageId)
     {
         var offset = _cryptoFileHeaderSize + (long)pageId * _physicalPageSize;
-        if (offset + _physicalPageSize > _fileStream!.Length)
+        if (offset + _physicalPageSize > _mappedLength)
             throw new InvalidDataException(
                 $"Page {pageId} is outside the page file (file holds {_nextPageId} pages): the file is corrupt.");
         return offset;
@@ -635,7 +660,7 @@ public sealed class PageFile : IPageStorage
 
     private unsafe void ReadPageHeaderCore(uint pageId, Span<byte> destination)
     {
-        var offset = _cryptoFileHeaderSize + (long)pageId * _physicalPageSize;
+        var offset = CheckedPageOffset(pageId);
         byte* basePtr = null;
         _readAccessor!.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
         try
@@ -730,29 +755,106 @@ public sealed class PageFile : IPageStorage
     // _mappedFile when the requested offset does not fit in the current mapping.
     private void EnsureCapacityCore(long requiredOffset)
     {
-        if (requiredOffset + _physicalPageSize <= _fileStream!.Length)
+        var required = requiredOffset + _physicalPageSize;
+        if (required <= _mappedLength)
             return;
 
-        // For encrypted files, grow exactly to fit the new page.  Extra (unwritten) pages
-        // contain all-zeros and cannot be decrypted by AES-GCM (auth tag mismatch).
-        // For plain files, round up to the block boundary for I/O efficiency.
-        var newSize = _cryptoProvider != null && _cryptoFileHeaderSize > 0
-            ? requiredOffset + _physicalPageSize
-            : AlignToBlock(requiredOffset + _physicalPageSize);
+        // With AllowMultiProcessAccess another process may have grown the file already: then
+        // only this instance's map is stale (#216), and growing it to our own idea of its
+        // size could cut off what that process added.
+        if (required > _fileStream!.Length)
+        {
+            // For encrypted files, grow exactly to fit the new page.  Extra (unwritten) pages
+            // contain all-zeros and cannot be decrypted by AES-GCM (auth tag mismatch).
+            // For plain files, round up to the block boundary for I/O efficiency.
+            var newSize = _cryptoProvider != null && _cryptoFileHeaderSize > 0
+                ? required
+                : AlignToBlock(required);
+            _fileStream.SetLength(newSize);
+            _allocationViewLength = newSize;
+        }
 
-        _fileStream.SetLength(newSize);
-        _mappedFile!.Dispose();
+        MapCore();
+    }
+
+    // Maps the whole file as it is now and records the mapped length. Must be called under
+    // the _rwLock write lock (or from Open, which holds it).
+    private void MapCore()
+    {
+        var length = _fileStream!.Length;
+        _readAccessor?.Dispose();
+        _mappedFile?.Dispose();
         _mappedFile = MemoryMappedFile.CreateFromFile(
             _fileStream,
             null,
-            _fileStream.Length,
+            length,
             _config.Access,
             HandleInheritability.None,
             leaveOpen: true);
 
-        // Recreate the persistent read accessor so it covers the newly grown region.
-        _readAccessor?.Dispose();
+        // Persistent read accessor — covers the whole mapped region (size=0 means entire file).
+        // Used by ReadPageCore for zero-alloc reads via AcquirePointer.
         _readAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        Volatile.Write(ref _mappedLength, length);
+    }
+
+    /// <summary>
+    /// Multi-process mode: called by <see cref="StorageEngine"/> right after it takes the SHM open
+    /// lock, before it allocates pages or rewrites the header under that lock (#216). Picks up
+    /// what other processes did to the file meanwhile: if one of them grew it, allocation
+    /// continues past the end of the file (that process hands out the pages of the block it
+    /// added), and the free-list head is re-read from the header page.
+    /// </summary>
+    internal void RefreshAllocationState()
+    {
+        ThrowIfDisposed();
+        if (!_rwLock.TryEnterWriteLock(WriteLockTimeoutMs))
+            throw new TimeoutException("Timed out acquiring PageFile write lock (RefreshAllocationState).");
+        try
+        {
+            var length = _fileStream!.Length;
+            if (length != _allocationViewLength)
+            {
+                if (length > _mappedLength)
+                    MapCore();
+                var pages = (uint)((length - _cryptoFileHeaderSize) / _physicalPageSize);
+                if (pages > _nextPageId)
+                    _nextPageId = pages;
+                _allocationViewLength = length;
+            }
+
+            var headerBuf = new byte[_config.PageSize];
+            ReadPageCore(0, headerBuf);
+            _firstFreePageId = PageHeader.ReadFrom(headerBuf).NextPageId;
+        }
+        finally
+        {
+            _rwLock.ExitWriteLock();
+        }
+    }
+
+    // Before a read: if the page lies past this instance's map but inside the file, another
+    // process has grown the file since it was mapped (AllowMultiProcessAccess), and the page
+    // may well be referenced from data that process wrote (#216). Map the grown file first.
+    // In single-process mode the map always covers the whole file, so this is one comparison;
+    // a page past the end of the file is still reported by CheckedPageOffset.
+    private void EnsureMapped(uint pageId)
+    {
+        var end = _cryptoFileHeaderSize + ((long)pageId + 1) * _physicalPageSize;
+        if (end <= Volatile.Read(ref _mappedLength))
+            return;
+
+        if (!_rwLock.TryEnterWriteLock(WriteLockTimeoutMs))
+            throw new TimeoutException("Timed out acquiring PageFile write lock (remap).");
+        try
+        {
+            if (end > _mappedLength && end <= _fileStream!.Length)
+                MapCore();
+        }
+        finally
+        {
+            _rwLock.ExitWriteLock();
+        }
     }
 
     // ── Public page I/O ────────────────────────────────────────────────────
@@ -771,6 +873,7 @@ public sealed class PageFile : IPageStorage
         if (_mappedFile == null)
             throw new InvalidOperationException("File not open");
 
+        EnsureMapped(pageId);
         if (!_rwLock.TryEnterReadLock(ReadLockTimeoutMs))
             throw new TimeoutException("Timed out acquiring PageFile read lock (ReadPage).");
         try
@@ -798,6 +901,7 @@ public sealed class PageFile : IPageStorage
         if (_mappedFile == null)
             throw new InvalidOperationException("File not open");
 
+        EnsureMapped(pageId);
         if (!_rwLock.TryEnterReadLock(ReadLockTimeoutMs))
             throw new TimeoutException("Timed out acquiring PageFile read lock (ReadPageHeader).");
         try
@@ -831,6 +935,7 @@ public sealed class PageFile : IPageStorage
         if (_mappedFile == null)
             throw new InvalidOperationException("File not open");
 
+        EnsureMapped(pageId);
         if (!_rwLock.TryEnterReadLock(ReadLockTimeoutMs))
             throw new TimeoutException("Timed out acquiring PageFile read lock (ReadPageAsync).");
         try
@@ -870,9 +975,9 @@ public sealed class PageFile : IPageStorage
 
         var offset = _cryptoFileHeaderSize + (long)pageId * _physicalPageSize;
 
-        // Fast path: file is already large enough — no mapping growth needed, but the
+        // Fast path: the mapping already covers the page — no growth or remap needed, but the
         // write still needs exclusive access to the page bytes (see remarks above).
-        if (offset + _physicalPageSize <= _fileStream!.Length)
+        if (offset + _physicalPageSize <= Volatile.Read(ref _mappedLength))
         {
             YieldToWaitingReaders();
             if (!_rwLock.TryEnterWriteLock(WriteLockTimeoutMs))
@@ -1217,18 +1322,13 @@ public sealed class PageFile : IPageStorage
                 _readAccessor = null;
                 _mappedFile.Dispose();
                 _mappedFile = null;
+                _mappedLength = 0;
 
                 _fileStream.SetLength(newLength);
                 _nextPageId = newPageCount;
+                _allocationViewLength = newLength;
 
-                _mappedFile = MemoryMappedFile.CreateFromFile(
-                    _fileStream,
-                    null,
-                    newLength,
-                    _config.Access,
-                    HandleInheritability.None,
-                    leaveOpen: true);
-                _readAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                MapCore();
 
                 // 5. Rewrite the free list chain with only valid (retained) entries.
                 _firstFreePageId = 0;
@@ -1287,6 +1387,7 @@ public sealed class PageFile : IPageStorage
             _readAccessor = null;
             _mappedFile?.Dispose();
             _mappedFile = null;
+            _mappedLength = 0;
             
             // 3. Then close file stream
             _fileStream?.Dispose();
