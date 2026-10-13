@@ -471,6 +471,27 @@ public sealed class WriteAheadLog : IWriteAheadLog
     internal long GetCurrentPositionNoLock() => _walStream?.Position ?? 0;
 
     /// <summary>
+    /// Moves the write position to the current end of the WAL file. In multi-process mode
+    /// another process may have appended to the file since this instance last wrote to it, so
+    /// the position left by this instance's own writes is stale; call this under the
+    /// cross-process writer lock before appending.
+    /// </summary>
+    internal void SeekToEnd()
+    {
+        if (!_lock.Wait(_writeTimeoutMs))
+            throw new TimeoutException("Timed out acquiring WAL write lock.");
+        try
+        {
+            if (_walStream != null)
+                _walStream.Position = _walStream.Length;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    /// <summary>
     /// Writes a WAL data record and returns the byte offset at which the record
     /// starts in the WAL file. The offset is captured atomically inside the WAL
     /// write lock — so no concurrent WAL writer (e.g. <c>PrepareTransactionAsync</c>)

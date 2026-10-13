@@ -18,7 +18,8 @@ public sealed partial class StorageEngine
     //   • The WAL flush cost (~5–30 µs) is amortised across N concurrent commits.
     //   • _commitLock is held only by the writer, for the duration of the batch
     //     write + flush — not by every individual caller for the full round trip.
-    //   • BeginTransaction no longer competes with an in-flight flush.
+    //   • BeginTransaction no longer competes with an in-flight flush (except in
+    //     multi-process mode, when it has another process's commits to replay).
     //   • The sync CommitTransactionAsync(ulong) path and checkpoint operations still
     //     use _commitLock normally and are fully compatible.
     // -------------------------------------------------------------------------
@@ -158,6 +159,17 @@ public sealed partial class StorageEngine
             var wal = (_shm != null) ? (_wal as Transactions.WriteAheadLog) : null;
             var pageOffsets = wal != null ? new List<(uint pageId, long walOffset)>() : null;
 
+            // Another process may have appended to the shared WAL since this engine last wrote
+            // to it or replayed it. Replay those records first, so that advancing the bookmark
+            // past this batch below never skips them, and append after them instead of at this
+            // engine's own, stale, write position (which would overwrite them).
+            bool caughtUp = false;
+            if (wal != null)
+            {
+                caughtUp = TryCatchUpWithSharedWal(wal);
+                wal.SeekToEnd();
+            }
+
             foreach (var commit in batch)
             {
                 if (commit.Pages == null || commit.Pages.IsEmpty)
@@ -193,9 +205,11 @@ public sealed partial class StorageEngine
             {
                 if (commit.Pages != null)
                 {
-                    _walCache.TryRemove(commit.TransactionId, out _);
+                    // Index first, then drop the cache: a page must never be in neither
+                    // (FreePage relies on finding its WAL image in one of them).
                     foreach (var kvp in commit.Pages)
                         _walIndex[kvp.Key] = kvp.Value;
+                    _walCache.TryRemove(commit.TransactionId, out _);
                 }
             }
 
@@ -221,8 +235,10 @@ public sealed partial class StorageEngine
             // this engine does not redundantly replay WAL records that we just committed
             // (they are already in _walIndex from the lines above). This is safe because
             // we hold _commitLock + SHM writer lock: no concurrent writer can insert
-            // records between our last write and the position we record here.
-            if (_shm != null)
+            // records between our last write and the position we record here, and the
+            // catch-up above replayed everything before this batch. If that replay failed,
+            // the bookmark stays put and the next catch-up replays this batch as well.
+            if (caughtUp)
                 Volatile.Write(ref _lastKnownWalEndOffset, newWalEnd);
 
             // Check if checkpoint is needed, but defer until after releasing the lock

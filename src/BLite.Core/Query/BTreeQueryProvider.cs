@@ -214,6 +214,35 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         visitor.Visit(expression);
         var model = visitor.GetModel();
 
+        // ── Element terminals: First / FirstOrDefault / Single / SingleOrDefault / Any ──
+        // With only a WHERE in front, at most one (Single*: two) matching document decides the
+        // result, so fetch just that many through the index-aware FetchAsync. Anything else in
+        // front (OrderBy, Select, Take, ...), and Last / LastOrDefault, which need every match,
+        // go through the general fallback.
+        if (model.ElementTerminal is { } terminal)
+        {
+            if (terminal is not ("Last" or "LastOrDefault")
+                && !model.HasComplexOperators && model.SelectClause == null && model.OrderByClause == null
+                && !model.Take.HasValue && !model.Skip.HasValue && model.AggregateOp == null && !model.IsCountOnly)
+            {
+                bool single = terminal is "Single" or "SingleOrDefault";
+                var found = new List<T>(single ? 2 : 1);
+                await foreach (var item in _collection.FetchAsync(model.WhereClause, single ? 2 : 1, cancellationToken))
+                    found.Add(item);
+
+                return terminal switch
+                {
+                    "First"           => (TResult)(object)found.First()!,
+                    "FirstOrDefault"  => (TResult)(object?)found.FirstOrDefault()!,
+                    "Single"          => (TResult)(object)found.Single()!,
+                    "SingleOrDefault" => (TResult)(object?)found.SingleOrDefault()!,
+                    _                 => (TResult)(object)(found.Count > 0),
+                };
+            }
+
+            model.HasComplexOperators = true;
+        }
+
         // ── Fast path: Count() / LongCount() terminal with no WHERE ─────────────
         // Uses the primary BTree key scan (O(n) key reads, zero document reads).
         // Disabled when Take/Skip are present — those shaping operators reduce the
@@ -311,6 +340,13 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // pipeline cannot model.  We still benefit from index / BSON-scan fetch,
         // then let EnumerableRewriter translate the remaining Queryable calls to
         // Enumerable equivalents and compile the residual expression once.
+        // FetchAsync applied the WHERE, so the replay drops the root-chain Where calls folded into
+        // it. Re-evaluating them would change nothing except for VectorSearch, which only the index
+        // can evaluate. Every other VectorSearch in the expression is still evaluated and throws.
+        // The same holds for a terminal predicate folded into the WHERE (First(p) after OrderBy).
+        if (whereAlreadyApplied)
+            expression = DropAppliedWheres(DropFoldedTerminalPredicate(expression, model.FoldedTerminal)).Expression;
+
         if (model.HasComplexOperators)
             return ExecuteViaEnumerableRewriter<TResult>(expression, sourceData);
 
@@ -635,6 +671,78 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     }
 
     // ─── Expression-tree helpers ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Removes the <c>Queryable.Where(x =&gt; ...)</c> calls on the root chain whose input is the
+    /// fetched documents or a subset of them (only filtering, ordering and paging operators lie
+    /// between the root and the Where). <see cref="BTreeExpressionVisitor"/> folds each of these
+    /// into <see cref="QueryModel.WhereClause"/>, which FetchAsync applied, so every element
+    /// reaching them already satisfies their predicate and dropping them leaves the result unchanged.
+    /// </summary>
+    /// <returns>
+    /// The rewritten expression, and whether its elements are still a subset of the fetched documents.
+    /// </returns>
+    private static (Expression Expression, bool IsFetchedSubset) DropAppliedWheres(Expression expression)
+    {
+        if (expression is ConstantExpression { Value: IQueryable })
+            return (expression, true);
+
+        if (expression is not MethodCallExpression call
+            || call.Method.DeclaringType != typeof(Queryable)
+            || call.Arguments.Count == 0)
+            return (expression, false);
+
+        var (source, isFetchedSubset) = DropAppliedWheres(call.Arguments[0]);
+
+        if (isFetchedSubset
+            && call.Method.Name == nameof(Queryable.Where)
+            && call.Arguments[1] is UnaryExpression { Operand: LambdaExpression { Parameters.Count: 1 } })
+            return (source, true);
+
+        var rewritten = source == call.Arguments[0]
+            ? call
+            : call.Update(call.Object, [source, .. call.Arguments.Skip(1)]);
+        return (rewritten, isFetchedSubset && s_subsetPreservingOperators.Contains(call.Method.Name));
+    }
+
+    /// <summary>
+    /// Replaces the terminal whose predicate <see cref="BTreeExpressionVisitor"/> folded into
+    /// <see cref="QueryModel.WhereClause"/> (<c>Count(p)</c>, <c>First(p)</c>, ...) with its
+    /// parameterless overload. The visitor folds a predicate only when the terminal's source is the
+    /// root followed by plain Where and ordering calls, so the elements reaching the terminal are
+    /// fetched documents, which all satisfy the predicate already.
+    /// </summary>
+    [RequiresDynamicCode("BLite LINQ queries use Expression.Compile() and MakeGenericMethod which require dynamic code generation.")]
+    [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
+    private static Expression DropFoldedTerminalPredicate(Expression expression, MethodCallExpression? foldedTerminal)
+    {
+        if (foldedTerminal is null || !ReferenceEquals(expression, foldedTerminal))
+            return expression;
+
+        var name = foldedTerminal.Method.Name;
+        if (!s_parameterlessTerminals.TryGetValue(name, out var definition))
+        {
+            definition = typeof(Queryable).GetMethods().Single(m => m.Name == name && m.GetParameters().Length == 1);
+            s_parameterlessTerminals[name] = definition;
+        }
+
+        var parameterless = definition.MakeGenericMethod(foldedTerminal.Method.GetGenericArguments());
+        return Expression.Call(parameterless, foldedTerminal.Arguments[0]);
+    }
+
+    /// <summary>Generic definitions of the parameterless Queryable terminals, by name.</summary>
+    private static readonly ConcurrentDictionary<string, MethodInfo> s_parameterlessTerminals = new();
+
+    /// <summary>Queryable operators whose output elements are a subset of their source's.</summary>
+    private static readonly HashSet<string> s_subsetPreservingOperators =
+    [
+        nameof(Queryable.Where),
+        nameof(Queryable.OrderBy), nameof(Queryable.OrderByDescending),
+        nameof(Queryable.ThenBy), nameof(Queryable.ThenByDescending),
+        nameof(Queryable.Skip), nameof(Queryable.Take),
+        nameof(Queryable.SkipWhile), nameof(Queryable.TakeWhile),
+        nameof(Queryable.Distinct), nameof(Queryable.Reverse),
+    ];
 
     /// <summary>
     /// Fallback for queries containing operators the direct pipeline cannot handle

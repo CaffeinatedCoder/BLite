@@ -25,6 +25,9 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     private readonly string _collectionName;
     private CollectionMetadata _metadata;
     private volatile IReadOnlyList<CollectionIndexInfo>? _cachedIndexInfo;
+    // Whether any index is a unique BTree index, so EnsureUniqueInAll can skip the loop.
+    // Refreshed under _lock whenever _indexes changes.
+    private volatile bool _hasUniqueBTreeIndex;
 
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     [RequiresUnreferencedCode("Index creation uses reflection (Expression.PropertyOrField) to access type members. Ensure all entity types and their members are preserved.")]
@@ -37,6 +40,10 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         
         // Load existing metadata via storage
         _metadata = _storage.GetCollectionMetadata(_collectionName) ?? new CollectionMetadata { Name = _collectionName };
+
+        // Refuse a collection that requires features this version cannot maintain, before anything
+        // below writes to it.
+        CollectionFeatures.EnsureCanOpen(_metadata, _storage.IsReadOnly);
         
         // Initialize indexes from metadata. Root page ids are fixed for the lifetime of an index
         // (a root split rewrites the root page in place), so they only need persisting when the
@@ -54,8 +61,18 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             rootAllocated |= index.RootPageId != idxMeta.RootPageId;
         }
 
+        RefreshHasUniqueBTreeIndex();
+
         if (rootAllocated)
             SaveMetadata();
+    }
+
+    private void RefreshHasUniqueBTreeIndex()
+    {
+        var any = false;
+        foreach (var index in _indexes.Values)
+            any |= index.IsUniqueBTree;
+        _hasUniqueBTreeIndex = any;
     }
 
     private void UpdateMetadata()
@@ -101,6 +118,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             var secondaryIndex = new CollectionSecondaryIndex<TId, T>(definition, _storage, _mapper);
             _indexes[definition.Name] = secondaryIndex;
             _cachedIndexInfo = null; // invalidate cache
+            RefreshHasUniqueBTreeIndex();
             
             // Persist metadata
             UpdateMetadata();
@@ -279,6 +297,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
                 index.Dispose();
                 _indexes.Remove(name);
                 _cachedIndexInfo = null; // invalidate cache
+                RefreshHasUniqueBTreeIndex();
                 
                 SaveMetadata(); // Save metadata after dropping index
                 return true;
@@ -301,19 +320,66 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
-            var fresh = new CollectionSecondaryIndex<TId, T>(old.Definition, _storage, _mapper)
-            {
-                KeyFormat = old.KeyFormat
-            };
+            var fresh = CreateUnregisteredCopy(name);
+            fresh.KeyFormat = old.KeyFormat;
+            ReplaceIndex(name, fresh);
+            return fresh;
+        }
+    }
+
+    /// <summary>
+    /// Creates an empty index with the same definition as <paramref name="name"/> without
+    /// registering it, so queries keep using the existing index while the copy is populated.
+    /// The copy owns its root page: hand it to <see cref="ReplaceIndex"/> or release it with
+    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/>.
+    /// </summary>
+    internal CollectionSecondaryIndex<TId, T> CreateUnregisteredCopy(string name)
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
+            if (!_indexes.TryGetValue(name, out var old))
+                throw new InvalidOperationException($"Index '{name}' does not exist");
+
+            return new CollectionSecondaryIndex<TId, T>(old.Definition, _storage, _mapper);
+        }
+    }
+
+    /// <summary>
+    /// Registers <paramref name="fresh"/> under <paramref name="name"/>, persists its root page
+    /// and frees the pages of the index it replaces. If the metadata cannot be saved, the old
+    /// index stays registered and <paramref name="fresh"/> remains the caller's to release.
+    /// </summary>
+    internal void ReplaceIndex(string name, CollectionSecondaryIndex<TId, T> fresh)
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
+            if (!_indexes.TryGetValue(name, out var old))
+                throw new InvalidOperationException($"Index '{name}' does not exist");
+
             _indexes[name] = fresh;
             _cachedIndexInfo = null; // invalidate cache
+            RefreshHasUniqueBTreeIndex();
 
             // Persist the new root before freeing the old tree: a crash in between leaks the old
             // pages, whereas the reverse order would let the next open free them a second time.
-            SaveMetadata();
+            try
+            {
+                SaveMetadata();
+            }
+            catch
+            {
+                // Keep the old index registered, matching the metadata on disk; the caller still
+                // owns the copy.
+                _indexes[name] = old;
+                UpdateMetadata();
+                throw;
+            }
             old.FreeAllPages(_storage);
             old.Dispose();
-            return fresh;
         }
     }
 
@@ -449,6 +515,32 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             foreach (var index in _indexes.Values)
             {
                 index.Insert(document, location, transaction);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Throws if <paramref name="document"/> would violate any unique index.
+    /// Call before any page is written, so a rejected write leaves nothing behind.
+    /// On update, pass the stored version as <paramref name="oldDocument"/>: only indexes whose
+    /// key changed are checked, so documents that already share a value can still be updated.
+    /// </summary>
+    /// <param name="document">Document about to be inserted or written by an update</param>
+    /// <param name="oldDocument">Stored version of the document on update; null on insert</param>
+    /// <param name="transaction">Transaction context</param>
+    public void EnsureUniqueInAll(T document, T? oldDocument, ITransaction transaction)
+    {
+        if (document == null)
+            throw new ArgumentNullException(nameof(document));
+
+        if (!_hasUniqueBTreeIndex)
+            return;
+
+        lock (_lock)
+        {
+            foreach (var index in _indexes.Values)
+            {
+                index.EnsureUnique(document, oldDocument, transaction);
             }
         }
     }
@@ -599,6 +691,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             }
             
             _indexes.Clear();
+            _hasUniqueBTreeIndex = false;
             _disposed = true;
         }
 

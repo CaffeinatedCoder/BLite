@@ -503,6 +503,20 @@ public class MetadataChainTests : IDisposable
         Assert.Equal(2, Layout(storage).Count);
     }
 
+    [Fact]
+    public async Task DeleteOfAMissingCollection_DoesNotWaitForTheLockItHolds()
+    {
+        // DeleteCollectionMetadata looks the record up while holding the metadata lock; a lookup
+        // that misses must not try to take that lock again (it is not reentrant).
+        await SeedAsync(Names(2));
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        storage.DeleteCollectionMetadata("missing");
+        Assert.True(watch.ElapsedMilliseconds < 400, $"took {watch.ElapsedMilliseconds} ms");
+        Assert.Equal(new[] { "c0", "c1" }, storage.GetAllCollectionsMetadata().Select(m => m.Name).OrderBy(n => n));
+    }
+
     // ── Records too large for a page ─────────────────────────────────────────
 
     private static int RecordLength(StorageEngine storage, string collection)

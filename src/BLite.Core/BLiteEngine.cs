@@ -356,10 +356,20 @@ public sealed class BLiteEngine : IDisposable, ITransactionHolder
         // registered in the in-memory dictionary.  DynamicCollection reads its
         // own metadata from storage, so the idType argument is irrelevant for
         // existing collections (only matters when creating brand-new ones).
+        // A collection that requires features this version cannot maintain is listed but
+        // not opened: opening it throws, and it must not make the whole listing fail.
+        var unopened = new List<string>();
         foreach (var meta in _storage.GetAllCollectionsMetadata())
+        {
+            if (!_collections.ContainsKey(meta.Name) && !CollectionFeatures.CanOpen(meta, _storage.IsReadOnly))
+            {
+                unopened.Add(meta.Name);
+                continue;
+            }
             _collections.GetOrAdd(meta.Name, n => new DynamicCollection(_storage, this, n, BsonIdType.ObjectId, _freeSpaceIndexes.GetIndex()));
+        }
 
-        return _collections.Keys.ToList();
+        return _collections.Keys.Concat(unopened).ToList();
     }
 
     /// <summary>
@@ -532,18 +542,22 @@ public sealed class BLiteEngine : IDisposable, ITransactionHolder
         {
             // Ensure the collection is loaded from disk (it may exist on disk but not yet
             // in the in-memory map) before vacuum; silently skip if it doesn't exist at all.
+            // A collection ListCollections could not open still exists: opening it below
+            // reports the features this version lacks.
             ListCollections(); // warms up _collections from the on-disk catalog
-            if (!_collections.ContainsKey(options.CollectionName))
+            if (!_collections.ContainsKey(options.CollectionName)
+                && _storage.GetCollectionMetadata(options.CollectionName) == null)
                 return;
 
             targets = new[] { GetOrCreateCollection(options.CollectionName) };
         }
         else
         {
-            // Warm up: load any on-disk collections not yet in the in-memory map, then
-            // snapshot the full set to avoid mutation during iteration.
-            ListCollections();
-            targets = _collections.Values.ToArray();
+            // Open every collection, including on-disk ones not yet in the in-memory map, and
+            // snapshot the set to avoid mutation during iteration. A collection that requires
+            // features this version lacks throws here, before anything is vacuumed: skipping it
+            // would leave its deleted documents unerased.
+            targets = ListCollections().Select(name => GetOrCreateCollection(name)).ToArray();
         }
 
         foreach (var collection in targets)
