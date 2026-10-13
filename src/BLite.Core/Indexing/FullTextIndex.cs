@@ -270,8 +270,15 @@ internal sealed class FullTextIndex
     /// <summary>
     /// The postings of <paramref name="term"/>, one per location. A stale posting left at a location
     /// that now holds another document containing the term differs only in its frequency and length,
-    /// so it sorts next to the current one and is skipped: the first posting of a location wins.
+    /// so it sorts next to the current one and only the first posting of the location is returned.
     /// </summary>
+    /// <remarks>
+    /// "First" is key order, i.e. lowest frequency, then shortest length, not the current posting, so
+    /// the stale one can be the posting used for scoring (as in <see cref="TryPosting"/>), and
+    /// <c>CountRange</c> counts both towards the term's document frequency. That only skews BM25
+    /// scores while the stale posting exists: which documents match, and that each comes back once,
+    /// do not depend on it, and hits are re-checked against the document.
+    /// </remarks>
     private IEnumerable<(DocumentLocation Location, int Frequency, int Length)> Postings(string term, ulong? txnId)
     {
         int offset = 2 + Encoding.UTF8.GetByteCount(term) + DocumentLocation.SerializedSize;

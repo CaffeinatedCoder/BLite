@@ -570,6 +570,7 @@ public class FullTextSearchTests : IDisposable
         Assert.Equal(new[] { "fox again", "fox" }, top5.Select(r => r.Document.Title));
     }
 
+    // Checks membership and order only: the stale posting may be the one scored (see FullTextIndex.Postings).
     [Fact]
     public async Task StalePostingAtTheLocationOfADocumentWithTheSameTerm_IsCountedOnce()
     {
