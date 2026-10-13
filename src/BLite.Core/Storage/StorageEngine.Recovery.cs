@@ -58,6 +58,11 @@ public sealed partial class StorageEngine
         }
         if (Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) != 0) return;
         var sw = _metrics != null ? Metrics.ValueStopwatch.StartNew() : default;
+
+        // Reported in the Checkpoint metric. A checkpoint that could not take its locks or catch
+        // up with the shared WAL writes nothing, not even this engine's own pages; a later one
+        // retries. A failed catch-up is also reported as a warning (ReportFailedCatchUp).
+        bool success = true;
         try
         {
             List<KeyValuePair<uint, byte[]>> toCheckpoint;
@@ -74,10 +79,10 @@ public sealed partial class StorageEngine
                     if (!commitLockHeld)
                     {
                         writeCommitHeld = await _commitLock.WaitAsync(_config.LockTimeout.WriteTimeoutMs, ct).ConfigureAwait(false);
-                        if (!writeCommitHeld) return; // a later checkpoint retries
+                        if (!writeCommitHeld) { success = false; return; } // a later checkpoint retries
                     }
                     writeShmHeld = _shm.TryAcquireWriterLock(_config.LockTimeout.WriteTimeoutMs);
-                    if (!writeShmHeld || !TryCatchUpWithSharedWal(sharedWal)) return;
+                    if (!writeShmHeld || !TryCatchUpWithSharedWal(sharedWal)) { success = false; return; }
                 }
 
                 // Phase 6: Compute the safe upper boundary for this checkpoint run.
@@ -191,6 +196,11 @@ public sealed partial class StorageEngine
                 }
             }
         }
+        catch
+        {
+            success = false;
+            throw;
+        }
         finally
         {
             Interlocked.Exchange(ref _checkpointRunning, 0);
@@ -200,7 +210,7 @@ public sealed partial class StorageEngine
                     Timestamp     = sw.StartTimestamp,
                     Type          = Metrics.MetricEventType.Checkpoint,
                     ElapsedMicros = sw.GetElapsedMicros(),
-                    Success       = true,
+                    Success       = success,
                 });
         }
     }
@@ -305,11 +315,11 @@ public sealed partial class StorageEngine
         List<BackupCopyOperation>? operations = null;
         try
         {
+            // Truncates the WAL through the checkpoint path once every page is written: in
+            // multi-process mode under the SHM writer lock, keeping records other processes have
+            // not replayed, and starting a new WAL generation. Whatever stays in the WAL is
+            // copied with it below.
             await CheckpointCoreAsync(commitLockHeld: true, ct).ConfigureAwait(false);
-
-            // Through the same path as a checkpoint: in multi-process mode it takes the SHM writer
-            // lock, keeps records other processes have not replayed, and starts a new WAL generation.
-            await TryTruncateWalCoreAsync(commitLockHeld: true, ct).ConfigureAwait(false);
 
             operations = BuildBackupPlan(destinationDbPath, includeIndexes);
 

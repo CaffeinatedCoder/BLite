@@ -51,6 +51,13 @@ internal static class IndexOptimizer
         public float[]? VectorQuery { get; set; }
         public int K { get; set; }
 
+        /// <summary>
+        /// The <c>VectorSearch</c> call a vector plan serves from the index. It cannot be
+        /// evaluated per document, so a post-filter must treat it as satisfied; see
+        /// <see cref="WithoutCall"/>.
+        /// </summary>
+        public MethodCallExpression? VectorSearchCall { get; set; }
+
         public bool IsSpatialSearch { get; set; }
         public (double Latitude, double Longitude) SpatialPoint { get; set; }
         public double RadiusKm { get; set; }
@@ -161,7 +168,17 @@ internal static class IndexOptimizer
             var left = OptimizeExpression(binary.Left, parameter, indexes, registry);
             var right = OptimizeExpression(binary.Right, parameter, indexes, registry);
 
-            if (left != null && right != null && left.IndexName == right.IndexName)
+            // A vector term must drive the plan: the post-filter cannot evaluate it per document.
+            if (left?.IsVectorSearch == true || right?.IsVectorSearch == true)
+            {
+                var vector = left?.IsVectorSearch == true ? left : right!;
+                vector.FilterCompleteness = FilterCompleteness.PartialAnd;
+                vector.HasResiduePredicate = true;
+                return vector;
+            }
+
+            if (left != null && right != null && left.IndexName == right.IndexName
+                && !left.IsSpatialSearch && !right.IsSpatialSearch)
             {
                 // Both sides are covered by the same index — combine into a single range.
                 // Propagate the stricter completeness: if either branch required a post-filter
@@ -200,6 +217,8 @@ internal static class IndexOptimizer
 
             if (left != null && right != null &&
                 left.IndexName == right.IndexName &&
+                !left.IsSpatialSearch && !right.IsSpatialSearch &&
+                !left.IsVectorSearch && !right.IsVectorSearch &&
                 left.FilterCompleteness == FilterCompleteness.Exact &&
                 right.FilterCompleteness == FilterCompleteness.Exact &&
                 TryGetPointValues(left, out var leftValues) &&
@@ -381,7 +400,8 @@ internal static class IndexOptimizer
                         IndexName = index.Name,
                         IsVectorSearch = true,
                         VectorQuery = query,
-                        K = k
+                        K = k,
+                        VectorSearchCall = mcall
                     };
                 }
             }
@@ -430,6 +450,28 @@ internal static class IndexOptimizer
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Returns <paramref name="predicate"/> with <paramref name="call"/> replaced by <c>true</c>,
+    /// for post-filtering the candidates of an index that already satisfied that call.
+    /// </summary>
+    public static LambdaExpression WithoutCall(LambdaExpression predicate, Expression call)
+        => Expression.Lambda(predicate.Type, new ReplaceNodeVisitor(call, Expression.Constant(true)).Visit(predicate.Body)!, predicate.Parameters);
+
+    private sealed class ReplaceNodeVisitor : ExpressionVisitor
+    {
+        private readonly Expression _target;
+        private readonly Expression _replacement;
+
+        public ReplaceNodeVisitor(Expression target, Expression replacement)
+        {
+            _target = target;
+            _replacement = replacement;
+        }
+
+        public override Expression? Visit(Expression? node)
+            => ReferenceEquals(node, _target) ? _replacement : base.Visit(node);
     }
 
     private static bool TryGetPointValues(OptimizationResult result, out IReadOnlyList<object?> values)

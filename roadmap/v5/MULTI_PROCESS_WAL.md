@@ -148,6 +148,12 @@ Offset    Size    Field
 
 The WAL index is a double-buffered open-addressing hash table mapping `uint pageId → long walByteOffset`. The double-buffer allows the writer to rebuild one half while readers continue using the other, then atomically flip a pointer in the SHM header.
 
+**Version compatibility.** `WalGeneration` was added in a reserved field without changing `Version`, so older processes can open the same `.wal-shm`, but they neither increment it when they truncate the WAL nor discard what they replayed when another process does. Every process that opens the database must therefore run a BLite version later than 5.2.3; in a mixed deployment the older processes keep the bug described in [#197](https://github.com/EntglDb/BLite/issues/197) (stale pages read and checkpointed back after another process truncated the WAL).
+
+**Configuration mismatch.** A well-formed `.wal-shm` whose page size or reader-slot count differs from the opening process's configuration is re-initialised only if nothing shows it in use (a WAL end offset of 0, no live writer or reader PID); otherwise `Open` throws `InvalidOperationException`. On re-initialisation `WalGeneration` is incremented and `NextTransactionId` kept, so neither ever goes back.
+
+**Commit paths.** Only group commit appends under the cross-process writer lock, after catching up with the shared WAL, and publishes the new end offset. The direct commit path `CommitTransactionAsync(ulong)` and two-phase commit (`PrepareTransactionAsync`, `MarkTransactionCommittedAsync`) do none of that and throw `NotSupportedException` in multi-process mode ([#188](https://github.com/EntglDb/BLite/issues/188)).
+
 ---
 
 ## Platform Matrix

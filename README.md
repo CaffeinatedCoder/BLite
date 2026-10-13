@@ -362,6 +362,8 @@ using var db = new AppDb("shared.db", config); // open from multiple processes
 
 Each transaction starts by replaying what other processes have committed since. If a commit in the same process is running, it waits up to `LockTimeout.ReadTimeoutMs` for it; after that it starts anyway and may not see those other commits until the next transaction. A checkpoint writes its pages under the cross-process writer lock, so commits in every process wait for those writes (not for the flush that follows).
 
+Every process that opens the database must run a BLite version later than 5.2.3. Older versions don't track the WAL generation in the `.wal-shm`, so in a mixed deployment a process can still read, and checkpoint back over newer data, pages from a WAL another process has already checkpointed and truncated ([#197](https://github.com/EntglDb/BLite/issues/197)). Commit through `Transaction.CommitAsync` (group commit): the direct commit path `CommitTransactionAsync(ulong)` and two-phase commit (`PrepareTransactionAsync`, `MarkTransactionCommittedAsync`) throw `NotSupportedException` in multi-process mode ([#188](https://github.com/EntglDb/BLite/issues/188)).
+
 ### �📡 Change Data Capture (CDC)
 Real-time event streaming for database changes with transactional consistency.
 
@@ -874,6 +876,8 @@ IReadOnlyList<string> indexes = orders.ListIndexes();
 // Drop
 orders.DropIndex("idx_status");
 ```
+
+A unique index rejects a second document with the same value (`InvalidOperationException`); `DynamicCollection` indexes an explicit BSON `null` and rejects a second one, whereas typed collections do not index `null` keys, so any number of documents may hold `null` in a unique-indexed property.
 
 ### Reading BsonDocument fields
 
