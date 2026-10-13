@@ -1081,10 +1081,7 @@ public sealed class DynamicCollection : IDisposable
         _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
 
         foreach (var (_, idx) in _secondaryIndexes)
-        {
-            if (oldDoc != null) IndexDelete(idx, oldDoc, oldLocation, transaction);
-            IndexInsert(idx, newDocument, newLocation, transaction);
-        }
+            IndexUpdate(idx, oldDoc, newDocument, oldLocation, newLocation, transaction);
 
         await NotifyCdcAsync(OperationType.Update, id, transaction, newDocument.RawData);
     }
@@ -1308,10 +1305,7 @@ public sealed class DynamicCollection : IDisposable
                 _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
 
                 foreach (var (_, idx) in _secondaryIndexes)
-                {
-                    if (oldDoc != null) IndexDelete(idx, oldDoc, oldLocation, transaction);
-                    IndexInsert(idx, newDoc, newLocation, transaction);
-                }
+                    IndexUpdate(idx, oldDoc, newDoc, oldLocation, newLocation, transaction);
 
                 await NotifyCdcAsync(OperationType.Update, id, transaction, newDoc.RawData);
                 count++;
@@ -1884,9 +1878,35 @@ public sealed class DynamicCollection : IDisposable
                 var key = BsonValueToIndexKey(val);
                 if (key.HasValue) idx.BTree!.Delete(key.Value, location, transaction.TransactionId);
                 break;
-            // Vector and Spatial indexes do not support individual entry deletion;
-            // their rebuild is handled at the collection level (compaction/reindex).
+            case DynamicIndexKind.Vector:
+                var floats = ExtractFloatVector(val);
+                if (floats != null) idx.Vector!.Delete(floats, location, transaction);
+                break;
+            case DynamicIndexKind.Spatial:
+                var coords = ExtractCoordinates(val);
+                if (coords.HasValue) idx.Spatial!.Delete(GeoBox.FromPoint(new GeoPoint(coords.Value.Lat, coords.Value.Lon)), location, transaction);
+                break;
         }
+    }
+
+    /// <summary>
+    /// Moves a document's entry from <paramref name="oldDocument"/> at <paramref name="oldLocation"/>
+    /// to <paramref name="newDocument"/> at <paramref name="newLocation"/>. An unchanged vector keeps
+    /// its HNSW node, which is re-pointed instead of being replaced by a new one.
+    /// </summary>
+    private void IndexUpdate(DynamicSecondaryIndex idx, BsonDocument? oldDocument, BsonDocument newDocument, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction transaction)
+    {
+        if (oldDocument != null && idx.Kind == DynamicIndexKind.Vector
+            && TryGetNestedValue(oldDocument, idx.FieldPath, out var oldVal)
+            && TryGetNestedValue(newDocument, idx.FieldPath, out var newVal)
+            && ExtractFloatVector(oldVal) is { } oldVector
+            && ExtractFloatVector(newVal) is { } newVector
+            && oldVector.AsSpan().SequenceEqual(newVector)
+            && idx.Vector!.Relocate(oldVector, oldLocation, newLocation, transaction))
+            return;
+
+        if (oldDocument != null) IndexDelete(idx, oldDocument, oldLocation, transaction);
+        IndexInsert(idx, newDocument, newLocation, transaction);
     }
 
     #endregion

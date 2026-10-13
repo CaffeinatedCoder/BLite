@@ -103,6 +103,88 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
             return; // Skip null keys or failed traversal
         
+        InsertKey(keyValue, document, location, transaction);
+
+        System.Threading.Interlocked.Increment(ref _documentCount);
+    }
+
+    /// <summary>
+    /// Updates a document in this index, for both in-place and relocating updates.
+    /// If the key is unchanged and the document did not move, the existing entry is kept;
+    /// if only the location changed, the entry is re-pointed to <paramref name="newLocation"/>;
+    /// otherwise the old entry is removed and the new one inserted.
+    /// </summary>
+    /// <param name="oldDocument">Old version of document</param>
+    /// <param name="newDocument">New version of document</param>
+    /// <param name="oldLocation">Physical location of old document</param>
+    /// <param name="newLocation">Physical location of new document (may differ from <paramref name="oldLocation"/>)</param>
+    /// <param name="transaction">Optional transaction</param>
+    public void Update(T oldDocument, T newDocument, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction transaction)
+    {
+        if (oldDocument == null)
+            throw new ArgumentNullException(nameof(oldDocument));
+        if (newDocument == null)
+            throw new ArgumentNullException(nameof(newDocument));
+        
+        // Extract keys with null-safe traversal
+        _definition.TryGetKey(oldDocument, out var oldKey);
+        _definition.TryGetKey(newDocument, out var newKey);
+        
+        bool moved = oldLocation.PageId != newLocation.PageId || oldLocation.SlotIndex != newLocation.SlotIndex;
+
+        if (KeysEqual(oldKey, newKey))
+        {
+            // Same key at the same location: the existing entry stays valid.
+            if (!moved || oldKey == null)
+                return;
+
+            // Same key, new location: re-point the entry. An unchanged vector keeps its HNSW
+            // node instead of leaving a deleted node behind.
+            if (_vectorIndex == null || !TryRelocateVectors(oldKey, oldLocation, newLocation, transaction))
+            {
+                DeleteKey(oldKey, oldDocument, oldLocation, transaction);
+                InsertKey(newKey!, newDocument, newLocation, transaction);
+            }
+            return;
+        }
+        
+        // Delete old entry if it had a key
+        if (oldKey != null)
+            DeleteKey(oldKey, oldDocument, oldLocation, transaction);
+        
+        // Insert new entry if it has a key
+        if (newKey != null)
+            InsertKey(newKey, newDocument, newLocation, transaction);
+
+        // Keep the count in line with Insert/Delete, which skip documents without a key.
+        if (oldKey == null && newKey != null)
+            System.Threading.Interlocked.Increment(ref _documentCount);
+        else if (oldKey != null && newKey == null)
+            System.Threading.Interlocked.Decrement(ref _documentCount);
+    }
+
+    /// <summary>
+    /// Deletes a document from this index
+    /// </summary>
+    /// <param name="document">Document to remove from index</param>
+    /// <param name="location">Physical location of the document</param>
+    /// <param name="transaction">Optional transaction</param>
+    public void Delete(T document, DocumentLocation location, ITransaction transaction)
+    {
+        if (document == null)
+            throw new ArgumentNullException(nameof(document));
+        
+        // Extract key with null-safe traversal
+        if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
+            return; // Nothing to delete
+        
+        DeleteKey(keyValue, document, location, transaction);
+
+        System.Threading.Interlocked.Decrement(ref _documentCount);
+    }
+
+    private void InsertKey(object keyValue, T document, DocumentLocation location, ITransaction? transaction)
+    {
         if (_vectorIndex != null)
         {
             // Vector Index Support
@@ -134,80 +216,81 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             var compositeKey = CreateCompositeKey(userKey, _mapper.ToIndexKey(documentId));
             _btreeIndex.Insert(compositeKey, location, transaction?.TransactionId);
         }
+    }
 
-        System.Threading.Interlocked.Increment(ref _documentCount);
+    /// <summary>Re-points every vector of <paramref name="keyValue"/>; false if any node was missing.</summary>
+    private bool TryRelocateVectors(object keyValue, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction? transaction)
+    {
+        if (keyValue is float[] singleVector)
+            return _vectorIndex!.Relocate(singleVector, oldLocation, newLocation, transaction);
+
+        if (keyValue is IEnumerable<float[]> vectors)
+        {
+            bool all = true;
+            foreach (var v in vectors)
+                all &= _vectorIndex!.Relocate(v, oldLocation, newLocation, transaction);
+            return all;
+        }
+
+        return false;
+    }
+
+    private void DeleteKey(object keyValue, T document, DocumentLocation location, ITransaction? transaction)
+    {
+        if (_vectorIndex != null)
+        {
+            if (keyValue is float[] singleVector)
+            {
+                _vectorIndex.Delete(singleVector, location, transaction);
+            }
+            else if (keyValue is IEnumerable<float[]> vectors)
+            {
+                foreach (var v in vectors)
+                {
+                    _vectorIndex.Delete(v, location, transaction);
+                }
+            }
+        }
+        else if (_spatialIndex != null)
+        {
+            if (keyValue is ValueTuple<double, double> t)
+            {
+                _spatialIndex.Delete(GeoBox.FromPoint(new GeoPoint(t.Item1, t.Item2)), location, transaction);
+            }
+        }
+        else if (_btreeIndex != null)
+        {
+            var userKey = ConvertToIndexKey(keyValue);
+            var documentId = _mapper.GetId(document);
+            var compositeKey = CreateCompositeKey(userKey, _mapper.ToIndexKey(documentId));
+            _btreeIndex.Delete(compositeKey, location, transaction?.TransactionId);
+        }
     }
 
     /// <summary>
-    /// Updates a document in this index (delete old, insert new).
-    /// This optimization applies only for in-place updates where the physical location
-    /// is unchanged and the old index entry remains valid. For non-in-place (relocating)
-    /// updates, callers must use <c>InsertInAll</c> directly after <c>DeleteFromAll</c>
-    /// has already been called (e.g., via <c>DeleteCore</c>).
+    /// Key equality for skipping index maintenance. Vectors compare by value: every load
+    /// materializes a new array, so reference equality would rewrite the vector index on
+    /// every update.
     /// </summary>
-    /// <param name="oldDocument">Old version of document</param>
-    /// <param name="newDocument">New version of document</param>
-    /// <param name="oldLocation">Physical location of old document</param>
-    /// <param name="newLocation">Physical location of new document (must equal oldLocation for this method)</param>
-    /// <param name="transaction">Optional transaction</param>
-    public void Update(T oldDocument, T newDocument, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction transaction)
+    private static bool KeysEqual(object? oldKey, object? newKey)
     {
-        if (oldDocument == null)
-            throw new ArgumentNullException(nameof(oldDocument));
-        if (newDocument == null)
-            throw new ArgumentNullException(nameof(newDocument));
-        
-        // Extract keys with null-safe traversal
-        _definition.TryGetKey(oldDocument, out var oldKey);
-        _definition.TryGetKey(newDocument, out var newKey);
-        
-        // If keys are the same, no index update needed (optimization for in-place updates
-        // where the existing entry at the same location remains valid).
-        if (Equals(oldKey, newKey))
-            return;
-        
-        var documentId = _mapper.GetId(oldDocument);
-        
-        // Delete old entry if it had a key
-        if (oldKey != null)
-        {
-            var oldUserKey = ConvertToIndexKey(oldKey);
-            var oldCompositeKey = CreateCompositeKey(oldUserKey, _mapper.ToIndexKey(documentId));
-            _btreeIndex?.Delete(oldCompositeKey, oldLocation, transaction?.TransactionId);
-        }
-        
-        // Insert new entry if it has a key
-        if (newKey != null)
-        {
-            var newUserKey = ConvertToIndexKey(newKey);
-            var newCompositeKey = CreateCompositeKey(newUserKey, _mapper.ToIndexKey(documentId));
-            _btreeIndex?.Insert(newCompositeKey, newLocation, transaction?.TransactionId);
-        }
-    }
+        if (oldKey is float[] oldVector && newKey is float[] newVector)
+            return oldVector.AsSpan().SequenceEqual(newVector);
 
-    /// <summary>
-    /// Deletes a document from this index
-    /// </summary>
-    /// <param name="document">Document to remove from index</param>
-    /// <param name="location">Physical location of the document</param>
-    /// <param name="transaction">Optional transaction</param>
-    public void Delete(T document, DocumentLocation location, ITransaction transaction)
-    {
-        if (document == null)
-            throw new ArgumentNullException(nameof(document));
-        
-        // Extract key with null-safe traversal
-        if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
-            return; // Nothing to delete
-        
-        var userKey = ConvertToIndexKey(keyValue);
-        var documentId = _mapper.GetId(document);
-        
-        // Create composite key and delete
-        var compositeKey = CreateCompositeKey(userKey, _mapper.ToIndexKey(documentId));
-        _btreeIndex?.Delete(compositeKey, location, transaction?.TransactionId);
+        if (oldKey is IEnumerable<float[]> oldVectors && newKey is IEnumerable<float[]> newVectors)
+        {
+            using var oldEnum = oldVectors.GetEnumerator();
+            using var newEnum = newVectors.GetEnumerator();
+            while (true)
+            {
+                bool hasOld = oldEnum.MoveNext();
+                if (hasOld != newEnum.MoveNext()) return false;
+                if (!hasOld) return true;
+                if (!oldEnum.Current.AsSpan().SequenceEqual(newEnum.Current)) return false;
+            }
+        }
 
-        System.Threading.Interlocked.Decrement(ref _documentCount);
+        return Equals(oldKey, newKey);
     }
 
     /// <summary>
