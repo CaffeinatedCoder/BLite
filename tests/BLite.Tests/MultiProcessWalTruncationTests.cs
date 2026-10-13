@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BLite.Core.Storage;
 using BLite.Core.Transactions;
 
@@ -310,6 +311,105 @@ public class MultiProcessWalTruncationTests : IDisposable
         AssertFreshEngineReads(p1, 0x11);
         AssertFreshEngineReads(p2, 0x22);
         AssertFreshEngineReads(p3, 0x33);
+    }
+
+    [Fact]
+    public async Task CutOff_CannotDeleteCommitsOfTheDirectOrTwoPhasePaths()
+    {
+        // The repro from the review of #202: a commit through the direct path never publishes
+        // the WAL end, so the next group commit's cut-off would delete it. Those paths are
+        // rejected in multi-process mode, so every acknowledged commit lies within the published
+        // end and survives the cut-off.
+        uint p, q;
+        using (var engine = new StorageEngine(_dbPath, Config))
+        {
+            p = engine.AllocatePage();
+            q = engine.AllocatePage();
+            using (var tx = engine.BeginTransaction())
+            {
+                engine.WritePage(p, tx.TransactionId, Filled(engine.PageSize, 0x44));
+                await Assert.ThrowsAsync<NotSupportedException>(() => engine.CommitTransactionAsync(tx.TransactionId));
+                await Assert.ThrowsAsync<NotSupportedException>(() => engine.PrepareTransactionAsync(tx.TransactionId));
+                await Assert.ThrowsAsync<NotSupportedException>(() => engine.MarkTransactionCommittedAsync(tx.TransactionId));
+                AssertNothingBeyondThePublishedEnd();
+                await tx.CommitAsync();
+            }
+
+            await WriteAndCommitAsync(engine, q, 0x55);
+            AssertNothingBeyondThePublishedEnd();
+        }
+
+        using var reopened = new StorageEngine(_dbPath, Config);
+        using (reopened.BeginTransaction())
+        {
+            AssertPage(reopened, p, 0x44);
+            AssertPage(reopened, q, 0x55);
+        }
+    }
+
+    [Fact]
+    public async Task UnreadableRecordInsideThePublishedRange_IsReportedAsAStall()
+    {
+        using var a = new StorageEngine(_dbPath, Config);
+        using var b = new StorageEngine(_dbPath, Config);
+        var metrics = b.EnsureMetrics();
+        var p1 = a.AllocatePage();
+        var p2 = a.AllocatePage();
+        var p3 = a.AllocatePage();
+
+        var warnings = new WarningCollector(Path.ChangeExtension(_dbPath, ".wal"));
+        Trace.Listeners.Add(warnings);
+        try
+        {
+            using (b.BeginTransaction()) { } // B's bookmark: the empty WAL
+            await WriteAndCommitAsync(a, p1, 0x11);
+            CorruptWalByte(0); // A's record: unreadable for B, whose bookmark lies before it
+            await WriteAndCommitAsync(b, p3, 0x33); // something for B to checkpoint
+            await WriteAndCommitAsync(a, p2, 0x22);
+
+            for (int i = 0; i < 2 * StorageEngine.CatchUpStallThreshold; i++)
+                using (b.BeginTransaction()) { }
+            await b.CheckpointAsync();
+        }
+        finally
+        {
+            Trace.Listeners.Remove(warnings);
+        }
+
+        // Reported, but not on every attempt: the first, then every power of two in a row.
+        var messages = warnings.Messages;
+        Assert.NotEmpty(messages);
+        Assert.InRange(messages.Count, 2, 7);
+        Assert.All(messages, m => Assert.Contains("the record at offset 0 is unreadable", m));
+        Assert.Contains(messages, m => m.Contains("stalled"));
+        Assert.DoesNotContain("stalled", messages[0]);
+
+        // The checkpoint wrote nothing, and says so.
+        Assert.NotEqual(0, WalLength);
+        await WaitUntilAsync(() => metrics.GetSnapshot().CheckpointsFailedTotal >= 1);
+        Assert.Equal(0, metrics.GetSnapshot().CheckpointsTotal);
+    }
+
+    private void AssertNothingBeyondThePublishedEnd()
+    {
+        using var shm = WalSharedMemory.Open(ShmPath, Config.PageSize);
+        Assert.Equal(WalLength, shm.ReadWalEndOffset());
+    }
+
+    /// <summary>Collects the trace warnings that name one WAL file.</summary>
+    private sealed class WarningCollector(string walPath) : TraceListener
+    {
+        private readonly List<string> _messages = new();
+
+        public List<string> Messages { get { lock (_messages) return _messages.ToList(); } }
+
+        public override void Write(string? message) { }
+
+        public override void WriteLine(string? message)
+        {
+            if (message != null && message.Contains(walPath))
+                lock (_messages) _messages.Add(message);
+        }
     }
 
     /// <summary>The start of a Write record whose page data never made it to disk.</summary>

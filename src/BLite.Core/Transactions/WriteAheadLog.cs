@@ -741,9 +741,11 @@ public sealed class WriteAheadLog : IWriteAheadLog
     /// undecryptable) or ran past <paramref name="toOffset"/>: the records after that point were not
     /// read, so the caller must not treat the range as replayed.
     /// </param>
-    internal List<(uint pageId, byte[] data, long walOffset)> ReadCommittedPagesSince(long fromOffset, long toOffset, out bool complete)
+    /// <param name="stoppedAt">Where the scan stopped: <paramref name="toOffset"/> if complete.</param>
+    internal List<(uint pageId, byte[] data, long walOffset)> ReadCommittedPagesSince(long fromOffset, long toOffset, out bool complete, out long stoppedAt)
     {
         complete = true;
+        stoppedAt = toOffset;
         if (_walStream == null || fromOffset >= toOffset) return new List<(uint, byte[], long)>();
         long scanned = fromOffset;
 
@@ -849,6 +851,7 @@ public sealed class WriteAheadLog : IWriteAheadLog
             scanned = pos;
         }
         complete = scanned == toOffset;
+        stoppedAt = scanned;
 
         // Emit one entry per page: the latest committed write (highest walOffset) wins.
         // Iterate all committed transactions' writes in WAL order so that later commits

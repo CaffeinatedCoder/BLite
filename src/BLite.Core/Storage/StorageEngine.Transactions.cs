@@ -95,9 +95,10 @@ public sealed partial class StorageEngine
         {
             List<(uint pageId, byte[] data, long walOffset)> newPages;
             bool complete;
+            long stoppedAt;
             try
             {
-                newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd, out complete);
+                newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd, out complete, out stoppedAt);
             }
             catch (Exception ex)
             {
@@ -106,17 +107,24 @@ public sealed partial class StorageEngine
                 return false;
             }
 
-            // A record that could not be read ends the scan early: the records after it were not
-            // replayed. Moving the bookmark past them would let this engine skip them and truncate
-            // the WAL that still holds them (#198). Keep it, and with it the WAL, until a replay
-            // gets through.
-            if (!complete)
-                return false;
-
             // Without the SHM writer lock (BeginTransaction), the WAL can be truncated and
             // rewritten while it is read; the bytes read then belong to neither generation.
             if (_shm.ReadWalGeneration() != generation)
                 return false;
+
+            // A record that could not be read ends the scan early: the records after it were not
+            // replayed. Moving the bookmark past them would let this engine skip them and truncate
+            // the WAL that still holds them (#198). Keep it, and with it the WAL, until a replay
+            // gets through. If the record stays unreadable, every catch-up stops there: reported
+            // so that the stall is visible.
+            if (!complete)
+            {
+                ReportFailedCatchUp(wal, lastKnown, shmEnd,
+                    stoppedAt < shmEnd
+                        ? $"the record at offset {stoppedAt} is unreadable (torn, corrupt, or past the end of the file)"
+                        : $"the last record ends at offset {stoppedAt}, past the published end");
+                return false;
+            }
 
             foreach (var (pid, data, walOffset) in newPages)
             {
@@ -133,6 +141,13 @@ public sealed partial class StorageEngine
     }
 
     /// <summary>
+    /// Failed catch-ups in a row from which <see cref="ReportFailedCatchUp"/> calls the replay
+    /// stalled. A record inside the published range that stays unreadable stops every catch-up
+    /// of every process whose bookmark is before it.
+    /// </summary>
+    internal const int CatchUpStallThreshold = 16;
+
+    /// <summary>
     /// Counts the catch-ups in a row that could not replay the shared WAL, and reports the first
     /// one and then every power of two as a warning (<see cref="Trace"/>): a WAL that stays
     /// unreadable is visible without flooding the log. Until a catch-up succeeds, this engine's
@@ -147,7 +162,10 @@ public sealed partial class StorageEngine
         Trace.TraceWarning(
             $"BLite: could not replay the shared WAL '{wal.FilePath}' from offset {fromOffset} to {toOffset} " +
             $"({failures} attempt(s) in a row): {reason}. Until it can, reads may miss other processes' commits " +
-            "and checkpoints write nothing, so the WAL is not truncated.");
+            "and checkpoints write nothing, so the WAL is not truncated." +
+            (failures >= CatchUpStallThreshold
+                ? " The replay has stalled: the WAL and this engine's memory use grow until the record can be read or another process truncates the WAL."
+                : ""));
     }
 
     /// <summary>
