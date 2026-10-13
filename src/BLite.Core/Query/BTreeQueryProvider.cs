@@ -305,6 +305,9 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
                 // after Select, ...): read the first windowEnd entries in index order and replay the
                 // whole query over them. OrderBy is a stable sort, so the replay keeps the index
                 // order and its Skip/Take select the same window.
+                // This needs the root queryable to be the query's only source: EnumerableRewriter
+                // replaces every use of it with the prefix, so TryGetIndexWindow rejects a query
+                // that reads a queryable again after the window (Concat(q), Join(q, ...)).
                 var prefix = new List<T>(windowEnd);
                 await foreach (var item in _collection.QueryIndexAsync(orderOpt.IndexName, null, null, ascending, 0, windowEnd, cancellationToken))
                     prefix.Add(item);
@@ -484,6 +487,12 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         if (length == long.MaxValue) return false;
         if (i < calls.Count && calls[i].Method.Name is "ThenBy" or "ThenByDescending") return false;
 
+        // A second query source after the window (Concat(q), Join(q, ...), Union(q.Select(...))):
+        // the replay would read the window prefix for it, since every use of the root is replaced.
+        for (int j = i; j < calls.Count; j++)
+            for (int a = 1; a < calls[j].Arguments.Count; a++)
+                if (ContainsQueryableConstant(calls[j].Arguments[a])) return false;
+
         long end = start + length;
         if (end > int.MaxValue) return false;
         windowEnd = (int)end;
@@ -494,6 +503,27 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
                       && calls.Skip(i).All(c => c.Method.Name == "Select"
                                                 || c.Method.Name is "Count" or "LongCount" && c.Arguments.Count == 1);
         return true;
+    }
+
+    /// <summary>Whether <paramref name="expression"/> contains a constant holding an <see cref="IQueryable"/>, i.e. a query source.</summary>
+    private static bool ContainsQueryableConstant(Expression expression)
+    {
+        var finder = new QueryableConstantFinder();
+        finder.Visit(expression);
+        return finder.Found;
+    }
+
+    private sealed class QueryableConstantFinder : ExpressionVisitor
+    {
+        public bool Found { get; private set; }
+
+        public override Expression? Visit(Expression? node) => Found ? node : base.Visit(node);
+
+        protected override Expression VisitConstant(ConstantExpression node)
+        {
+            if (node.Value is IQueryable) Found = true;
+            return node;
+        }
     }
 
     /// <summary>

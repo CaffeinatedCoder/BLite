@@ -89,6 +89,13 @@ public class SelectTerminalTests : IDisposable
         ["OrderByIdx.Skip.Take.First"]      = q => q.OrderBy(p => p.Age).Skip(3).Take(10).First().Age,
         ["OrderByIdx.Take(0).Any"]          = q => q.OrderBy(p => p.Age).Take(0).Select(p => p.Age).Any(),
 
+        // The root queryable used a second time after the window: that use reads the whole
+        // collection, not the window prefix the replay is given.
+        ["OrderByIdx.Take.Concat(root).Count"]        = q => q.OrderBy(p => p.Age).Take(5).Concat(q).Count(),
+        ["OrderByIdx.Take.Select.Concat(root).Count"] = q => q.OrderBy(p => p.Age).Take(5).Select(p => p.Age).Concat(q.Select(p => p.Age)).Count(),
+        ["OrderByIdx.Take.Select.Union(root).Count"]  = q => q.OrderBy(p => p.Age).Take(5).Select(p => p.Age).Union(q.Select(p => p.Age)).Count(),
+        ["OrderByIdx.Take.Join(root).Count"]          = q => q.OrderBy(p => p.Age).Take(5).Join(q, a => a.Age, b => b.Age, (a, b) => b.Name).Count(),
+
         // Parameterless Sum/Average after Select (non-generic Queryable overloads).
         ["Select(long).Sum"]           = q => q.Select(p => (long)p.Age).Sum(),
         ["Select(double).Average"]     = q => q.Select(p => (double)p.Age).Average(),
