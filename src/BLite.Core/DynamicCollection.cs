@@ -115,6 +115,10 @@ public sealed class DynamicCollection : IDisposable
 
         if (metadata != null)
         {
+            // Refuse a collection that requires features this version cannot maintain, before
+            // anything below writes to it.
+            CollectionFeatures.EnsureCanOpen(metadata, _storage.IsReadOnly);
+
             primaryRootPageId = metadata.PrimaryRootPageId;
             _isTimeSeries = metadata.IsTimeSeries;
 

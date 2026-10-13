@@ -34,4 +34,17 @@ internal class QueryModel
     /// Enables an O(n) primary-BTree key scan instead of full document deserialisation.
     /// </summary>
     public bool IsCountOnly { get; set; }
+
+    /// <summary>
+    /// Element terminal (<c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>,
+    /// <c>SingleOrDefault</c>, <c>Last</c>, <c>LastOrDefault</c> or <c>Any</c>) ending the query,
+    /// or null. A predicate passed to it has already been folded into <see cref="WhereClause"/>.
+    /// </summary>
+    public string? ElementTerminal { get; set; }
+
+    /// <summary>
+    /// The terminal call (<c>Count(p)</c>, <c>First(p)</c>, ...) whose predicate was folded into
+    /// <see cref="WhereClause"/>, or null. A fallback replay must not evaluate that predicate again.
+    /// </summary>
+    public MethodCallExpression? FoldedTerminal { get; set; }
 }

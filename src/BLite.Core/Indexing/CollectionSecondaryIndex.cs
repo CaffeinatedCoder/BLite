@@ -24,7 +24,9 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     // Pre-allocated boundary sentinels — single allocation at type-init time.
     // 255 bytes of 0xFF covers any composite key length used in this implementation.
     private static readonly IndexKey s_maxBoundaryKey;
-    // 16 bytes of 0xFF covers any GUID or ObjectId suffix in composite keys.
+    // Upper bound for the document-id part of a composite key: one byte above every id key prefix.
+    // Must not be longer: [user key][0xFF..] also covers the entries of longer values that start with
+    // the user key ("p70", "p71".. for "p7"), see CreateCompositeKeyBoundary.
     private static readonly IndexKey s_maxIdBoundaryKey;
     // Id types whose index key always has the same length (used by EnsureUnique).
     private static readonly bool s_fixedSizeId =
@@ -36,10 +38,9 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     {
         // Fill the pre-allocated boundary buffers with 0xFF.
         var buf255 = new byte[256]; Array.Fill(buf255, (byte)0xFF);
-        var buf16  = new byte[20];  Array.Fill(buf16,  (byte)0xFF);
         // Raw (un-prefixed) so it sorts above keys of every prefix, including DecimalKeyPrefix (0x03).
         s_maxBoundaryKey   = IndexKey.FromOwnedArray(buf255);
-        s_maxIdBoundaryKey = IndexKey.FromOwnedArray(buf16); // raw: above ids of every key prefix
+        s_maxIdBoundaryKey = IndexKey.FromOwnedArray([IndexKey.PrefixUpperBound]); // raw: above ids of every key prefix
     }
 
     private readonly CollectionIndexDefinition<T> _definition;
@@ -608,8 +609,11 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
     /// </summary>
     private IndexKey CreateCompositeKeyBoundary(IndexKey userKey, bool useMinObjectId)
     {
-        // For range boundaries, we use an empty key for Min and a cached all-0xFF key for Max
-        // to wrap around all possible IDs for this user key.
+        // Min: [user key] sorts before every [user key][id] entry.
+        // Max: [user key][PrefixUpperBound] sorts after every [user key][id] entry (every id key starts
+        // with KeyPrefix or DecimalKeyPrefix) but before the entries of a longer value starting with the
+        // user key, whose next byte is that value's next byte (0x04 or above for every character but
+        // U+0000..U+0003). An all-0xFF id bound sorted after those too, so "p7" matched "p70".."p79" (#206).
         IndexKey idBoundary = useMinObjectId 
             ? IndexKey.MinKey
             : s_maxIdBoundaryKey;
@@ -827,12 +831,12 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
 
     /// <summary>
     /// The pages of this index as <paramref name="transactionId"/> sees them (0: committed state).
-    /// Empty for a spatial index: <c>RTreeIndex</c> cannot enumerate its pages yet.
     /// </summary>
     internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
     {
         if (_btreeIndex != null) return _btreeIndex.CollectAllPages(transactionId);
         if (_vectorIndex != null) return _vectorIndex.CollectAllPages(transactionId);
+        if (_spatialIndex != null) return _spatialIndex.CollectAllPages(transactionId);
         return Array.Empty<uint>();
     }
 }
