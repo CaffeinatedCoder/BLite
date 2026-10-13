@@ -211,9 +211,17 @@ public class LinqAggregateTests : IDisposable
     [Fact]
     public async Task IndexKeySums_ThatCannotOverflow_AreTakenFromTheKeys()
     {
+        // The positive values sum to exactly int.MaxValue and the negative ones to exactly
+        // int.MinValue, so no running total overflows in any order and the sum is taken from the
+        // keys. (One more below int.MinValue and the result would depend on the order: see
+        // IndexKeySums_OverflowWhereLinqDoes.) Explicit ids keep the document order fixed.
+        int[] counts = [int.MaxValue - 10, 4, -7, int.MinValue + 7, 6];
+        Assert.Equal(int.MaxValue, counts.Where(c => c > 0).Sum(c => (long)c));
+        Assert.Equal(int.MinValue, counts.Where(c => c < 0).Sum(c => (long)c));
+
         using var db = new AggregateDbContext(_dbPath);
-        foreach (var count in new[] { int.MaxValue - 10, 4, -7, int.MinValue + 3, 6 })
-            await db.Readings.InsertAsync(new Reading { Count = count, Total = count });
+        for (int i = 0; i < counts.Length; i++)
+            await db.Readings.InsertAsync(new Reading { Id = new ObjectId(i + 1, 0), Count = counts[i], Total = counts[i] });
 
         var entities = db.Readings.AsQueryable().ToList();
         var sum = await db.Readings.TryAggregateAsync(AggregateOperator.Sum, Selector("Count"), null, typeof(int));
