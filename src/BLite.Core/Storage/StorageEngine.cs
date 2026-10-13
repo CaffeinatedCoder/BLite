@@ -355,6 +355,13 @@ public sealed partial class StorageEngine : IDisposable
             _activeTransactions.Clear();
         }
 
+        // 2b. Pages freed since the last WAL truncation only reach the free list after the next
+        // one (see FreePage); checkpoint now so they are not leaked when the engine closes.
+        if (HasPendingFreePages)
+        {
+            try { Task.Run(() => CheckpointAsync()).GetAwaiter().GetResult(); } catch { /* best-effort: the pages stay leaked */ }
+        }
+
         // 3. Close WAL and PageFile.
         try { _wal?.Dispose(); } catch { /* best-effort */ }
         try { _pageFile?.Dispose(); } catch { /* best-effort */ }

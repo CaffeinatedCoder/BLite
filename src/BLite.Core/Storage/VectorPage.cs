@@ -133,6 +133,17 @@ public struct VectorPage
         return DocumentLocation.ReadFrom(page.Slice(offset, 6));
     }
 
+    /// <summary>
+    /// Overwrites the document location of a node. Writing <c>default</c> marks the node deleted:
+    /// no document lives on page 0, so search skips it, while its vector and links keep routing.
+    /// </summary>
+    public static void WriteLocation(Span<byte> page, int nodeIndex, DocumentLocation loc)
+    {
+        int nodeSize = GetNodeSize(page);
+        int offset = DataOffset + (nodeIndex * nodeSize);
+        loc.WriteTo(page.Slice(offset, 6));
+    }
+
     public static Span<byte> GetLinksSpan(Span<byte> page, int nodeIndex, int level, int dimensions, int maxM)
     {
         int nodeSize = GetNodeSize(page);

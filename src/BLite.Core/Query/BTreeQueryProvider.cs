@@ -311,6 +311,12 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // pipeline cannot model.  We still benefit from index / BSON-scan fetch,
         // then let EnumerableRewriter translate the remaining Queryable calls to
         // Enumerable equivalents and compile the residual expression once.
+        // FetchAsync applied the WHERE, so the replay drops the root-chain Where calls folded into
+        // it. Re-evaluating them would change nothing except for VectorSearch, which only the index
+        // can evaluate. Every other VectorSearch in the expression is still evaluated and throws.
+        if (whereAlreadyApplied)
+            expression = DropAppliedWheres(expression).Expression;
+
         if (model.HasComplexOperators)
             return ExecuteViaEnumerableRewriter<TResult>(expression, sourceData);
 
@@ -635,6 +641,50 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     }
 
     // ─── Expression-tree helpers ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Removes the <c>Queryable.Where(x =&gt; ...)</c> calls on the root chain whose input is the
+    /// fetched documents or a subset of them (only filtering, ordering and paging operators lie
+    /// between the root and the Where). <see cref="BTreeExpressionVisitor"/> folds each of these
+    /// into <see cref="QueryModel.WhereClause"/>, which FetchAsync applied, so every element
+    /// reaching them already satisfies their predicate and dropping them leaves the result unchanged.
+    /// </summary>
+    /// <returns>
+    /// The rewritten expression, and whether its elements are still a subset of the fetched documents.
+    /// </returns>
+    private static (Expression Expression, bool IsFetchedSubset) DropAppliedWheres(Expression expression)
+    {
+        if (expression is ConstantExpression { Value: IQueryable })
+            return (expression, true);
+
+        if (expression is not MethodCallExpression call
+            || call.Method.DeclaringType != typeof(Queryable)
+            || call.Arguments.Count == 0)
+            return (expression, false);
+
+        var (source, isFetchedSubset) = DropAppliedWheres(call.Arguments[0]);
+
+        if (isFetchedSubset
+            && call.Method.Name == nameof(Queryable.Where)
+            && call.Arguments[1] is UnaryExpression { Operand: LambdaExpression { Parameters.Count: 1 } })
+            return (source, true);
+
+        var rewritten = source == call.Arguments[0]
+            ? call
+            : call.Update(call.Object, [source, .. call.Arguments.Skip(1)]);
+        return (rewritten, isFetchedSubset && s_subsetPreservingOperators.Contains(call.Method.Name));
+    }
+
+    /// <summary>Queryable operators whose output elements are a subset of their source's.</summary>
+    private static readonly HashSet<string> s_subsetPreservingOperators =
+    [
+        nameof(Queryable.Where),
+        nameof(Queryable.OrderBy), nameof(Queryable.OrderByDescending),
+        nameof(Queryable.ThenBy), nameof(Queryable.ThenByDescending),
+        nameof(Queryable.Skip), nameof(Queryable.Take),
+        nameof(Queryable.SkipWhile), nameof(Queryable.TakeWhile),
+        nameof(Queryable.Distinct), nameof(Queryable.Reverse),
+    ];
 
     /// <summary>
     /// Fallback for queries containing operators the direct pipeline cannot handle
