@@ -180,6 +180,15 @@ public sealed partial class StorageEngine
     /// section after the index list is optional and read only while bytes remain, so records written
     /// by older releases load with defaults for the sections they lack.
     /// </summary>
+    /// <remarks>
+    /// Format rule: new data goes only in new trailing sections, after the last one read here; new
+    /// per-index data too (as the key formats do), never inline in the index list. The list is read by
+    /// position, with the vector fields as the only per-type extra, so a version that finds bytes it
+    /// does not expect there misreads the rest of the record and fails to parse it.
+    /// <see cref="GetCollectionMetadata"/> then returns <c>null</c>, a dynamic open treats the collection
+    /// as new and saves a fresh record over it, and the required-features refusal
+    /// (<see cref="CollectionFeatures"/>) never runs.
+    /// </remarks>
     private static CollectionMetadata ReadCollectionMetadata(string name, BinaryReader reader)
     {
         var metadata = new CollectionMetadata { Name = name };
@@ -406,14 +415,11 @@ public sealed partial class StorageEngine
             throw new InvalidOperationException("Page 1 is not a collection metadata page.");
         var (foundPage, foundSlot) = FindMetadataRecord(chain, metadata.Name);
 
-        // Never rewrite the record of a collection that requires features this version lacks
-        // (see CollectionFeatures). Checked before every write path, the in-place one included.
-        // Nothing has been written yet.
-        if (foundPage >= 0
-            && TryReadRecord(chain[foundPage].Buffer, ReadSlot(chain[foundPage].Buffer, foundSlot)) is { } stored)
-        {
-            CollectionFeatures.EnsureCanWrite(stored);
-        }
+        // Never rewrite the record of a collection that requires features this version lacks, or
+        // one it cannot parse (see CollectionFeatures). Checked before every write path, the
+        // in-place one included. Nothing has been written yet.
+        if (foundPage >= 0)
+            EnsureCanReplaceRecord(metadata.Name, chain[foundPage].Buffer, foundSlot);
 
         // ── 1. No larger than the stored record: overwrite it where it is ─────
         // A single page write. Covers the frequent saves (sequence values, root page ids) whose
@@ -654,19 +660,40 @@ public sealed partial class StorageEngine
         }
     }
 
-    /// <summary>Parses the collection record in <paramref name="slot"/>, or returns <c>null</c> if it is malformed.</summary>
-    private static CollectionMetadata? TryReadRecord(byte[] page, SlotEntry slot)
+    /// <summary>
+    /// Throws unless this version may overwrite or drop the stored record of collection
+    /// <paramref name="name"/> in slot <paramref name="slotIndex"/>: the record must parse, and every
+    /// feature it requires must be known (see <see cref="CollectionFeatures"/>). A record that does not
+    /// parse is refused too, since its features cannot be checked.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The record cannot be parsed, or requires features this version lacks.</exception>
+    private static void EnsureCanReplaceRecord(string name, byte[] page, int slotIndex)
     {
+        var slot = ReadSlot(page, slotIndex);
+        CollectionMetadata stored;
         try
         {
             using var ms     = new MemoryStream(page, slot.Offset, slot.Length, false);
             using var reader = new BinaryReader(ms);
-            return ReadCollectionMetadata(reader.ReadString(), reader);
+            stored = ReadCollectionMetadata(reader.ReadString(), reader);
         }
-        catch
+        catch (Exception ex)
         {
-            return null;
+            throw CollectionFeatures.UnreadableRecord(name, ex);
         }
+        CollectionFeatures.EnsureCanWrite(stored);
+    }
+
+    /// <summary>
+    /// Like <see cref="EnsureCanReplaceRecord"/>, for the first live record of collection
+    /// <paramref name="name"/> (the one <see cref="SaveCollectionMetadata"/> replaces), if there is one.
+    /// </summary>
+    private void EnsureCanReplaceStoredRecord(string name)
+    {
+        var chain = LoadMetadataChain();
+        var (page, slot) = FindMetadataRecord(chain, name);
+        if (page >= 0)
+            EnsureCanReplaceRecord(name, chain[page].Buffer, slot);
     }
 
     /// <summary>
@@ -680,10 +707,9 @@ public sealed partial class StorageEngine
             throw new TimeoutException("Timed out acquiring metadata lock (DeleteCollectionMetadata).");
         try
         {
-        // Never drop the record of a collection that requires features this version lacks
-        // (see CollectionFeatures).
-        if (GetCollectionMetadata(name) is { } stored)
-            CollectionFeatures.EnsureCanWrite(stored);
+        // Never drop the record of a collection that requires features this version lacks, or one
+        // it cannot parse (see CollectionFeatures).
+        EnsureCanReplaceStoredRecord(name);
 
         var buffer = new byte[PageSize];
         uint pageId = 1;
