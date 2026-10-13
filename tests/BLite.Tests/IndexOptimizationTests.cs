@@ -158,8 +158,11 @@ namespace BLite.Tests
             Assert.NotNull(result);
             Assert.Equal("idx_name", result.IndexName);
             Assert.Equal("Ali", result.MinValue);
-            // "Ali" + next char -> "Alj"
-            Assert.Equal("Alj", result.MaxValue);
+            // Exclusive upper bound: the key of "Ali" with its last byte incremented, i.e. the key of "Alj".
+            // The scan also returns entries equal to it, so the predicate must still be applied.
+            Assert.Equal(IndexKey.Create("Alj"), result.MaxValue);
+            Assert.False(result.EndInclusive);
+            Assert.Equal(IndexOptimizer.FilterCompleteness.StrictBoundary, result.FilterCompleteness);
             Assert.True(result.IsRange);
         }
 

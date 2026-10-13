@@ -101,25 +101,26 @@ public sealed class BTreeIndex
     {
         var txnId = transactionId ?? 0;
 
-        if (_options.Unique && TryFind(key, out var existingLocation, txnId))
-        {
-            if (!existingLocation.Equals(location))
-                throw new InvalidOperationException("Duplicate key violation for unique index");
-
-            return;
-        }
-
         var entry = new IndexEntry(key, location);
         var path = new List<uint>();
-
-        // Find the leaf node for insertion
-        var leafPageId = FindLeafNodeWithPath(key, path, txnId);
 
         var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
         {
-            ReadPage(leafPageId, txnId, pageBuffer);
+            // Find the leaf node for insertion; the leaf is left in pageBuffer.
+            var leafPageId = FindLeafNodeWithPath(key, path, txnId, pageBuffer);
             var header = BTreeNodeHeader.ReadFrom(pageBuffer.AsSpan(32));
+
+            if (_options.Unique)
+            {
+                var existing = BinarySearchLeaf(pageBuffer, header.EntryCount, key);
+                if (existing.Found)
+                {
+                    if (!existing.Location.Equals(location))
+                        throw new InvalidOperationException("Duplicate key violation for unique index");
+                    return;
+                }
+            }
 
             // Check if we need to split
             if (header.EntryCount >= MaxEntriesPerNode)
@@ -128,8 +129,7 @@ public sealed class BTreeIndex
 
                 // Re-find leaf after split to ensure we have correct node
                 path.Clear();
-                leafPageId = FindLeafNodeWithPath(key, path, txnId);
-                ReadPage(leafPageId, txnId, pageBuffer);
+                leafPageId = FindLeafNodeWithPath(key, path, txnId, pageBuffer);
             }
 
             // Insert entry into leaf
@@ -151,17 +151,24 @@ public sealed class BTreeIndex
 
         var leafPageId = FindLeafNode(key, txnId);
 
-        Span<byte> pageBuffer = stackalloc byte[_storage.PageSize];
-        ReadPage(leafPageId, txnId, pageBuffer);
-
-        var header = BTreeNodeHeader.ReadFrom(pageBuffer[32..]);
-        var result = BinarySearchLeaf(pageBuffer, header.EntryCount, key);
-        if (result.Found)
+        var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
+        try
         {
-            location = result.Location;
-            return true;
+            ReadPage(leafPageId, txnId, pageBuffer);
+
+            var header = BTreeNodeHeader.ReadFrom(pageBuffer.AsSpan(32));
+            var result = BinarySearchLeaf(pageBuffer, header.EntryCount, key);
+            if (result.Found)
+            {
+                location = result.Location;
+                return true;
+            }
+            return false;
         }
-        return false;
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(pageBuffer);
+        }
     }
 
     /// <summary>
@@ -423,28 +430,31 @@ public sealed class BTreeIndex
 
     private uint FindLeafNodeWithPath(IndexKey key, List<uint> path, ulong transactionId)
     {
-        var currentPageId = _rootPageId;
         var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
-
         try
         {
-            while (true)
-            {
-                ReadPage(currentPageId, transactionId, pageBuffer);
-                var header = BTreeNodeHeader.ReadFrom(pageBuffer.AsSpan(32));
-
-                if (header.IsLeaf)
-                {
-                    return currentPageId;
-                }
-
-                path.Add(currentPageId);
-                currentPageId = FindChildNode(pageBuffer, header, key);
-            }
+            return FindLeafNodeWithPath(key, path, transactionId, pageBuffer);
         }
         finally
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(pageBuffer);
+        }
+    }
+
+    /// <summary>Like the overload above, but leaves the leaf page in <paramref name="pageBuffer"/>.</summary>
+    private uint FindLeafNodeWithPath(IndexKey key, List<uint> path, ulong transactionId, byte[] pageBuffer)
+    {
+        var currentPageId = _rootPageId;
+        while (true)
+        {
+            ReadPage(currentPageId, transactionId, pageBuffer);
+            var header = BTreeNodeHeader.ReadFrom(pageBuffer.AsSpan(32));
+
+            if (header.IsLeaf)
+                return currentPageId;
+
+            path.Add(currentPageId);
+            currentPageId = FindChildNode(pageBuffer, header, key);
         }
     }
 
@@ -708,8 +718,7 @@ public sealed class BTreeIndex
         if (insertOffset < currentEnd)
         {
             int bytesToShift = currentEnd - insertOffset;
-            for (int i = bytesToShift - 1; i >= 0; i--)
-                pageBuffer[insertOffset + entrySize + i] = pageBuffer[insertOffset + i];
+            pageBuffer.Slice(insertOffset, bytesToShift).CopyTo(pageBuffer.Slice(insertOffset + entrySize));
         }
 
         // Write new entry at sorted insertion point

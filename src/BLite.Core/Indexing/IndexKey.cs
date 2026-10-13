@@ -24,6 +24,11 @@ public struct IndexKey : IEquatable<IndexKey>, IComparable<IndexKey>
     // 0x03 sorts after every KeyPrefix key, so range scans must use an upper bound above both prefixes.
     internal const byte DecimalKeyPrefix = 0x03;
 
+    // One above the highest prefix byte: every encoded (non-sentinel) key starts with a smaller byte.
+    // CollectionSecondaryIndex appends it to a user key to bound the [user key][document id] entries of
+    // exactly that value, below the entries of longer values that start with it.
+    internal const byte PrefixUpperBound = DecimalKeyPrefix + 1;
+
     // Prefix + class byte + exponent byte + 15 bytes (30 BCD nibbles, a decimal has at most 29 digits).
     private const int DecimalKeyLength = 18;
 

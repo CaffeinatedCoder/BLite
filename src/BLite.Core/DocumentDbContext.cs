@@ -348,6 +348,10 @@ public abstract partial class DocumentDbContext : IDocumentDbContext
         {
             if (registeredNames.Contains(metadata.Name)) continue;
 
+            // Created by a newer version with features this one cannot maintain: dropping it would
+            // destroy that version's data (and leak the pages this one cannot find), so leave it.
+            if (!CollectionFeatures.CanWrite(metadata)) continue;
+
             // Orphan — free its pages, delete its metadata, and remove any per-collection file.
             _storage.FreeCollectionPagesCore(metadata.Name, _freeSpaceIndexes.InvalidatePages);
             _storage.DeleteCollectionMetadata(metadata.Name);

@@ -44,6 +44,15 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
                 case "LongCount":
                     VisitCount(node);
                     return node;
+                case "First":
+                case "FirstOrDefault":
+                case "Single":
+                case "SingleOrDefault":
+                case "Last":
+                case "LastOrDefault":
+                case "Any":
+                    VisitElementTerminal(node);
+                    return node;
                 default:
                     // GroupBy, Join, etc. — operators the direct pipeline cannot model.
                     _model.HasComplexOperators = true;
@@ -60,8 +69,11 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
         Visit(node.Arguments[0]);
 
         var predicate = (UnaryExpression)node.Arguments[1];
-        var lambda = (LambdaExpression)predicate.Operand;
+        AddPredicate((LambdaExpression)predicate.Operand);
+    }
 
+    private void AddPredicate(LambdaExpression lambda)
+    {
         if (_model.WhereClause == null)
         {
             _model.WhereClause = lambda;
@@ -145,6 +157,36 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
     }
 
     /// <summary>
+    /// Handles <c>First</c>, <c>FirstOrDefault</c>, <c>Single</c>, <c>SingleOrDefault</c>,
+    /// <c>Last</c>, <c>LastOrDefault</c> and <c>Any</c>, with or without a predicate. A predicate
+    /// on the entities themselves is folded into the WHERE clause (<c>First(p)</c> is
+    /// <c>Where(p).First()</c>), so the index planner sees it, but only where
+    /// <see cref="CanFoldPredicate"/> allows it. Overloads taking a default value are left to the
+    /// fallback pipeline. <c>All(p)</c> is not handled here: it is not <c>Where(p).All()</c>.
+    /// </summary>
+    private void VisitElementTerminal(MethodCallExpression node)
+    {
+        Visit(node.Arguments[0]); // recurse into source
+
+        if (node.Arguments.Count == 1)
+        {
+            _model.ElementTerminal = node.Method.Name;
+        }
+        else if (node.Arguments.Count == 2
+                 && node.Arguments[1] is UnaryExpression { NodeType: ExpressionType.Quote, Operand: LambdaExpression predicate }
+                 && CanFoldPredicate(node.Arguments[0], predicate))
+        {
+            AddPredicate(predicate);
+            _model.ElementTerminal = node.Method.Name;
+            _model.FoldedTerminal = node;
+        }
+        else
+        {
+            _model.HasComplexOperators = true;
+        }
+    }
+
+    /// <summary>
     /// Handles <c>Count()</c> / <c>LongCount()</c> as a push-down scalar.
     /// When there is no predicate, the provider can use the primary BTree key count instead
     /// of materialising all documents.
@@ -157,10 +199,57 @@ internal class BTreeExpressionVisitor : ExpressionVisitor
             // Count() with no predicate — fast O(log n) + k BTree scan.
             _model.IsCountOnly = true;
         }
+        else if (node.Arguments[1] is UnaryExpression { NodeType: ExpressionType.Quote, Operand: LambdaExpression predicate }
+                 && CanFoldPredicate(node.Arguments[0], predicate))
+        {
+            // Count(predicate) on the entities themselves is Where(predicate).Count().
+            AddPredicate(predicate);
+            _model.IsCountOnly = true;
+            _model.FoldedTerminal = node;
+        }
         else
         {
-            // Count(predicate) — treat as a complex operator.
+            // Count(predicate) after any other operator — treat as a complex operator.
             _model.HasComplexOperators = true;
         }
+    }
+
+    /// <summary>
+    /// True when a terminal's <paramref name="predicate"/> may be folded into the WHERE clause,
+    /// i.e. when <c>source.Terminal(p)</c> equals <c>source.Where(p).Terminal()</c> evaluated with
+    /// the filter applied first. That holds only when every operator between the root and the
+    /// terminal is a plain <c>Where</c> or an ordering (<c>OrderBy*</c> / <c>ThenBy*</c>): those keep
+    /// the element type and commute with a filter. Anything else, such as <c>GroupBy</c>,
+    /// <c>OfType</c>, <c>Select</c> or the order-dependent <c>Take</c>, <c>Skip</c>,
+    /// <c>SkipWhile</c> and <c>TakeWhile</c>, either changes what the predicate is applied to or
+    /// gives a different result when the predicate runs first.
+    /// </summary>
+    private static bool CanFoldPredicate(Expression source, LambdaExpression predicate)
+    {
+        var current = source;
+        while (current is MethodCallExpression call)
+        {
+            if (call.Method.DeclaringType != typeof(Queryable))
+                return false;
+
+            switch (call.Method.Name)
+            {
+                case "Where" when call.Arguments[1] is UnaryExpression { Operand: LambdaExpression { Parameters.Count: 1 } }:
+                case "OrderBy":
+                case "OrderByDescending":
+                case "ThenBy":
+                case "ThenByDescending":
+                    current = call.Arguments[0];
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        // Only element-type-preserving operators were skipped, so the predicate must take the
+        // root collection's own element type (the entity type).
+        return current is ConstantExpression { Value: IQueryable root }
+               && predicate.Parameters.Count == 1
+               && predicate.Parameters[0].Type == root.ElementType;
     }
 }
