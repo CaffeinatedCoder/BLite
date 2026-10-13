@@ -875,6 +875,8 @@ IReadOnlyList<string> indexes = orders.ListIndexes();
 orders.DropIndex("idx_status");
 ```
 
+A unique index rejects a second document with the same value (`InvalidOperationException`); `DynamicCollection` indexes an explicit BSON `null` and rejects a second one, whereas typed collections do not index `null` keys, so any number of documents may hold `null` in a unique-indexed property.
+
 ### Reading BsonDocument fields
 
 ```csharp

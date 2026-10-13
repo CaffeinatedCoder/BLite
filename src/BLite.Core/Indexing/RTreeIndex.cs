@@ -51,6 +51,31 @@ internal class RTreeIndex : IDisposable
 
     public IEnumerable<DocumentLocation> Search(GeoBox area, ITransaction? transaction = null)
     {
+        foreach (var (_, location) in SearchEntries(area, transaction))
+            yield return location;
+    }
+
+    /// <summary>
+    /// Locations of the indexed points within <paramref name="radiusKm"/> of the center. The tree
+    /// is searched with the circle's bounding box, then each hit is checked against the
+    /// great-circle distance, so points in the box corners are left out.
+    /// </summary>
+    public IEnumerable<DocumentLocation> SearchNear(double latitude, double longitude, double radiusKm, ITransaction? transaction = null)
+    {
+        var box = SpatialMath.BoundingBox(latitude, longitude, radiusKm);
+        foreach (var (mbr, location) in SearchEntries(box, transaction))
+        {
+            if (SpatialMath.DistanceKm(mbr.MinLat, mbr.MinLon, latitude, longitude) <= radiusKm)
+                yield return location;
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="Search"/>, but also yields each leaf entry's box, which for an indexed
+    /// point is the point itself.
+    /// </summary>
+    private IEnumerable<(GeoBox Mbr, DocumentLocation Location)> SearchEntries(GeoBox area, ITransaction? transaction = null)
+    {
         var stack = new Stack<uint>();
         stack.Push(_rootPageId);
 
@@ -73,7 +98,7 @@ internal class RTreeIndex : IDisposable
                     {
                         if (isLeaf)
                         {
-                            yield return pointer;
+                            yield return (mbr, pointer);
                         }
                         else
                         {
@@ -93,6 +118,83 @@ internal class RTreeIndex : IDisposable
             var leafPageId = ChooseLeaf(_rootPageId, mbr, transaction);
             InsertIntoNode(leafPageId, mbr, loc, transaction);
         }
+    }
+
+    /// <summary>
+    /// Removes the entry for <paramref name="loc"/> stored under <paramref name="mbr"/> and shrinks
+    /// the bounding boxes above it. A node left empty stays in the tree, where its empty box
+    /// matches no search, instead of being freed: page frees are not transactional.
+    /// </summary>
+    /// <returns><c>false</c> if no such entry exists.</returns>
+    public bool Delete(GeoBox mbr, DocumentLocation loc, ITransaction? transaction = null)
+    {
+        lock (_lock)
+        {
+            var buffer = RentPageBuffer();
+            try
+            {
+                if (!TryFindLeafEntry(mbr, loc, transaction, buffer, out var leafPageId, out var index))
+                    return false;
+
+                // Move the last entry into the freed slot.
+                ushort count = SpatialPage.GetEntryCount(buffer);
+                if (index != count - 1)
+                {
+                    SpatialPage.ReadEntry(buffer, count - 1, out var lastMbr, out var lastPointer);
+                    SpatialPage.WriteEntry(buffer, index, lastMbr, lastPointer);
+                }
+                SpatialPage.SetEntryCount(buffer, (ushort)(count - 1));
+
+                if (transaction != null)
+                    _storage.WritePage(leafPageId, transaction.TransactionId, buffer);
+                else
+                    _storage.WritePageImmediate(leafPageId, buffer);
+
+                UpdateMBRUpwards(leafPageId, transaction);
+                return true;
+            }
+            finally { ReturnPageBuffer(buffer); }
+        }
+    }
+
+    /// <summary>
+    /// Searches every subtree whose box covers <paramref name="mbr"/> for a leaf entry with exactly
+    /// that box and location. On success <paramref name="buffer"/> holds the leaf page.
+    /// </summary>
+    private bool TryFindLeafEntry(GeoBox mbr, DocumentLocation loc, ITransaction? transaction, byte[] buffer, out uint leafPageId, out int index)
+    {
+        var stack = new Stack<uint>();
+        stack.Push(_rootPageId);
+
+        while (stack.Count > 0)
+        {
+            uint pageId = stack.Pop();
+            _storage.ReadPage(pageId, transaction?.TransactionId, buffer);
+
+            bool isLeaf = SpatialPage.GetIsLeaf(buffer);
+            ushort count = SpatialPage.GetEntryCount(buffer);
+            for (int i = 0; i < count; i++)
+            {
+                SpatialPage.ReadEntry(buffer, i, out var entryMbr, out var pointer);
+                if (isLeaf)
+                {
+                    if (entryMbr == mbr && pointer.PageId == loc.PageId && pointer.SlotIndex == loc.SlotIndex)
+                    {
+                        leafPageId = pageId;
+                        index = i;
+                        return true;
+                    }
+                }
+                else if (entryMbr.Intersects(mbr))
+                {
+                    stack.Push(pointer.PageId);
+                }
+            }
+        }
+
+        leafPageId = 0;
+        index = -1;
+        return false;
     }
 
     private uint ChooseLeaf(uint rootId, GeoBox mbr, ITransaction? transaction)

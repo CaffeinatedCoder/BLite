@@ -2264,6 +2264,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             : default;
         // ────────────────────────────────────────────────────────────────────
 
+        // Unique secondary indexes are checked before any page is written.
+        _indexManager.EnsureUniqueInAll(entity, null, transaction);
+
         DocumentLocation location;
         if (_isTimeSeries)
         {
@@ -2852,6 +2855,10 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var oldEntity = await FindByLocation(oldLocation, transaction);
         if (oldEntity == null) return false;
 
+        // Unique secondary indexes are checked before any page is written; only those whose
+        // key changed, so documents that already share a value can still be updated.
+        _indexManager.EnsureUniqueInAll(entity, oldEntity, transaction);
+
         // Read old page
         var pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
@@ -2879,8 +2886,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             }
             else
             {
-                // Delete old + insert new
-                await DeleteCore(id, transaction, notifyCdc: false);
+                // Delete old + insert new. Secondary indexes are moved below, so an entry whose
+                // key did not change is re-pointed rather than deleted and inserted again.
+                await DeleteCore(id, transaction, notifyCdc: false, deleteFromIndexes: false);
 
                 DocumentLocation newLocation;
                 if (bytesWritten + SlotEntry.Size <= _maxDocumentSizeForSinglePage)
@@ -2897,9 +2905,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
 
                 _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
-                // DeleteCore already removed all secondary index entries for this document.
-                // We only need to insert the new entries at the new physical location.
-                _indexManager.InsertIntoAll(entity, newLocation, transaction);
+                _indexManager.UpdateInAll(oldEntity, entity, oldLocation, newLocation, transaction);
 
                 // Notify CDC
                 await NotifyCdc(OperationType.Update, id, transaction, docData);
@@ -3159,17 +3165,20 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         return deleteCount;
     }
 
-    private async Task<bool> DeleteCore(TId id, ITransaction transaction, bool notifyCdc = true)
+    private async Task<bool> DeleteCore(TId id, ITransaction transaction, bool notifyCdc = true, bool deleteFromIndexes = true)
     {
         var key = _mapper.ToIndexKey(id);
         if (!_primaryIndex.TryFind(key, out var location, transaction.TransactionId))
             return false;
 
         // Notify secondary indexes BEFORE deleting document from storage
-        var entity = await FindByLocation(location, transaction);
-        if (entity != null)
+        if (deleteFromIndexes)
         {
-            _indexManager.DeleteFromAll(entity, location, transaction);
+            var entity = await FindByLocation(location, transaction);
+            if (entity != null)
+            {
+                _indexManager.DeleteFromAll(entity, location, transaction);
+            }
         }
 
         // Read page
@@ -3592,8 +3601,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 if (indexOpt.IsVectorSearch)
                 {
+                    // The index satisfied the VectorSearch term; the post-filter checks the rest.
+                    // Compiled lazily, like GetCompiled(), only when a candidate needs it.
+                    bool exact = indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact;
+                    Func<T, bool>? residual = null;
                     await foreach (var item in VectorSearchAsync(indexOpt.IndexName, indexOpt.VectorQuery!, indexOpt.K, ct: ct))
-                        if (indexOpt.FilterCompleteness == Query.IndexOptimizer.FilterCompleteness.Exact || GetCompiled()(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
+                    {
+                        if (!exact && !(residual ??= ((System.Linq.Expressions.Expression<Func<T, bool>>)Query.IndexOptimizer.WithoutCall(whereClause, indexOpt.VectorSearchCall!)).Compile())(item))
+                            continue;
+                        yield return item;
+                        if (++yielded >= fetchLimit) yield break;
+                    }
                 }
                 else if (indexOpt.IsSpatialSearch)
                 {

@@ -382,38 +382,43 @@ public sealed class VectorSearchIndex
         return current;
     }
 
-    private IEnumerable<NodeReference> SearchLayer(NodeReference entryPoint, float[] query, int ef, int level, ITransaction? transaction)
+    /// <param name="liveOnly">
+    /// When true (queries), deleted nodes are still expanded so the graph stays navigable, but
+    /// only live nodes enter the result, and the search keeps going until it holds
+    /// <paramref name="ef"/> live nodes or runs out of candidates (as hnswlib does). Graph
+    /// construction passes false: deleted nodes remain valid neighbours.
+    /// </param>
+    private IEnumerable<NodeReference> SearchLayer(NodeReference entryPoint, float[] query, int ef, int level, ITransaction? transaction, bool liveOnly = false)
     {
         var visited = new HashSet<NodeReference>();
         var candidates = new PriorityQueue<NodeReference, float>();
-        var result = new PriorityQueue<NodeReference, float>();
+        var result = new PriorityQueue<NodeReference, float>(); // max-heap via negated distance
 
-        float dist = VectorMath.Distance(query, LoadVector(entryPoint, transaction), _options.Metric);
+        float dist = VectorMath.Distance(query, LoadVector(entryPoint, transaction, out var entryLive), _options.Metric);
         candidates.Enqueue(entryPoint, dist);
-        result.Enqueue(entryPoint, -dist); // Max-heap for results
+        if (entryLive || !liveOnly) result.Enqueue(entryPoint, -dist);
         visited.Add(entryPoint);
+
+        // Distance of the furthest node in the result; unbounded until the result has entries.
+        float Bound() => result.TryPeek(out _, out var negated) ? -negated : float.PositiveInfinity;
 
         while (candidates.Count > 0)
         {
-            float d_c = 0;
-            candidates.TryPeek(out var c, out d_c);
-            result.TryPeek(out var f, out var d_f);
-            
-            if (d_c > -d_f) break;
+            candidates.TryPeek(out var c, out var d_c);
+            if (d_c > Bound() && result.Count >= ef) break;
 
             candidates.Dequeue();
 
             foreach (var e in GetNeighbors(c, level, transaction))
             {
-                if (!visited.Contains(e))
-                {
-                    visited.Add(e);
-                    result.TryPeek(out _, out d_f);
-                    float d_e = VectorMath.Distance(query, LoadVector(e, transaction), _options.Metric);
+                if (!visited.Add(e)) continue;
 
-                    if (d_e < -d_f || result.Count < ef)
+                float d_e = VectorMath.Distance(query, LoadVector(e, transaction, out var live), _options.Metric);
+                if (result.Count < ef || d_e < Bound())
+                {
+                    candidates.Enqueue(e, d_e);
+                    if (live || !liveOnly)
                     {
-                        candidates.Enqueue(e, d_e);
                         result.Enqueue(e, -d_e);
                         if (result.Count > ef) result.Dequeue();
                     }
@@ -455,13 +460,18 @@ public sealed class VectorSearchIndex
     }
 
     private float[] LoadVector(NodeReference node, ITransaction? transaction)
+        => LoadVector(node, transaction, out _);
+
+    /// <summary>Loads a node's vector; <paramref name="live"/> is false for a deleted node.</summary>
+    private float[] LoadVector(NodeReference node, ITransaction? transaction, out bool live)
     {
         var buffer = RentPageBuffer();
         try
         {
             _storage.ReadPage(node.PageId, transaction?.TransactionId, buffer);
             float[] vector = new float[_options.Dimensions];
-            VectorPage.ReadNodeData(buffer, node.NodeIndex, out _, out _, vector);
+            VectorPage.ReadNodeData(buffer, node.NodeIndex, out var location, out _, vector);
+            live = location.PageId != 0;
             return vector;
         }
         finally { ReturnPageBuffer(buffer); }
@@ -479,15 +489,15 @@ public sealed class VectorSearchIndex
         }
 
         // 2. Comprehensive search on level 0
-        var nearest = SearchLayer(currentPoint, query, Math.Max(efSearch, k), 0, transaction);
+        var nearest = SearchLayer(currentPoint, query, Math.Max(efSearch, k), 0, transaction, liveOnly: true);
         
-        // 3. Return top-k results.
+        // 3. Return top-k results, skipping deleted nodes.
         // SearchLayer already computed distances; we retrieve location + vector together
         // in a single page read to avoid the double-LoadVector that the old code did.
         int count = 0;
         foreach (var node in nearest)
         {
-            if (count++ >= k) break;
+            if (count >= k) break;
 
             var buffer = RentPageBuffer();
             try
@@ -495,11 +505,94 @@ public sealed class VectorSearchIndex
                 _storage.ReadPage(node.PageId, transaction?.TransactionId, buffer);
                 float[] vec = new float[_options.Dimensions];
                 VectorPage.ReadNodeData(buffer, node.NodeIndex, out var loc, out _, vec);
+                if (loc.PageId == 0) continue;
+
+                count++;
                 float dist = VectorMath.Distance(query, vec, _options.Metric);
                 yield return new VectorSearchResult(loc, dist);
             }
             finally { ReturnPageBuffer(buffer); }
         }
+    }
+
+    /// <summary>
+    /// Marks the node that stores <paramref name="vector"/> for <paramref name="docLocation"/> as
+    /// deleted. The node keeps its vector and links so the graph stays connected, but search no
+    /// longer returns it. Deleted nodes are dropped when the index is rebuilt.
+    /// Search keeps expanding deleted nodes until it holds <c>ef</c> live ones, so when fewer
+    /// than <c>ef</c> live nodes are reachable, query cost grows with the number of deleted
+    /// nodes; rebuild the index (<see cref="VacuumOptions.RebuildIndexes"/>) to remove them.
+    /// </summary>
+    /// <returns><c>false</c> if no such node exists.</returns>
+    public bool Delete(float[] vector, DocumentLocation docLocation, ITransaction? transaction = null)
+        => RewriteLocation(vector, docLocation, default, transaction);
+
+    /// <summary>
+    /// Points the node that stores <paramref name="vector"/> for <paramref name="oldLocation"/> at
+    /// <paramref name="newLocation"/>, for a document that moved without changing its vector.
+    /// </summary>
+    /// <returns><c>false</c> if no such node exists.</returns>
+    public bool Relocate(float[] vector, DocumentLocation oldLocation, DocumentLocation newLocation, ITransaction? transaction = null)
+        => RewriteLocation(vector, oldLocation, newLocation, transaction);
+
+    /// <summary>
+    /// Finds one node holding exactly <paramref name="vector"/> for <paramref name="from"/> and
+    /// rewrites its location. A search for the vector itself finds the node in practice; the
+    /// page scan behind it only runs if the approximate search misses, which happens reliably
+    /// when more than <c>EfConstruction</c> documents share an identical vector (e.g. all-zero
+    /// embeddings): every such update then reads all node pages.
+    /// Like <see cref="Insert"/>, this runs without an index-level lock; callers serialize
+    /// writes through the collection lock.
+    /// </summary>
+    private bool RewriteLocation(float[] vector, DocumentLocation from, DocumentLocation to, ITransaction? transaction)
+    {
+        if (vector.Length != _options.Dimensions || from.PageId == 0) return false;
+        if (!TryGetEntryPoint(transaction?.TransactionId ?? 0, out var entryPoint)) return false;
+
+        var buffer = RentPageBuffer();
+        var stored = new float[_options.Dimensions];
+        try
+        {
+            bool IsTarget(int nodeIndex)
+            {
+                var loc = VectorPage.ReadLocation(buffer, nodeIndex);
+                if (loc.PageId != from.PageId || loc.SlotIndex != from.SlotIndex) return false;
+                VectorPage.ReadNodeData(buffer, nodeIndex, out _, out _, stored);
+                return stored.AsSpan().SequenceEqual(vector);
+            }
+
+            void Rewrite(uint pageId, int nodeIndex)
+            {
+                VectorPage.WriteLocation(buffer, nodeIndex, to);
+                WritePage(pageId, transaction, buffer);
+            }
+
+            var currentPoint = entryPoint;
+            for (int l = entryPoint.MaxLevel; l > 0; l--)
+                currentPoint = GreedySearch(currentPoint, vector, l, transaction);
+
+            foreach (var node in SearchLayer(currentPoint, vector, _options.EfConstruction, 0, transaction))
+            {
+                _storage.ReadPage(node.PageId, transaction?.TransactionId, buffer);
+                if (!IsTarget(node.NodeIndex)) continue;
+                Rewrite(node.PageId, node.NodeIndex);
+                return true;
+            }
+
+            for (uint pageId = _rootPageId; pageId != 0; pageId = PageHeader.ReadFrom(buffer).NextPageId)
+            {
+                _storage.ReadPage(pageId, transaction?.TransactionId, buffer);
+                int nodeCount = VectorPage.GetNodeCount(buffer);
+                for (int i = 0; i < nodeCount; i++)
+                {
+                    if (!IsTarget(i)) continue;
+                    Rewrite(pageId, i);
+                    return true;
+                }
+            }
+            return false;
+        }
+        finally { ReturnPageBuffer(buffer); }
     }
 
     private DocumentLocation LoadDocumentLocation(NodeReference node, ITransaction? transaction)
