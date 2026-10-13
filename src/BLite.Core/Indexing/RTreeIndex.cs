@@ -51,6 +51,31 @@ internal class RTreeIndex : IDisposable
 
     public IEnumerable<DocumentLocation> Search(GeoBox area, ITransaction? transaction = null)
     {
+        foreach (var (_, location) in SearchEntries(area, transaction))
+            yield return location;
+    }
+
+    /// <summary>
+    /// Locations of the indexed points within <paramref name="radiusKm"/> of the center. The tree
+    /// is searched with the circle's bounding box, then each hit is checked against the
+    /// great-circle distance, so points in the box corners are left out.
+    /// </summary>
+    public IEnumerable<DocumentLocation> SearchNear(double latitude, double longitude, double radiusKm, ITransaction? transaction = null)
+    {
+        var box = SpatialMath.BoundingBox(latitude, longitude, radiusKm);
+        foreach (var (mbr, location) in SearchEntries(box, transaction))
+        {
+            if (SpatialMath.DistanceKm(mbr.MinLat, mbr.MinLon, latitude, longitude) <= radiusKm)
+                yield return location;
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="Search"/>, but also yields each leaf entry's box, which for an indexed
+    /// point is the point itself.
+    /// </summary>
+    private IEnumerable<(GeoBox Mbr, DocumentLocation Location)> SearchEntries(GeoBox area, ITransaction? transaction = null)
+    {
         var stack = new Stack<uint>();
         stack.Push(_rootPageId);
 
@@ -73,7 +98,7 @@ internal class RTreeIndex : IDisposable
                     {
                         if (isLeaf)
                         {
-                            yield return pointer;
+                            yield return (mbr, pointer);
                         }
                         else
                         {
