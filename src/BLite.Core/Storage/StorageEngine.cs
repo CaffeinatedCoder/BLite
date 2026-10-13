@@ -54,6 +54,9 @@ public sealed partial class StorageEngine : IDisposable
     private long _knownWalGeneration;
     private long _replayEpoch;
     private readonly object _replayLock = new();
+
+    // Multi-process: catch-ups in a row that could not replay the shared WAL (under _commitLock).
+    private int _failedCatchUps;
     
     // Collection-per-file: collectionName → IPageStorage dedicated
     // Null if CollectionDataDirectory not configured (embedded mode, single file)

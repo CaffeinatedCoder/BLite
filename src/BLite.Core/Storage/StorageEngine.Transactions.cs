@@ -98,9 +98,10 @@ public sealed partial class StorageEngine
             {
                 newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd);
             }
-            catch
+            catch (Exception ex)
             {
                 // Stale reads until the next catch-up retries, never a skipped record.
+                ReportFailedCatchUp(wal, lastKnown, shmEnd, ex.Message);
                 return false;
             }
 
@@ -119,7 +120,26 @@ public sealed partial class StorageEngine
         }
 
         Volatile.Write(ref _lastKnownWalEndOffset, shmEnd);
+        _failedCatchUps = 0;
         return true;
+    }
+
+    /// <summary>
+    /// Counts the catch-ups in a row that could not replay the shared WAL, and reports the first
+    /// one and then every power of two as a warning (<see cref="Trace"/>): a WAL that stays
+    /// unreadable is visible without flooding the log. Until a catch-up succeeds, this engine's
+    /// reads may miss other processes' commits and its checkpoints write nothing, so it never
+    /// truncates the WAL. Called under <c>_commitLock</c>.
+    /// </summary>
+    private void ReportFailedCatchUp(Transactions.WriteAheadLog wal, long fromOffset, long toOffset, string reason)
+    {
+        int failures = ++_failedCatchUps;
+        if ((failures & (failures - 1)) != 0)
+            return;
+        Trace.TraceWarning(
+            $"BLite: could not replay the shared WAL '{wal.FilePath}' from offset {fromOffset} to {toOffset} " +
+            $"({failures} attempt(s) in a row): {reason}. Until it can, reads may miss other processes' commits " +
+            "and checkpoints write nothing, so the WAL is not truncated.");
     }
 
     /// <summary>
@@ -220,8 +240,10 @@ public sealed partial class StorageEngine
     /// <param name="transactionId">Transaction ID</param>
     /// <param name="writeSet">All writes to record in WAL</param>
     /// <returns>True if preparation succeeded</returns>
+    /// <exception cref="NotSupportedException">Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>).</exception>
     public async Task<bool> PrepareTransactionAsync(ulong transactionId)
     {
+        ThrowIfMultiProcessAccess(nameof(PrepareTransactionAsync));
         try
         {
             await _wal.WriteBeginRecordAsync(transactionId);
@@ -241,8 +263,10 @@ public sealed partial class StorageEngine
         }
     }
 
+    /// <exception cref="NotSupportedException">Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>).</exception>
     public async Task<bool> PrepareTransactionAsync(ulong transactionId, CancellationToken ct = default)
     {
+        ThrowIfMultiProcessAccess(nameof(PrepareTransactionAsync));
         try
         {
             await _wal.WriteBeginRecordAsync(transactionId, ct);
@@ -274,11 +298,16 @@ public sealed partial class StorageEngine
     /// </summary>
     /// <param name="transactionId">Transaction to commit</param>
     /// <param name="writeSet">All writes performed in this transaction (unused, kept for compatibility)</param>
+    /// <exception cref="NotSupportedException">
+    /// Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>); commit through
+    /// <see cref="Transaction.CommitAsync"/> or <c>CommitTransactionAsync(transactionId, cancellationToken)</c>.
+    /// </exception>
     public async Task CommitTransactionAsync(ulong transactionId)
     {
-        // NOTE: No admission gate here — the caller (CommitTransactionAsync(Transaction, ct))
-        // already acquired the gate. This method is also called from the group commit writer
-        // which should not be gated.
+        ThrowIfMultiProcessAccess(nameof(CommitTransactionAsync) + "(ulong)");
+
+        // NOTE: No admission gate here. Nothing in the library calls this direct path;
+        // Transaction.CommitAsync goes through group commit (the CancellationToken overload).
         bool needsCheckpoint = false;
         bool completed = false;
 
@@ -448,8 +477,10 @@ public sealed partial class StorageEngine
     /// Used for 2PC: after PrepareAsync() writes to WAL, this finalizes the commit.
     /// </summary>
     /// <param name="transactionId">Transaction to mark committed</param>
+    /// <exception cref="NotSupportedException">Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>).</exception>
     public async Task MarkTransactionCommittedAsync(ulong transactionId)
     {
+        ThrowIfMultiProcessAccess(nameof(MarkTransactionCommittedAsync));
         bool needsCheckpoint = false;
 
         _commitLock.Wait();
@@ -483,6 +514,25 @@ public sealed partial class StorageEngine
         {
             _ = Task.Run(() => CheckpointAsync());
         }
+    }
+
+    /// <summary>
+    /// Rejects the direct commit path (<c>CommitTransactionAsync(ulong)</c>) and two-phase commit
+    /// (<see cref="PrepareTransactionAsync(ulong)"/>, <see cref="MarkTransactionCommittedAsync"/>) in
+    /// multi-process mode. They append to the shared WAL at this engine's own write position,
+    /// without the cross-process writer lock, without catching up with the shared WAL first and
+    /// without publishing the new WAL end (#188). Their records can overwrite another process's,
+    /// and stay invisible to other processes, which then checkpoint and truncate the WAL without
+    /// them. This engine then discards them along with everything else it holds from the old WAL,
+    /// so the commit is lost. Group commit (<see cref="Transaction.CommitAsync"/>) does all of
+    /// that under both locks.
+    /// </summary>
+    private void ThrowIfMultiProcessAccess(string operation)
+    {
+        if (_shm != null)
+            throw new NotSupportedException(
+                $"{operation} is not supported with PageFileConfig.AllowMultiProcessAccess. " +
+                "Commit through Transaction.CommitAsync or CommitTransactionAsync(transactionId, cancellationToken).");
     }
 
     /// <summary>

@@ -1,4 +1,5 @@
 using BLite.Core.Storage;
+using BLite.Core.Transactions;
 
 namespace BLite.Tests;
 
@@ -26,6 +27,8 @@ public class MultiProcessWalTruncationTests : IDisposable
     }
 
     private long WalLength => new FileInfo(Path.ChangeExtension(_dbPath, ".wal")).Length;
+
+    private string ShmPath => Path.ChangeExtension(_dbPath, ".wal") + "-shm";
 
     [Fact]
     public async Task ReplayedPage_AfterAnotherProcessTruncated_IsNotWrittenBackOnCheckpoint()
@@ -237,6 +240,163 @@ public class MultiProcessWalTruncationTests : IDisposable
             using (c.BeginTransaction())
                 foreach (var (page, fill) in expected)
                     AssertPage(c, page, fill);
+        }
+    }
+
+    [Fact]
+    public async Task DirectCommitPath_IsRejected_SoAnotherProcessesTruncationCannotLoseIt()
+    {
+        // The sequence from the review of #201. The direct path neither catches up with the
+        // shared WAL nor publishes its end: A would commit, checkpoint and truncate without
+        // seeing B's record, and B would then discard it along with the rest of the old WAL.
+        using var a = new StorageEngine(_dbPath, Config);
+        using var b = new StorageEngine(_dbPath, Config);
+        var p = a.AllocatePage();
+        var q = a.AllocatePage();
+
+        await WriteAndCommitAsync(a, p, 0x11);
+        using (b.BeginTransaction())
+            AssertPage(b, p, 0x11);
+
+        long walBefore = WalLength;
+        using (var tx = b.BeginTransaction())
+        {
+            b.WritePage(p, tx.TransactionId, Filled(b.PageSize, 0x44));
+            await Assert.ThrowsAsync<NotSupportedException>(() => b.CommitTransactionAsync(tx.TransactionId));
+            Assert.Equal(walBefore, WalLength); // nothing appended outside group commit
+
+            // The transaction is untouched and commits through group commit.
+            await tx.CommitAsync();
+        }
+
+        await WriteAndCommitAsync(a, q, 0x55);
+        await a.CheckpointAsync();
+        Assert.Equal(0, WalLength);
+
+        using (b.BeginTransaction())
+            AssertPage(b, p, 0x44);
+        AssertFreshEngineReads(p, 0x44);
+        AssertFreshEngineReads(q, 0x55);
+    }
+
+    [Fact]
+    public async Task TwoPhaseCommitPaths_AreRejected()
+    {
+        using var engine = new StorageEngine(_dbPath, Config);
+        var page = engine.AllocatePage();
+        long walBefore = WalLength;
+
+        using (var tx = engine.BeginTransaction())
+        {
+            engine.WritePage(page, tx.TransactionId, Filled(engine.PageSize, 0x66));
+            await Assert.ThrowsAsync<NotSupportedException>(() => engine.PrepareTransactionAsync(tx.TransactionId));
+            await Assert.ThrowsAsync<NotSupportedException>(() => engine.PrepareTransactionAsync(tx.TransactionId, CancellationToken.None));
+            await Assert.ThrowsAsync<NotSupportedException>(() => engine.MarkTransactionCommittedAsync(tx.TransactionId));
+            await Assert.ThrowsAsync<NotSupportedException>(() => tx.PrepareAsync());
+        }
+
+        Assert.Equal(walBefore, WalLength);
+    }
+
+    [Fact]
+    public async Task DirectAndTwoPhaseCommitPaths_StillWork_InSingleProcessMode()
+    {
+        using var engine = new StorageEngine(_dbPath, PageFileConfig.Default);
+        var direct = engine.AllocatePage();
+        var prepared = engine.AllocatePage();
+
+        using (var tx = engine.BeginTransaction())
+        {
+            engine.WritePage(direct, tx.TransactionId, Filled(engine.PageSize, 0x77));
+            await engine.CommitTransactionAsync(tx.TransactionId);
+        }
+        using (var tx = engine.BeginTransaction())
+        {
+            engine.WritePage(prepared, tx.TransactionId, Filled(engine.PageSize, 0x78));
+            Assert.True(await engine.PrepareTransactionAsync(tx.TransactionId));
+            await engine.MarkTransactionCommittedAsync(tx.TransactionId);
+        }
+
+        AssertPage(engine, direct, 0x77);
+        AssertPage(engine, prepared, 0x78);
+    }
+
+    [Fact]
+    public async Task CheckpointThatCannotTakeTheWriterLock_IsReportedAsFailed()
+    {
+        using var engine = new StorageEngine(_dbPath, Config);
+        var metrics = engine.EnsureMetrics();
+        var page = engine.AllocatePage();
+        await WriteAndCommitAsync(engine, page, 0x11);
+
+        // Another holder of the cross-process writer lock (an instance in the same process
+        // excludes it like another process would).
+        using (var other = WalSharedMemory.Open(ShmPath, Config.PageSize))
+        {
+            Assert.True(other.TryAcquireWriterLock(1_000));
+            await engine.CheckpointAsync();
+            other.ReleaseWriterLock();
+        }
+        Assert.NotEqual(0, WalLength); // nothing was written or truncated
+
+        await WaitUntilAsync(() => metrics.GetSnapshot().CheckpointsFailedTotal == 1);
+        Assert.Equal(0, metrics.GetSnapshot().CheckpointsTotal);
+
+        await engine.CheckpointAsync();
+        Assert.Equal(0, WalLength);
+        await WaitUntilAsync(() => metrics.GetSnapshot().CheckpointsTotal == 1);
+        Assert.Equal(1, metrics.GetSnapshot().CheckpointsFailedTotal);
+    }
+
+    [Fact]
+    public async Task ShmOpenedWithAnotherPageSize_WhileInUse_ThrowsAndKeepsTheHeader()
+    {
+        using var a = new StorageEngine(_dbPath, Config);
+        var page = a.AllocatePage();
+        await WriteAndCommitAsync(a, page, 0x11);
+        await a.CheckpointAsync();                // generation 1
+        await WriteAndCommitAsync(a, page, 0x22); // the WAL has records again
+
+        Assert.Throws<InvalidOperationException>(() => WalSharedMemory.Open(ShmPath, Config.PageSize * 2));
+
+        using (var shm = WalSharedMemory.Open(ShmPath, Config.PageSize))
+        {
+            Assert.Equal(1, shm.ReadWalGeneration());
+            Assert.Equal(WalLength, shm.ReadWalEndOffset());
+        }
+        using (a.BeginTransaction())
+            AssertPage(a, page, 0x22);
+        AssertFreshEngineReads(page, 0x22);
+    }
+
+    [Fact]
+    public async Task ShmOpenedWithAnotherPageSize_WhenIdle_IsReinitialisedWithoutGoingBack()
+    {
+        // E.g. a .wal-shm left behind by a database recreated with another page size.
+        ulong nextTransactionId;
+        using (var a = new StorageEngine(_dbPath, Config))
+        {
+            var page = a.AllocatePage();
+            await WriteAndCommitAsync(a, page, 0x11);
+            await a.CheckpointAsync(); // generation 1, WAL end 0
+            using var shm = WalSharedMemory.Open(ShmPath, Config.PageSize);
+            Assert.Equal(1, shm.ReadWalGeneration());
+            nextTransactionId = shm.ReadNextTransactionId();
+        }
+
+        using var reopened = WalSharedMemory.Open(ShmPath, Config.PageSize * 2);
+        // A generation never seen before: a process still attached to the old one sees a change.
+        Assert.Equal(2, reopened.ReadWalGeneration());
+        Assert.Equal(nextTransactionId, reopened.ReadNextTransactionId());
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "Condition not met within 10 s.");
+            await Task.Delay(20);
         }
     }
 

@@ -208,11 +208,33 @@ public sealed class WalSharedMemory : IDisposable
 
             if (!valid)
             {
+                long generation = 0;
+                long nextTransactionId = 0;
+                if (magic == WalSharedMemoryLayout.Magic && version == WalSharedMemoryLayout.CurrentVersion)
+                {
+                    // A well-formed SHM for another page size or reader count: a configuration
+                    // mismatch, not corruption. Re-initialising it under processes that use it
+                    // would reset the WAL end offset and the WAL generation they rely on, so they
+                    // would take it for a truncation and drop the commits they have not
+                    // checkpointed. Refuse while there is any sign of such a process.
+                    if (IsInUse(fileMaxReaders))
+                        throw new InvalidOperationException(
+                            $"The shared WAL memory file '{_shmPath}' is in use with page size {filePageSize} " +
+                            $"and {fileMaxReaders} reader slots; this process was configured with page size " +
+                            $"{_pageSize} and {_maxReaders} reader slots. Every process must use the same configuration.");
+
+                    // Otherwise keep the counters monotonic: a new generation, so an idle process
+                    // still attached sees a change (it holds nothing from the WAL, whose end is 0),
+                    // and never the generation of an earlier WAL again; and no reused transaction ids.
+                    generation = Volatile.Read(ref RefLong(WalSharedMemoryLayout.OffsetWalGeneration)) + 1;
+                    nextTransactionId = Volatile.Read(ref RefLong(WalSharedMemoryLayout.OffsetNextTransactionId));
+                }
+
                 // Treat as corruption: zero the header and re-initialize. Reader slots
                 // (which carry only PID + offset) are also reset — any live readers will
                 // re-register on their next BeginTransaction.
                 ZeroFile();
-                InitializeHeader();
+                InitializeHeader(generation, nextTransactionId);
             }
         }
     }
@@ -228,18 +250,42 @@ public sealed class WalSharedMemory : IDisposable
         _accessor!.Flush();
     }
 
-    private void InitializeHeader()
+    private void InitializeHeader(long walGeneration = 0, long nextTransactionId = 0)
     {
         _accessor!.Write(WalSharedMemoryLayout.OffsetMagic, WalSharedMemoryLayout.Magic);
         _accessor.Write(WalSharedMemoryLayout.OffsetVersion, WalSharedMemoryLayout.CurrentVersion);
         _accessor.Write(WalSharedMemoryLayout.OffsetPageSize, _pageSize);
         _accessor.Write(WalSharedMemoryLayout.OffsetMaxReaders, _maxReaders);
-        _accessor.Write(WalSharedMemoryLayout.OffsetNextTransactionId, 0L);
+        _accessor.Write(WalSharedMemoryLayout.OffsetNextTransactionId, nextTransactionId);
         _accessor.Write(WalSharedMemoryLayout.OffsetWalEndOffset, 0L);
         _accessor.Write(WalSharedMemoryLayout.OffsetCheckpointedOffset, 0L);
         _accessor.Write(WalSharedMemoryLayout.OffsetWriterOwnerPid, 0);
-        _accessor.Write(WalSharedMemoryLayout.OffsetWalGeneration, 0L);
+        _accessor.Write(WalSharedMemoryLayout.OffsetWalGeneration, walGeneration);
         _accessor.Flush();
+    }
+
+    /// <summary>
+    /// Whether a well-formed SHM written with <paramref name="fileMaxReaders"/> reader slots shows
+    /// signs of use: WAL records not yet truncated away, a live writer, or a live reader. A
+    /// process that is attached but idle, with an empty WAL, leaves no trace and is not detected.
+    /// </summary>
+    private bool IsInUse(int fileMaxReaders)
+    {
+        if (Volatile.Read(ref RefLong(WalSharedMemoryLayout.OffsetWalEndOffset)) != 0)
+            return true;
+        if (IsProcessAlive(Volatile.Read(ref RefInt(WalSharedMemoryLayout.OffsetWriterOwnerPid))))
+            return true;
+
+        // Only the slots that lie inside this process's view (the file's layout may be larger).
+        int slots = Math.Min(Math.Min(fileMaxReaders, MaxAllowedReaders),
+            (_shmFileSize - WalSharedMemoryLayout.HeaderSize) / WalSharedMemoryLayout.ReaderSlotSize);
+        for (int i = 0; i < slots; i++)
+        {
+            long pid = Volatile.Read(ref RefLong(WalSharedMemoryLayout.HeaderSize + i * WalSharedMemoryLayout.ReaderSlotSize));
+            if (pid > 0 && pid <= int.MaxValue && IsProcessAlive((int)pid))
+                return true;
+        }
+        return false;
     }
 
     // ── Atomic counters ──────────────────────────────────────────────────────
