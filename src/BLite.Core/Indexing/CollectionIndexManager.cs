@@ -40,6 +40,10 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         
         // Load existing metadata via storage
         _metadata = _storage.GetCollectionMetadata(_collectionName) ?? new CollectionMetadata { Name = _collectionName };
+
+        // Refuse a collection that requires features this version cannot maintain, before anything
+        // below writes to it.
+        CollectionFeatures.EnsureCanOpen(_metadata, _storage.IsReadOnly);
         
         // Initialize indexes from metadata. Root page ids are fixed for the lifetime of an index
         // (a root split rewrites the root page in place), so they only need persisting when the
