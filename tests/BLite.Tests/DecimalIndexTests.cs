@@ -1,5 +1,7 @@
+using System.Reflection;
 using BLite.Bson;
 using BLite.Core;
+using BLite.Core.Collections;
 using BLite.Core.Indexing;
 using BLite.Core.Query;
 using BLite.Core.Query.Blql;
@@ -218,6 +220,71 @@ public class DecimalIndexTests : IDisposable
         var products = storage.GetAllCollectionsMetadata().Single(m => m.Name == "products_collection");
         var priceIndex = products.Indexes.Single(i => i.PropertyPaths.Single() == nameof(Product.Price));
         Assert.Equal(IndexMetadata.CurrentKeyFormat, priceIndex.KeyFormat);
+    }
+
+    /// <summary>
+    /// A migration that fails late, after the rebuilt tree has split, keeps the legacy index as it
+    /// was and frees every page of the partial rebuild: it is retried on each open without growing
+    /// the file, and succeeds once the document can be read again.
+    /// </summary>
+    [Fact]
+    public async Task LegacyIndexMigration_ThatFailsLate_KeepsTheOldIndex_AndDoesNotGrowTheFile()
+    {
+        const int count = 3000;
+        uint legacyRoot;
+        uint corruptedPage;
+        byte[] intact;
+        using (var db = new TestDbContext(_dbPath))
+        {
+            await db.Products.InsertBulkAsync(Enumerable.Range(1, count)
+                .Select(i => new Product { Id = i, Title = $"P{i}", Price = i + 0.01m }).ToList());
+            db.Products.IndexManager.SetKeyFormat(PriceIndex(db).Name, IndexMetadata.LegacyKeyFormat);
+            legacyRoot = PriceIndex(db).RootPageId;
+            await db.CheckpointAsync();
+
+            // Make the last document in primary-key order unreadable, so the rebuild on open fails
+            // only after thousands of inserts.
+            var primary = (BTreeIndex)typeof(DocumentCollection<int, Product>)
+                .GetField("_primaryIndex", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(db.Products)!;
+            var location = primary.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Backward).First().Location;
+            corruptedPage = location.PageId;
+            intact = new byte[db.Storage.PageSize];
+            db.Storage.ReadPage(corruptedPage, null, intact);
+            var corrupt = (byte[])intact.Clone();
+            var slot = SlotEntry.ReadFrom(corrupt.AsSpan(SlottedPageHeader.Size + location.SlotIndex * SlotEntry.Size));
+            corrupt.AsSpan(slot.Offset + 4, 12).Fill(0xFF); // invalid element types
+            db.Storage.WritePageImmediate(corruptedPage, corrupt);
+        }
+
+        var sizes = new List<long>();
+        for (int open = 0; open < 4; open++)
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() => new TestDbContext(_dbPath));
+            Assert.Contains("retried on the next open", ex.Message);
+            sizes.Add(new FileInfo(_dbPath).Length);
+        }
+        // The first failed open may extend the file; the following ones reuse the freed pages.
+        Assert.All(sizes.Skip(1), size => Assert.Equal(sizes[0], size));
+
+        using (var storage = new StorageEngine(_dbPath, PageFileConfig.Default))
+        {
+            // The legacy index is still the registered one, so the next open retries the migration.
+            var stored = storage.GetCollectionMetadata("products_collection")!.Indexes
+                .Single(i => i.PropertyPaths.Single() == nameof(Product.Price));
+            Assert.Equal(IndexMetadata.LegacyKeyFormat, stored.KeyFormat);
+            Assert.Equal(legacyRoot, stored.RootPageId);
+            storage.WritePageImmediate(corruptedPage, intact);
+        }
+
+        using (var db = new TestDbContext(_dbPath))
+        {
+            var index = PriceIndex(db);
+            Assert.Equal(IndexMetadata.CurrentKeyFormat, index.KeyFormat);
+            Assert.Equal(count, AllKeys(index).Count);
+            Assert.Equal(count, (await db.Products.AsQueryable().Where(p => p.Price >= 0m).ToListAsync()).Count);
+            Assert.Equal(1500, Assert.Single(await db.Products.AsQueryable().Where(p => p.Price == 1500.01m).ToListAsync()).Id);
+        }
     }
 
     private static List<IndexKey> AllKeys(CollectionSecondaryIndex<int, Product> index)

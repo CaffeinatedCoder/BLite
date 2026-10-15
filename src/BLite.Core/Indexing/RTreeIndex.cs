@@ -3,6 +3,7 @@ using BLite.Core.Transactions;
 using BLite.Core.Collections;
 using BLite.Core.Indexing.Internal;
 using System.Buffers;
+using System.Diagnostics;
 
 namespace BLite.Core.Indexing;
 
@@ -57,16 +58,22 @@ internal class RTreeIndex : IDisposable
 
     /// <summary>
     /// Locations of the indexed points within <paramref name="radiusKm"/> of the center. The tree
-    /// is searched with the circle's bounding box, then each hit is checked against the
-    /// great-circle distance, so points in the box corners are left out.
+    /// is searched with boxes covering the circle (split at the ±180° meridian, widened to all
+    /// longitudes around a pole), then each hit is checked against the great-circle distance,
+    /// so points in the box corners are left out.
     /// </summary>
     public IEnumerable<DocumentLocation> SearchNear(double latitude, double longitude, double radiusKm, ITransaction? transaction = null)
     {
-        var box = SpatialMath.BoundingBox(latitude, longitude, radiusKm);
-        foreach (var (mbr, location) in SearchEntries(box, transaction))
+        // The boxes never overlap, so no point is returned twice: a split happens only when no
+        // pole is inside the circle, and then the longitude half-width asin(sin r / cos lat) is
+        // below 90°, so the two halves together span less than 360°.
+        foreach (var box in SpatialMath.NearQueryBoxes(latitude, longitude, radiusKm))
         {
-            if (SpatialMath.DistanceKm(mbr.MinLat, mbr.MinLon, latitude, longitude) <= radiusKm)
-                yield return location;
+            foreach (var (mbr, location) in SearchEntries(box, transaction))
+            {
+                if (SpatialMath.DistanceKm(mbr.MinLat, mbr.MinLon, latitude, longitude) <= radiusKm)
+                    yield return location;
+            }
         }
     }
 
@@ -109,6 +116,63 @@ internal class RTreeIndex : IDisposable
             }
         }
         finally { ReturnPageBuffer(buffer); }
+    }
+
+    /// <summary>
+    /// Returns all physical page IDs owned by this R-tree.
+    /// Used when dropping or rebuilding an index to free storage space.
+    /// </summary>
+    /// <remarks>
+    /// The walk does not take this index's lock. Callers must hold the lock that excludes writers
+    /// to the tree: the collection write lock during <c>VacuumAsync</c>'s rebuild, the index
+    /// manager's lock (which every index insert, update and delete also takes) when an index is
+    /// dropped, and a dropped collection is disposed before its pages are collected.
+    /// </remarks>
+    public IReadOnlyList<uint> CollectAllPages() => CollectAllPages(0);
+
+    /// <summary>
+    /// Like <see cref="CollectAllPages()"/>, but walks the tree as <paramref name="transactionId"/>
+    /// sees it, including nodes that transaction has written but not committed. <see cref="SplitNode"/>
+    /// allocates its pages outside the transaction and links them only from nodes written in it, so
+    /// after a rollback they can no longer be reached from the committed tree.
+    /// </summary>
+    internal IReadOnlyList<uint> CollectAllPages(ulong transactionId)
+    {
+        var pages = new List<uint>();
+        var seen = new HashSet<uint>();
+        var stack = new Stack<uint>();
+        stack.Push(_rootPageId);
+
+        var buffer = RentPageBuffer();
+        try
+        {
+            while (stack.Count > 0)
+            {
+                uint pageId = stack.Pop();
+                if (pageId == 0) continue;
+                if (!seen.Add(pageId))
+                {
+                    // Every node has exactly one parent, so reaching a page twice means a cycle or a
+                    // shared child. The set keeps the walk finite and the page counted once, but the
+                    // tree is corrupt.
+                    Debug.Fail($"R-tree page {pageId} is reachable more than once from root {_rootPageId}.");
+                    continue;
+                }
+                pages.Add(pageId);
+
+                _storage.ReadPage(pageId, transactionId == 0 ? null : transactionId, buffer);
+                if (SpatialPage.GetIsLeaf(buffer)) continue;
+
+                ushort count = SpatialPage.GetEntryCount(buffer);
+                for (int i = 0; i < count; i++)
+                {
+                    SpatialPage.ReadEntry(buffer, i, out _, out var pointer);
+                    stack.Push(pointer.PageId);
+                }
+            }
+        }
+        finally { ReturnPageBuffer(buffer); }
+        return pages;
     }
 
     public void Insert(GeoBox mbr, DocumentLocation loc, ITransaction? transaction = null)
