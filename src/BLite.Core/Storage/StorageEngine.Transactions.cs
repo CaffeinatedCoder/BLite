@@ -17,7 +17,8 @@ public sealed partial class StorageEngine
         // holds it for longer than the read timeout, the transaction starts without the
         // replay: its reads may be stale, and the next transaction or commit catches up.
         if (_shm != null && _wal is Transactions.WriteAheadLog walForReplay
-            && _shm.ReadWalEndOffset() != Volatile.Read(ref _lastKnownWalEndOffset)
+            && (_shm.ReadWalEndOffset() != Volatile.Read(ref _lastKnownWalEndOffset)
+                || _shm.ReadWalGeneration() != Volatile.Read(ref _knownWalGeneration))
             && _commitLock.Wait(_config.LockTimeout.ReadTimeoutMs))
         {
             try { TryCatchUpWithSharedWal(walForReplay); }
@@ -67,16 +68,28 @@ public sealed partial class StorageEngine
     /// so the latest committed image of each page in it is the newest there is and replaces
     /// whatever this engine holds for that page, including an image it committed itself.
     /// </para>
+    /// <para>
+    /// If another process has truncated the WAL since (a new WAL generation), everything this
+    /// engine holds from the old WAL is discarded first and the new WAL is replayed from its start.
+    /// Without the SHM writer lock, a truncation during the replay makes it return <c>false</c>.
+    /// </para>
     /// </summary>
     private bool TryCatchUpWithSharedWal(Transactions.WriteAheadLog wal)
     {
-        long shmEnd = _shm!.ReadWalEndOffset();
+        long generation = _shm!.ReadWalGeneration();
+        long shmEnd = _shm.ReadWalEndOffset();
         long lastKnown = Volatile.Read(ref _lastKnownWalEndOffset);
 
-        // shmEnd < lastKnown: another process truncated the WAL after checkpointing it, and
-        // may have appended to it since. Replay the new WAL from its start.
-        if (shmEnd < lastKnown)
+        // Another process truncated the WAL: a new generation, or an end before the bookmark (as
+        // a process that does not count generations leaves it). It had checkpointed every record
+        // first, so the page files hold each page this engine replayed or read from the old WAL
+        // in that version or a newer one. Keeping them would serve stale reads and let a
+        // checkpoint write them back over the newer data (#197). Replay the new WAL from its start.
+        if (generation != Volatile.Read(ref _knownWalGeneration) || shmEnd < lastKnown)
+        {
+            DiscardSharedWalState(generation);
             lastKnown = 0;
+        }
 
         if (shmEnd > lastKnown)
         {
@@ -85,11 +98,17 @@ public sealed partial class StorageEngine
             {
                 newPages = wal.ReadCommittedPagesSince(lastKnown, shmEnd);
             }
-            catch
+            catch (Exception ex)
             {
                 // Stale reads until the next catch-up retries, never a skipped record.
+                ReportFailedCatchUp(wal, lastKnown, shmEnd, ex.Message);
                 return false;
             }
+
+            // Without the SHM writer lock (BeginTransaction), the WAL can be truncated and
+            // rewritten while it is read; the bytes read then belong to neither generation.
+            if (_shm.ReadWalGeneration() != generation)
+                return false;
 
             foreach (var (pid, data, walOffset) in newPages)
             {
@@ -101,7 +120,84 @@ public sealed partial class StorageEngine
         }
 
         Volatile.Write(ref _lastKnownWalEndOffset, shmEnd);
+        _failedCatchUps = 0;
         return true;
+    }
+
+    /// <summary>
+    /// Counts the catch-ups in a row that could not replay the shared WAL, and reports the first
+    /// one and then every power of two as a warning (<see cref="Trace"/>): a WAL that stays
+    /// unreadable is visible without flooding the log. Until a catch-up succeeds, this engine's
+    /// reads may miss other processes' commits and its checkpoints write nothing, so it never
+    /// truncates the WAL. Called under <c>_commitLock</c>.
+    /// </summary>
+    private void ReportFailedCatchUp(Transactions.WriteAheadLog wal, long fromOffset, long toOffset, string reason)
+    {
+        int failures = ++_failedCatchUps;
+        if ((failures & (failures - 1)) != 0)
+            return;
+        Trace.TraceWarning(
+            $"BLite: could not replay the shared WAL '{wal.FilePath}' from offset {fromOffset} to {toOffset} " +
+            $"({failures} attempt(s) in a row): {reason}. Until it can, reads may miss other processes' commits " +
+            "and checkpoints write nothing, so the WAL is not truncated.");
+    }
+
+    /// <summary>
+    /// Drops every page this engine holds from an earlier generation of the shared WAL and
+    /// records <paramref name="generation"/> as the current one. Each of them is on disk in that
+    /// version or a newer one: the process that truncated the WAL had checkpointed it. Its own
+    /// commits are no exception, since a commit replays the WAL (and so notices a truncation)
+    /// before appending.
+    /// </summary>
+    private void DiscardSharedWalState(long generation)
+    {
+        lock (_replayLock)
+        {
+            _walIndex.Clear();
+            _walOffsets?.Clear();
+            _replayEpoch++;
+            Volatile.Write(ref _knownWalGeneration, generation);
+            Volatile.Write(ref _lastKnownWalEndOffset, 0);
+        }
+    }
+
+    /// <summary>
+    /// Reads the latest committed image of <paramref name="pageId"/> straight from the shared WAL
+    /// through the SHM page index (Phase 4), or returns <c>null</c> if the WAL has none or was
+    /// truncated while it was read. The image is cached in <c>_walIndex</c> only if this engine's
+    /// view of the WAL is still the one it was read from: a page cached after a discard would be a
+    /// stale image that a checkpoint could write back.
+    /// </summary>
+    private byte[]? ReadFromSharedWal(uint pageId)
+    {
+        if (_shm == null || _wal is not Transactions.WriteAheadLog walFile)
+            return null;
+
+        long epoch = Interlocked.Read(ref _replayEpoch);
+        long generation = _shm.ReadWalGeneration();
+        long walOffset = _shm.LookupPageOffset(pageId);
+        if (walOffset <= 0)
+            return null;
+
+        var pageData = walFile.ReadPageAt(walOffset, pageId);
+        if (pageData == null)
+            return null;
+
+        lock (_replayLock)
+        {
+            // Truncated meanwhile: the page files hold every record of the old WAL.
+            if (_shm.ReadWalGeneration() != generation)
+                return null;
+
+            // Populate local _walIndex and _walOffsets to amortise future reads
+            // and ensure CheckpointAsync respects the reader boundary (Phase 6).
+            if (_replayEpoch == epoch && _knownWalGeneration == generation)
+            {
+                _walIndex[pageId] = pageData;
+                _walOffsets?[pageId] = walOffset;
+            }
+        }
+        return pageData;
     }
 
     /// <summary>
@@ -144,8 +240,10 @@ public sealed partial class StorageEngine
     /// <param name="transactionId">Transaction ID</param>
     /// <param name="writeSet">All writes to record in WAL</param>
     /// <returns>True if preparation succeeded</returns>
+    /// <exception cref="NotSupportedException">Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>).</exception>
     public async Task<bool> PrepareTransactionAsync(ulong transactionId)
     {
+        ThrowIfMultiProcessAccess(nameof(PrepareTransactionAsync));
         try
         {
             await _wal.WriteBeginRecordAsync(transactionId);
@@ -165,8 +263,10 @@ public sealed partial class StorageEngine
         }
     }
 
+    /// <exception cref="NotSupportedException">Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>).</exception>
     public async Task<bool> PrepareTransactionAsync(ulong transactionId, CancellationToken ct = default)
     {
+        ThrowIfMultiProcessAccess(nameof(PrepareTransactionAsync));
         try
         {
             await _wal.WriteBeginRecordAsync(transactionId, ct);
@@ -198,11 +298,16 @@ public sealed partial class StorageEngine
     /// </summary>
     /// <param name="transactionId">Transaction to commit</param>
     /// <param name="writeSet">All writes performed in this transaction (unused, kept for compatibility)</param>
+    /// <exception cref="NotSupportedException">
+    /// Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>); commit through
+    /// <see cref="Transaction.CommitAsync"/> or <c>CommitTransactionAsync(transactionId, cancellationToken)</c>.
+    /// </exception>
     public async Task CommitTransactionAsync(ulong transactionId)
     {
-        // NOTE: No admission gate here — the caller (CommitTransactionAsync(Transaction, ct))
-        // already acquired the gate. This method is also called from the group commit writer
-        // which should not be gated.
+        ThrowIfMultiProcessAccess(nameof(CommitTransactionAsync) + "(ulong)");
+
+        // NOTE: No admission gate here. Nothing in the library calls this direct path;
+        // Transaction.CommitAsync goes through group commit (the CancellationToken overload).
         bool needsCheckpoint = false;
         bool completed = false;
 
@@ -372,8 +477,10 @@ public sealed partial class StorageEngine
     /// Used for 2PC: after PrepareAsync() writes to WAL, this finalizes the commit.
     /// </summary>
     /// <param name="transactionId">Transaction to mark committed</param>
+    /// <exception cref="NotSupportedException">Multi-process mode (see <see cref="ThrowIfMultiProcessAccess"/>).</exception>
     public async Task MarkTransactionCommittedAsync(ulong transactionId)
     {
+        ThrowIfMultiProcessAccess(nameof(MarkTransactionCommittedAsync));
         bool needsCheckpoint = false;
 
         _commitLock.Wait();
@@ -410,6 +517,25 @@ public sealed partial class StorageEngine
     }
 
     /// <summary>
+    /// Rejects the direct commit path (<c>CommitTransactionAsync(ulong)</c>) and two-phase commit
+    /// (<see cref="PrepareTransactionAsync(ulong)"/>, <see cref="MarkTransactionCommittedAsync"/>) in
+    /// multi-process mode. They append to the shared WAL at this engine's own write position,
+    /// without the cross-process writer lock, without catching up with the shared WAL first and
+    /// without publishing the new WAL end (#188). Their records can overwrite another process's,
+    /// and stay invisible to other processes, which then checkpoint and truncate the WAL without
+    /// them. This engine then discards them along with everything else it holds from the old WAL,
+    /// so the commit is lost. Group commit (<see cref="Transaction.CommitAsync"/>) does all of
+    /// that under both locks.
+    /// </summary>
+    private void ThrowIfMultiProcessAccess(string operation)
+    {
+        if (_shm != null)
+            throw new NotSupportedException(
+                $"{operation} is not supported with PageFileConfig.AllowMultiProcessAccess. " +
+                "Commit through Transaction.CommitAsync or CommitTransactionAsync(transactionId, cancellationToken).");
+    }
+
+    /// <summary>
     /// Rolls back a transaction: discards all uncommitted changes.
     /// </summary>
     /// <param name="transactionId">Transaction to rollback</param>
@@ -418,7 +544,13 @@ public sealed partial class StorageEngine
         _walCache.TryRemove(transactionId, out _);
         try
         {
-            await _wal.WriteAbortRecordAsync(transactionId);
+            // The abort record is advisory: replay and recovery only apply transactions with a
+            // commit record. In multi-process mode it would be appended outside the commit path,
+            // without the SHM writer lock and at this engine's own write position, which other
+            // processes' appends or a truncation may have made stale. Written there, it overwrites
+            // their records or leaves a gap of zeros that ends every other process's replay early.
+            if (_shm == null)
+                await _wal.WriteAbortRecordAsync(transactionId);
         }
         finally
         {

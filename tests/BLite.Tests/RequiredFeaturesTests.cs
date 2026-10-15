@@ -120,12 +120,38 @@ public class RequiredFeaturesTests : IDisposable
 
     /// <summary>Removes the last <paramref name="bytes"/> bytes of the collection's stored record.</summary>
     private void ShortenRecord(string collection, int bytes)
+        => SetRecordLength(collection, (length, _) => length - bytes);
+
+    /// <summary>Cuts the collection's stored record to its name and the next <paramref name="bytes"/> bytes.</summary>
+    private void CutRecordAfterName(string collection, int bytes)
+        => SetRecordLength(collection, (_, nameLength) => nameLength + bytes);
+
+    private void SetRecordLength(string collection, Func<int, int, int> newLength)
     {
         using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
-        var page = new byte[storage.PageSize];
+        var (pageId, page, slotOffset, slot, nameLength) = FindRecord(storage, collection)
+            ?? throw new InvalidOperationException($"No record for '{collection}'.");
+        slot.Length = (ushort)newLength(slot.Length, nameLength);
+        slot.WriteTo(page.AsSpan(slotOffset));
+        storage.WritePageImmediate(pageId, page);
+    }
+
+    /// <summary>The bytes of the collection's live stored record, or <c>null</c> if there is none.</summary>
+    private byte[]? RecordBytes(string collection)
+    {
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+        return FindRecord(storage, collection) is { } record
+            ? record.Page.AsSpan(record.Slot.Offset, record.Slot.Length).ToArray()
+            : null;
+    }
+
+    private static (uint PageId, byte[] Page, int SlotOffset, SlotEntry Slot, int NameLength)? FindRecord(
+        StorageEngine storage, string collection)
+    {
         uint pageId = 1;
         while (pageId != 0)
         {
+            var page = new byte[storage.PageSize];
             storage.ReadPage(pageId, null, page);
             var header = SlottedPageHeader.ReadFrom(page);
             for (ushort i = 0; i < header.SlotCount; i++)
@@ -135,15 +161,11 @@ public class RequiredFeaturesTests : IDisposable
                 if ((slot.Flags & SlotFlags.Deleted) != 0) continue;
                 using var reader = new BinaryReader(new MemoryStream(page, slot.Offset, slot.Length, false));
                 if (reader.ReadString() != collection) continue;
-
-                slot.Length -= (ushort)bytes;
-                slot.WriteTo(page.AsSpan(offset));
-                storage.WritePageImmediate(pageId, page);
-                return;
+                return (pageId, page, offset, slot, (int)reader.BaseStream.Position);
             }
             pageId = header.NextOverflowPage;
         }
-        throw new InvalidOperationException($"No record for '{collection}'.");
+        return null;
     }
 
     // ── Typed collections ────────────────────────────────────────────────────
@@ -265,6 +287,37 @@ public class RequiredFeaturesTests : IDisposable
         var stored = storage.GetCollectionMetadata("future")!;
         Assert.Equal(0, stored.SequenceValue);
         Assert.Equal(new[] { FutureIndex }, stored.RequiredFeatures);
+    }
+
+    [Fact]
+    public async Task RecordThisVersionCannotParse_IsNeitherOverwrittenNorDropped()
+    {
+        // E.g. a record a newer version extended inline: this version cannot read it, so it cannot
+        // check its features either. GetCollectionMetadata returns null for it, so without the
+        // refusal a dynamic open would save a fresh, empty record over it.
+        await SeedDynamicAsync("future", "items");
+        CutRecordAfterName("future", 6); // the primary root page id and half the schema root page id
+        var stored = RecordBytes("future");
+
+        using (var storage = new StorageEngine(_dbPath, PageFileConfig.Default))
+        {
+            Assert.Null(storage.GetCollectionMetadata("future"));
+            var ex = Assert.Throws<NotSupportedException>(() =>
+                storage.SaveCollectionMetadata(new CollectionMetadata { Name = "future" }));
+            Assert.Contains("'future'", ex.Message);
+            Assert.Throws<NotSupportedException>(() => storage.DeleteCollectionMetadata("future"));
+        }
+
+        using (var engine = new BLiteEngine(_dbPath))
+        {
+            Assert.Throws<NotSupportedException>(() => engine.GetOrCreateCollection("future"));
+
+            var items = engine.GetOrCreateCollection("items");
+            await items.InsertAsync(engine.CreateDocument(["name"], b => b.AddString("name", "items-2")));
+            Assert.Equal(2, await items.FindAllAsync().CountAsync());
+        }
+
+        Assert.Equal(stored, RecordBytes("future"));
     }
 
     [Fact]

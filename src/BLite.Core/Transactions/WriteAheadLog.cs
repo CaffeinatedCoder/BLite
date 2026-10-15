@@ -42,6 +42,9 @@ public sealed class WriteAheadLog : IWriteAheadLog
 {
     private readonly string _walPath;
     private FileStream? _walStream;
+
+    /// <summary>Path of the WAL file (diagnostics).</summary>
+    internal string FilePath => _walPath;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private bool _disposed;
     private readonly int _writeTimeoutMs;

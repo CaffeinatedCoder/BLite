@@ -319,8 +319,8 @@ public class StringIndexPrefixMatchTests : IDisposable
         await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "p70" });
         await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "p7" });
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => _db.PeopleV2.InsertAsync(new PersonV2 { Name = "p7" }).AsTask());
-        await Assert.ThrowsAsync<InvalidOperationException>(() => _db.PeopleV2.InsertAsync(new PersonV2 { Name = "p70" }).AsTask());
+        await Assert.ThrowsAsync<BLiteValidationException>(() => _db.PeopleV2.InsertAsync(new PersonV2 { Name = "p7" }).AsTask());
+        await Assert.ThrowsAsync<BLiteValidationException>(() => _db.PeopleV2.InsertAsync(new PersonV2 { Name = "p70" }).AsTask());
 
         Assert.Single(_db.PeopleV2.AsQueryable().Where(p => p.Name == "p7").ToList());
     }

@@ -60,12 +60,11 @@ internal class EnumerableRewriter : ExpressionVisitor
             for (int i = 0; i < node.Arguments.Count; i++)
             {
                 var arg = Visit(node.Arguments[i]);
-                // Strip Quote wrapping around lambda arguments.
+                // Strip Quote wrapping around lambda arguments. The lambda stays in the tree and is
+                // compiled with the enclosing expression: compiling it on its own would fail when
+                // it refers to the parameter of an outer lambda (q.Count(x => q.Any(y => y.Age == x.Age))).
                 if (arg is UnaryExpression { NodeType: ExpressionType.Quote } quote)
-                {
-                    var lambda = (LambdaExpression)quote.Operand;
-                    arg = Expression.Constant(lambda.Compile());
-                }
+                    arg = quote.Operand;
                 args[i] = arg;
             }
 
@@ -78,9 +77,18 @@ internal class EnumerableRewriter : ExpressionVisitor
             {
                 if (candidate.GetGenericArguments().Length != typeArgs.Length) continue;
                 if (candidate.GetParameters().Length != args.Length) continue;
-                MethodInfo closed = null!;
-                try { closed = candidate.MakeGenericMethod(typeArgs); }
-                catch { continue; }
+                MethodInfo closed;
+                if (typeArgs.Length == 0)
+                {
+                    // Non-generic overloads such as Sum(IEnumerable<int>) / Average(IEnumerable<long>):
+                    // MakeGenericMethod would throw on them.
+                    closed = candidate;
+                }
+                else
+                {
+                    try { closed = candidate.MakeGenericMethod(typeArgs); }
+                    catch { continue; }
+                }
                 try { return Expression.Call(closed, args); }
                 catch { continue; }
             }

@@ -326,8 +326,8 @@ public class VectorSearchTests
 
         using (var db = new TestDbContext(dbPath))
         {
-            // The index expects dim=3; passing a 5-element vector must throw
-            await Assert.ThrowsAsync<ArgumentException>(async () =>
+            // The index expects dim=3; a 5-element vector is rejected before anything is written
+            await Assert.ThrowsAsync<BLiteValidationException>(async () =>
                 await db.VectorItems.InsertAsync(new VectorEntity { Title = "Bad", Embedding = [1.0f, 2.0f, 3.0f, 4.0f, 5.0f] }));
         }
 

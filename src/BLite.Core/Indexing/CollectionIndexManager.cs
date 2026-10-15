@@ -128,6 +128,66 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         }
     }
 
+    /// <summary>The name an index on <paramref name="keySelector"/> gets when none is given.</summary>
+    internal static string ResolveIndexName(LambdaExpression keySelector, string? name)
+        => name ?? GenerateIndexName(ExpressionAnalyzer.ExtractPropertyPaths(keySelector));
+
+    /// <summary>
+    /// Builds an index definition from an untyped key selector, as declared in the model.
+    /// </summary>
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    internal static CollectionIndexDefinition<T> BuildDefinition(
+        LambdaExpression keySelector,
+        string? name,
+        bool unique,
+        IndexType type,
+        int dimensions,
+        VectorMetric metric)
+    {
+        var propertyPaths = ExpressionAnalyzer.ExtractPropertyPaths(keySelector);
+        var body = keySelector.Body.Type == typeof(object)
+            ? keySelector.Body
+            : Expression.Convert(keySelector.Body, typeof(object));
+        var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
+
+        return new CollectionIndexDefinition<T>(
+            name ?? GenerateIndexName(propertyPaths), propertyPaths, lambda, unique, type, false, dimensions, metric);
+    }
+
+    /// <summary>
+    /// Creates an index for <paramref name="definition"/> without registering or persisting it,
+    /// so it can be filled before queries or the collection metadata see it. The index owns its
+    /// root page: hand it to <see cref="Register"/> or <see cref="ReplaceIndex"/>, or release its
+    /// pages.
+    /// </summary>
+    internal CollectionSecondaryIndex<TId, T> CreateUnregistered(CollectionIndexDefinition<T> definition)
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
+
+            return new CollectionSecondaryIndex<TId, T>(definition, _storage, _mapper);
+        }
+    }
+
+    /// <summary>
+    /// Registers an index built by <see cref="CreateUnregistered"/> and persists it. If the
+    /// metadata cannot be saved, the index is not registered and remains the caller's to release.
+    /// </summary>
+    internal void Register(CollectionSecondaryIndex<TId, T> index)
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
+            if (_indexes.ContainsKey(index.Name))
+                throw new InvalidOperationException($"Index '{index.Name}' already exists");
+
+            PublishLocked(index.Name, index, previous: null);
+        }
+    }
+
     // ... methods ...
 
     /// <summary>
@@ -206,24 +266,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         }
     }
 
-    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    internal CollectionSecondaryIndex<TId, T> EnsureIndexUntyped(
-        LambdaExpression keySelector,
-        string? name = null,
-        bool unique = false)
-    {
-        // Convert LambdaExpression to Expression<Func<T, object>> properly by sharing parameters
-        var body = keySelector.Body;
-        if (body.Type != typeof(object))
-        {
-            body = Expression.Convert(body, typeof(object));
-        }
-        
-        var lambda = Expression.Lambda<Func<T, object>>(body, keySelector.Parameters);
-
-        return EnsureIndex(lambda, name, unique);
-    }
-
+    [Obsolete("Use model HasVectorIndex/HasSpatialIndex or CreateIndex(definition); will be removed in 6.0")]
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     public CollectionSecondaryIndex<TId, T> CreateVectorIndexUntyped(
         LambdaExpression keySelector,
@@ -252,6 +295,7 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
         }
     }
 
+    [Obsolete("Use model HasVectorIndex/HasSpatialIndex or CreateIndex(definition); will be removed in 6.0")]
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     public CollectionSecondaryIndex<TId, T> CreateSpatialIndexUntyped(
         LambdaExpression keySelector,
@@ -308,45 +352,6 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
     }
 
     /// <summary>
-    /// Replaces an index with an empty one of the same definition, freeing the old tree's pages.
-    /// The new index keeps the old <see cref="CollectionSecondaryIndex{TId,T}.KeyFormat"/>: the
-    /// caller repopulates it and then records the new format with <see cref="SetKeyFormat"/>, so an
-    /// interrupted rebuild is simply redone on the next open.
-    /// </summary>
-    internal CollectionSecondaryIndex<TId, T> RecreateIndex(string name)
-    {
-        lock (_lock)
-        {
-            if (!_indexes.TryGetValue(name, out var old))
-                throw new InvalidOperationException($"Index '{name}' does not exist");
-
-            var fresh = CreateUnregisteredCopy(name);
-            fresh.KeyFormat = old.KeyFormat;
-            ReplaceIndex(name, fresh);
-            return fresh;
-        }
-    }
-
-    /// <summary>
-    /// Creates an empty index with the same definition as <paramref name="name"/> without
-    /// registering it, so queries keep using the existing index while the copy is populated.
-    /// The copy owns its root page: hand it to <see cref="ReplaceIndex"/> or release it with
-    /// <see cref="CollectionSecondaryIndex{TId,T}.FreeAllPages"/>.
-    /// </summary>
-    internal CollectionSecondaryIndex<TId, T> CreateUnregisteredCopy(string name)
-    {
-        lock (_lock)
-        {
-            if (_disposed)
-                throw new ObjectDisposedException(nameof(CollectionIndexManager<TId, T>));
-            if (!_indexes.TryGetValue(name, out var old))
-                throw new InvalidOperationException($"Index '{name}' does not exist");
-
-            return new CollectionSecondaryIndex<TId, T>(old.Definition, _storage, _mapper);
-        }
-    }
-
-    /// <summary>
     /// Registers <paramref name="fresh"/> under <paramref name="name"/>, persists its root page
     /// and frees the pages of the index it replaces. If the metadata cannot be saved, the old
     /// index stays registered and <paramref name="fresh"/> remains the caller's to release.
@@ -360,26 +365,40 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             if (!_indexes.TryGetValue(name, out var old))
                 throw new InvalidOperationException($"Index '{name}' does not exist");
 
-            _indexes[name] = fresh;
-            _cachedIndexInfo = null; // invalidate cache
-            RefreshHasUniqueBTreeIndex();
-
             // Persist the new root before freeing the old tree: a crash in between leaks the old
             // pages, whereas the reverse order would let the next open free them a second time.
-            try
-            {
-                SaveMetadata();
-            }
-            catch
-            {
-                // Keep the old index registered, matching the metadata on disk; the caller still
-                // owns the copy.
-                _indexes[name] = old;
-                UpdateMetadata();
-                throw;
-            }
+            PublishLocked(name, fresh, old);
             old.FreeAllPages(_storage);
             old.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Registers <paramref name="index"/> under <paramref name="name"/> in place of
+    /// <paramref name="previous"/> (null: none) and saves the metadata. If the save fails, the
+    /// previous registration is restored, so memory keeps matching the metadata on disk, and the
+    /// exception propagates. Must be called under <see cref="_lock"/>.
+    /// </summary>
+    private void PublishLocked(string name, CollectionSecondaryIndex<TId, T> index, CollectionSecondaryIndex<TId, T>? previous)
+    {
+        _indexes[name] = index;
+        _cachedIndexInfo = null; // invalidate cache
+        RefreshHasUniqueBTreeIndex();
+
+        try
+        {
+            SaveMetadata();
+        }
+        catch
+        {
+            if (previous != null)
+                _indexes[name] = previous;
+            else
+                _indexes.Remove(name);
+            _cachedIndexInfo = null;
+            RefreshHasUniqueBTreeIndex();
+            UpdateMetadata();
+            throw;
         }
     }
 
@@ -541,6 +560,25 @@ public sealed class CollectionIndexManager<TId, T> : IDisposable where T : class
             foreach (var index in _indexes.Values)
             {
                 index.EnsureUnique(document, oldDocument, transaction);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="document"/>'s key could not
+    /// be written to one of the indexes (vector dimension mismatch, key too large).
+    /// Call before any page is written, together with <see cref="EnsureUniqueInAll"/>.
+    /// </summary>
+    public void ValidateKeysInAll(T document)
+    {
+        if (document == null)
+            throw new ArgumentNullException(nameof(document));
+
+        lock (_lock)
+        {
+            foreach (var index in _indexes.Values)
+            {
+                index.ValidateKey(document);
             }
         }
     }
