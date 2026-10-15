@@ -153,7 +153,23 @@ public sealed class WalSharedMemory : IDisposable
             bufferSize: 4096,
             FileOptions.None);
 
-        bool needInit = _backingFile.Length < WalSharedMemoryLayout.HeaderSize;
+        // Size, map and validate / initialise the header under the open lock, so a process that
+        // opens a brand-new SHM never sees the header half-written by another one and zeroes it
+        // (and whatever that process has stored in it since) as "corrupt" (#216).
+        AcquireOpenLock();
+        try
+        {
+            MapAndInitialize();
+        }
+        finally
+        {
+            ReleaseOpenLock();
+        }
+    }
+
+    private void MapAndInitialize()
+    {
+        bool needInit = _backingFile!.Length < WalSharedMemoryLayout.HeaderSize;
 
         // Grow the file to the required size before mapping.
         if (_backingFile.Length < _shmFileSize)
@@ -183,13 +199,8 @@ public sealed class WalSharedMemory : IDisposable
         }
 
         // Validate magic / version / page-size; if anything is wrong, re-init in place.
-        // Two processes opening a brand-new SHM concurrently may both reach this branch
-        // and both call InitializeHeader; that is benign because the writes are
-        // idempotent (the same magic / version / page-size constants and zero atomic
-        // counters), and any concurrent reader observing a partially-written header
-        // will simply fail validation and re-initialize on its next open. The
-        // cross-process writer lock (Phase 3) is what actually serialises *mutations*
-        // to the counters; the header itself is write-once-with-fixed-content.
+        // The open lock held by the caller makes this check-then-initialise atomic across
+        // processes: only the first opener of a new SHM initialises it.
         if (needInit)
         {
             InitializeHeader();
@@ -395,6 +406,32 @@ public sealed class WalSharedMemory : IDisposable
         ThrowIfDisposed();
         return Volatile.Read(ref RefInt(WalSharedMemoryLayout.OffsetWriterOwnerPid));
     }
+
+    // ── Cross-process open lock ─────────────────────────────────────────────
+
+    /// <summary>
+    /// How long <see cref="AcquireOpenLock"/> waits for another process (or engine) that is
+    /// creating or opening the same database. Generous, because the holder may be replaying a
+    /// large WAL; the OS releases the lock if the holder dies.
+    /// </summary>
+    internal const int OpenLockTimeoutMs = 60_000;
+
+    /// <summary>
+    /// Acquires the cross-process open lock (#216). It serialises creating and initialising the
+    /// database files: this SHM's header, and in <see cref="Storage.StorageEngine"/> the page
+    /// files (create if missing, header), WAL recovery and the dictionary / KV roots. It is
+    /// independent of the writer lock and always taken before it, never while holding it.
+    /// </summary>
+    /// <exception cref="TimeoutException">Not acquired within <see cref="OpenLockTimeoutMs"/>.</exception>
+    internal void AcquireOpenLock()
+    {
+        if (!WalShmFcntl.TryAcquireWriteLock(_backingFile!, OpenLockTimeoutMs, WalShmFcntl.OpenLockSlot))
+            throw new TimeoutException(
+                $"Timed out after {OpenLockTimeoutMs} ms waiting for another process to finish opening the database ('{_shmPath}').");
+    }
+
+    /// <summary>Releases the open lock taken by <see cref="AcquireOpenLock"/>.</summary>
+    internal void ReleaseOpenLock() => WalShmFcntl.ReleaseWriteLock(_backingFile!, WalShmFcntl.OpenLockSlot);
 
     // ── Cross-process writer lock ───────────────────────────────────────────
 

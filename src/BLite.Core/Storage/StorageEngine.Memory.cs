@@ -253,7 +253,10 @@ public sealed partial class StorageEngine
                 }
 
                 var pf = new PageFile(filePath, collConfig);
-                pf.Open();
+                // Creating a collection file races with other processes just like the main
+                // file does (#216).
+                using (EnterOpenLock())
+                    pf.Open();
                 return pf;
             })).Value;
     }

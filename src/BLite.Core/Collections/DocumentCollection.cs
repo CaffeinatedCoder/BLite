@@ -850,6 +850,10 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         _collectionName = collectionName ?? _mapper.CollectionName;
         _collectionLock = _storage.CreateCollectionWriteLock();
 
+        // Multi-process mode: create or open the catalog entry, schema and index roots of the
+        // collection under the cross-process open lock (#216). No-op in single-process mode.
+        using var openLock = _storage.EnterOpenLock();
+
         // Initialize secondary index manager first (loads metadata including Primary Root Page ID)
         _indexManager = new CollectionIndexManager<TId, T>(_storage, _mapper, _collectionName);
         _fsi = freeSpaceIndex ?? new FreeSpaceIndex(_storage.PageSize);

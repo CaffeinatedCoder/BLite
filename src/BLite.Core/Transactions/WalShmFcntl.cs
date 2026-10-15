@@ -55,8 +55,8 @@ internal static class WalShmFcntl
     private const int O_RDONLY_MACOS = 0x0000; // flock() needs no write access
     private const int O_CLOEXEC_MACOS = 0x01000000;
 
-    // Lock descriptor held while the macOS writer lock is taken, keyed by SHM path.
-    // At most one entry per path: the in-process semaphore serialises holders.
+    // Lock descriptor held while a macOS lock is taken, keyed by LockKey (SHM path and slot).
+    // At most one entry per key: the in-process semaphore serialises holders.
     private static readonly ConcurrentDictionary<string, int> s_macLockFds
         = new(StringComparer.Ordinal);
 
@@ -84,6 +84,24 @@ internal static class WalShmFcntl
     // POSIX/Linux allow locking bytes past EOF; LockFileEx on Windows also permits this.
     private const long WriterLockByteOffset = 1L << 30; // 1 GiB
 
+    // ── Lock slots ───────────────────────────────────────────────────────────
+    // Independent exclusive locks taken through the same primitives. Windows and Linux lock
+    // byte WriterLockByteOffset + slot of the SHM file; macOS flocks one lock file per slot
+    // (see LockKey). Slot 0 is the WAL writer lock. Slot 1 is the open lock, which serialises
+    // creating and initialising the database files across processes (#216); it is taken
+    // before, and never while holding, the writer lock.
+    internal const int WriterLockSlot = 0;
+    internal const int OpenLockSlot = 1;
+
+    // Per-slot key: the in-process semaphore and the macOS lock descriptor are keyed by it, and
+    // the macOS lock file is "<key>.lock" (<shm>.lock for the writer lock, <shm>.open.lock for
+    // the open lock).
+    private static string LockKey(FileStream shmFile, int slot)
+    {
+        var path = System.IO.Path.GetFullPath(shmFile.Name);
+        return slot == WriterLockSlot ? path : path + ".open";
+    }
+
     // In-process, per-SHM-path coordination. On macOS/iOS the kernel-level F_SETLK is
     // per-process, so two WalSharedMemory instances in the *same* process backed by
     // the same SHM file would not exclude each other via fcntl alone. On Windows,
@@ -93,13 +111,12 @@ internal static class WalShmFcntl
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> s_localLocksByPath
         = new(StringComparer.Ordinal);
 
-    private static SemaphoreSlim GetLocalLock(FileStream shmFile)
+    private static SemaphoreSlim GetLocalLock(FileStream shmFile, int slot)
     {
         // Use the absolute, normalised path as the key. Two FileStream instances open
         // on the same file — even via different relative paths — must hash to the
         // same SemaphoreSlim.
-        var key = System.IO.Path.GetFullPath(shmFile.Name);
-        return s_localLocksByPath.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        return s_localLocksByPath.GetOrAdd(LockKey(shmFile, slot), _ => new SemaphoreSlim(1, 1));
     }
 
     // ── Unix structs / imports ────────────────────────────────────────────────
@@ -182,11 +199,11 @@ internal static class WalShmFcntl
     /// contention, and silently retrying would hide it as a bogus timeout.
     /// </para>
     /// </summary>
-    public static bool TryAcquireWriteLock(FileStream shmFile, int timeoutMs)
+    public static bool TryAcquireWriteLock(FileStream shmFile, int timeoutMs, int slot = WriterLockSlot)
     {
         // Take the in-process lock first so two engines in the same process can't both
         // succeed at the OS-level lock. Mandatory pair with the release in ReleaseWriteLock.
-        var localLock = GetLocalLock(shmFile);
+        var localLock = GetLocalLock(shmFile, slot);
         if (!localLock.Wait(timeoutMs <= 0 ? 0 : timeoutMs))
             return false;
 
@@ -198,7 +215,7 @@ internal static class WalShmFcntl
             int sleepMs = 1;
             while (true)
             {
-                if (TryLockFileEx(shmFile)) return true;
+                if (TryLockFileEx(shmFile, slot)) return true;
                 if (DateTime.UtcNow >= deadline)
                 {
                     localLock.Release();
@@ -226,7 +243,7 @@ internal static class WalShmFcntl
                 bool locked;
                 try
                 {
-                    locked = TrySetLock(shmFile, fd, write: true, out errno);
+                    locked = TrySetLock(shmFile, fd, slot, write: true, out errno);
                 }
                 catch
                 {
@@ -255,39 +272,40 @@ internal static class WalShmFcntl
     }
 
     /// <summary>Releases the writer lock previously acquired via <see cref="TryAcquireWriteLock"/>.</summary>
-    public static void ReleaseWriteLock(FileStream shmFile)
+    public static void ReleaseWriteLock(FileStream shmFile, int slot = WriterLockSlot)
     {
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // Unlock failures are best-effort; ignore them to avoid masking primary errors.
-                TryUnlockFileEx(shmFile);
+                TryUnlockFileEx(shmFile, slot);
             }
             else
             {
                 int fd = shmFile.SafeFileHandle.DangerousGetHandle().ToInt32();
                 // Unlock failures here are best-effort; surfacing them would mask the
                 // primary error path (e.g. dispose during shutdown).
-                TrySetLock(shmFile, fd, write: false, out _);
+                TrySetLock(shmFile, fd, slot, write: false, out _);
             }
         }
         finally
         {
             // Always release the in-process companion lock, even if the OS-level
             // unlock above threw.
-            GetLocalLock(shmFile).Release();
+            GetLocalLock(shmFile, slot).Release();
         }
     }
 
     // ── Windows helpers ──────────────────────────────────────────────────────
 
-    private static bool TryLockFileEx(FileStream shmFile)
+    private static bool TryLockFileEx(FileStream shmFile, int slot)
     {
+        long offset = WriterLockByteOffset + slot;
         var ov = new OVERLAPPED
         {
-            OffsetLow  = (uint)(WriterLockByteOffset & 0xFFFFFFFF),
-            OffsetHigh = (uint)(WriterLockByteOffset >> 32),
+            OffsetLow  = (uint)(offset & 0xFFFFFFFF),
+            OffsetHigh = (uint)(offset >> 32),
         };
         // LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY → non-blocking try for one byte.
         return LockFileEx(
@@ -299,12 +317,13 @@ internal static class WalShmFcntl
             ref ov);
     }
 
-    private static void TryUnlockFileEx(FileStream shmFile)
+    private static void TryUnlockFileEx(FileStream shmFile, int slot)
     {
+        long offset = WriterLockByteOffset + slot;
         var ov = new OVERLAPPED
         {
-            OffsetLow  = (uint)(WriterLockByteOffset & 0xFFFFFFFF),
-            OffsetHigh = (uint)(WriterLockByteOffset >> 32),
+            OffsetLow  = (uint)(offset & 0xFFFFFFFF),
+            OffsetHigh = (uint)(offset >> 32),
         };
         UnlockFileEx(
             shmFile.SafeFileHandle.DangerousGetHandle(),
@@ -323,13 +342,13 @@ internal static class WalShmFcntl
             || errno == EAGAIN_MACOS;
     }
 
-    private static bool TrySetLock(FileStream shmFile, int fd, bool write, out int errno)
+    private static bool TrySetLock(FileStream shmFile, int fd, int slot, bool write, out int errno)
     {
         // Use RuntimeInformation rather than OperatingSystem.* so this file compiles
         // for both net10.0 and netstandard2.1 target frameworks.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            var key = System.IO.Path.GetFullPath(shmFile.Name);
+            var key = LockKey(shmFile, slot);
             if (!write)
             {
                 if (s_macLockFds.TryRemove(key, out var heldFd))
@@ -384,7 +403,7 @@ internal static class WalShmFcntl
             {
                 l_type = write ? F_WRLCK_LINUX : F_UNLCK_LINUX,
                 l_whence = SEEK_SET,
-                l_start = WriterLockByteOffset,
+                l_start = WriterLockByteOffset + slot,
                 l_len = 1,
                 l_pid = 0,
             };

@@ -66,19 +66,30 @@ public sealed partial class StorageEngine
             _dictionaryRootPageId = header.DictionaryRootPageId;
             
             // Warm cache
-            ushort maxId = DictionaryPage.ReservedValuesEnd;
-            foreach (var (key, val) in DictionaryPage.FindAllGlobal(this, _dictionaryRootPageId))
-            {
-                var lowerKey = key.ToLowerInvariant();
-                _dictionaryCache[lowerKey] = val;
-                _dictionaryReverseCache[val] = lowerKey;
-                if (val > maxId) maxId = val;
-            }
-            _nextDictionaryId = (ushort)(maxId + 1);
+            LoadDictionaryCore();
         }
 
         // Pre-register internal keys used for Schema persistence
         RegisterKeys(new[] { "_id", "t", "_v", "f", "n", "b", "s", "a" });
+    }
+
+    // Loads every entry of the dictionary pages into the caches and moves _nextDictionaryId past
+    // the highest id. Called with _dictionaryLock held, or from the constructor.
+    private void LoadDictionaryCore()
+    {
+        ushort maxId = DictionaryPage.ReservedValuesEnd;
+        bool added = false;
+        foreach (var (key, val) in DictionaryPage.FindAllGlobal(this, _dictionaryRootPageId))
+        {
+            var lowerKey = key.ToLowerInvariant();
+            added |= _dictionaryCache.TryAdd(lowerKey, val);
+            _dictionaryReverseCache[val] = lowerKey;
+            if (val > maxId) maxId = val;
+        }
+        if (maxId >= _nextDictionaryId)
+            _nextDictionaryId = (ushort)(maxId + 1);
+        if (added)
+            _frozenKeyMapCache = null; // invalidate snapshot
     }
 
     public ConcurrentDictionary<string, ushort> GetKeyMap() => _dictionaryCache;
@@ -157,12 +168,24 @@ public sealed partial class StorageEngine
             return id;
         }
 
+        // Multi-process mode: another process may have added keys since this engine loaded the
+        // dictionary. Under the open lock (always taken before _dictionaryLock), reload it from
+        // the dictionary pages, so this engine reuses that process's id for the key, or takes an
+        // id after all of its ids, instead of handing one id to two keys (#216).
+        using var openLock = EnterOpenLock();
         lock (_dictionaryLock)
         {
             // Double checked locking
             if (_dictionaryCache.TryGetValue(key, out id))
             {
                 return id;
+            }
+
+            if (_shm != null)
+            {
+                LoadDictionaryCore();
+                if (_dictionaryCache.TryGetValue(key, out id))
+                    return id;
             }
 
             // Try to find in storage (in case cache is incomplete or another process?)
