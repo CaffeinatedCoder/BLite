@@ -207,9 +207,6 @@ public sealed partial class StorageEngine
     /// Deserialises one collection record after its name. The only parser of this record: every
     /// section after the index list is optional and read only while bytes remain, so records written
     /// by older releases load with defaults for the sections they lack.
-    /// New per-index data goes only in a new trailing section, never inline in the index list: an
-    /// older version would misread the list and fail to load the record, so it could not refuse
-    /// the collection (see <see cref="CollectionFeatures"/>).
     /// </summary>
     /// <remarks>
     /// Format rule: new data goes only in new trailing sections, after the last one read here; new
