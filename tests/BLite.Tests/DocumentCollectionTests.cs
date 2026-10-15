@@ -43,7 +43,7 @@ public class DocumentCollectionTests : IDisposable
         await _db.Users.InsertAsync(new User { Id = id, Name = "Alice", Age = 30 });
         await _db.SaveChangesAsync();
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        var ex = await Assert.ThrowsAsync<BLite.Core.BLiteValidationException>(async () =>
             await _db.Users.InsertAsync(new User { Id = id, Name = "Bob", Age = 31 }));
         Assert.Contains("Duplicate key violation", ex.Message);
         Assert.Equal(1, await _db.Users.CountAsync());
