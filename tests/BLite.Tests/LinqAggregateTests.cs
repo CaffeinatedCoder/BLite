@@ -225,6 +225,23 @@ public class LinqAggregateTests : IDisposable
     }
 
     [Fact]
+    public async Task FilterWithASubqueryOverTheCollection_MatchesLinq()
+    {
+        using var db = new AggregateDbContext(_dbPath);
+        for (int i = 0; i < 20; i++)
+            await db.Readings.InsertAsync(new Reading { Id = new ObjectId(i + 1, 0), Count = i % 7, Total = i });
+
+        var entities = db.Readings.AsQueryable().ToList();
+        var q = db.Readings.AsQueryable();
+        Assert.Equal(
+            entities.Where(r => entities.Any(o => o.Count == r.Count + 1)).Sum(r => r.Count),
+            q.Where(r => q.Any(o => o.Count == r.Count + 1)).Sum(r => r.Count));
+        Assert.Equal(
+            entities.Where(r => r.Count > 2 && entities.Count(o => o.Total < r.Total) > 3).Max(r => r.Total),
+            q.Where(r => r.Count > 2 && q.Count(o => o.Total < r.Total) > 3).Max(r => r.Total));
+    }
+
+    [Fact]
     public async Task IndexKeySums_ThatCannotOverflow_AreTakenFromTheKeys()
     {
         // The positive values sum to exactly int.MaxValue and the negative ones to exactly
