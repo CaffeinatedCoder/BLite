@@ -70,8 +70,17 @@ internal sealed record RequiredFeature(string Id, FeatureRequirement Requirement
 /// </remarks>
 internal static class CollectionFeatures
 {
-    // Features this version implements. Empty until a feature that needs protecting ships.
-    private static readonly HashSet<string> s_known = new(StringComparer.Ordinal);
+    /// <summary>
+    /// Full-text indexes (#70), recorded while the collection has at least one. Needed to open: a
+    /// version without them reads a full-text index as a B-Tree index, so its query planner would
+    /// answer equality, range and IN lookups on the property from the postings, and its writes
+    /// would leave keys and stale postings behind.
+    /// </summary>
+    internal static readonly RequiredFeature FullTextIndexes =
+        new("fulltext-index", FeatureRequirement.Open, "full-text indexes (BLite 5.3 or later)");
+
+    // Features this version implements.
+    private static readonly HashSet<string> s_known = new(StringComparer.Ordinal) { FullTextIndexes.Id };
 
     // Highest IndexType this version knows; larger values come from newer versions. 0 is accepted:
     // older releases could persist an index whose type was never set.
@@ -87,6 +96,24 @@ internal static class CollectionFeatures
 
     /// <summary>Whether this version implements the feature with the given id.</summary>
     internal static bool IsKnown(string id) => s_known.Contains(id);
+
+    /// <summary>
+    /// Records the features the indexes in <paramref name="metadata"/> require and removes those
+    /// none of them requires any more (today: <see cref="FullTextIndexes"/> while there is a
+    /// full-text index). Call after changing the index list, before saving the record. Other
+    /// features, including ones this version does not know, are left as they are.
+    /// </summary>
+    /// <returns>Whether <paramref name="metadata"/> changed.</returns>
+    internal static bool SyncIndexFeatures(CollectionMetadata metadata)
+    {
+        bool needed = metadata.Indexes.Any(i => i.Type == IndexType.FullText);
+        bool recorded = metadata.RequiredFeatures.Any(f => f.Id == FullTextIndexes.Id);
+        if (needed == recorded) return false;
+
+        if (needed) metadata.RequiredFeatures.Add(FullTextIndexes);
+        else metadata.RequiredFeatures.RemoveAll(f => f.Id == FullTextIndexes.Id);
+        return true;
+    }
 
     /// <summary>
     /// Whether this version may open the collection: every feature it requires is known, except
@@ -141,11 +168,20 @@ internal static class CollectionFeatures
             "that wrote it.", cause);
 
     private static List<RequiredFeature> Unsupported(CollectionMetadata metadata, bool readOnly)
+        => Unsupported(metadata, readOnly, s_known, s_maxIndexType);
+
+    /// <summary>
+    /// The features that keep a version knowing only <paramref name="known"/> features and index
+    /// types up to <paramref name="maxIndexType"/> from opening (or, with <paramref name="readOnly"/>
+    /// false, modifying) the collection. Takes the version's knowledge as parameters so tests can
+    /// ask what an older version would refuse.
+    /// </summary>
+    internal static List<RequiredFeature> Unsupported(CollectionMetadata metadata, bool readOnly, ICollection<string> known, byte maxIndexType)
     {
         var result = new List<RequiredFeature>();
         foreach (var feature in metadata.RequiredFeatures)
         {
-            if (IsKnown(feature.Id)) continue;
+            if (known.Contains(feature.Id)) continue;
             if (readOnly && feature.Requirement == FeatureRequirement.Write) continue;
             result.Add(feature);
         }
@@ -155,7 +191,7 @@ internal static class CollectionFeatures
         foreach (var index in metadata.Indexes)
         {
             var type = (byte)index.Type;
-            if (type > s_maxIndexType)
+            if (type > maxIndexType)
                 result.Add(new RequiredFeature($"index-type-{type}", FeatureRequirement.Open,
                     $"index '{index.Name}' of type {type}, which this version does not know"));
         }

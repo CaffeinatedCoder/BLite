@@ -165,6 +165,21 @@ public interface IDocumentCollection<TId, T> where T : class
         bool unique = false,
         CancellationToken ct = default);
 
+    /// <inheritdoc cref="DocumentCollection{TId, T}.CreateFullTextIndexAsync"/>
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    Task<ICollectionIndex<TId, T>> CreateFullTextIndexAsync(
+        Expression<Func<T, string?>> keySelector,
+        string? name = null,
+        CancellationToken ct = default);
+
+    /// <inheritdoc cref="DocumentCollection{TId, T}.FullTextSearchAsync"/>
+    IAsyncEnumerable<FullTextSearchResult<T>> FullTextSearchAsync(
+        string indexName,
+        string query,
+        int k,
+        bool matchAllTerms = true,
+        CancellationToken ct = default);
+
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     Task<ICollectionIndex<TId, T>> CreateVectorIndexAsync<TKey>(
         Expression<Func<T, TKey>> keySelector,

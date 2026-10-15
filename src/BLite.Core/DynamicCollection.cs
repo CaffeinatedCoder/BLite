@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BLite.Bson;
+using BLite.Core.Text;
 using BLite.Core.Audit;
 using BLite.Core.CDC;
 using BLite.Core.Collections;
@@ -28,6 +29,7 @@ public sealed record DynamicIndexDescriptor(
 {
     public bool IsVector => Type == IndexType.Vector;
     public bool IsSpatial => Type == IndexType.Spatial;
+    public bool IsFullText => Type == IndexType.FullText;
     public bool IsStandard => Type == IndexType.BTree;
 }
 
@@ -59,7 +61,7 @@ public sealed class DynamicCollection : IDisposable
     private int _retentionRunning; // 0=idle, 1=running (Interlocked flag)
 
     // ── Discriminated union for secondary indexes ─────────────────────────────
-    private enum DynamicIndexKind { BTree, Vector, Spatial }
+    private enum DynamicIndexKind { BTree, Vector, Spatial, FullText }
 
     private sealed class DynamicSecondaryIndex
     {
@@ -69,7 +71,14 @@ public sealed class DynamicCollection : IDisposable
         public BTreeIndex? BTree { get; }
         public VectorSearchIndex? Vector { get; }
         public RTreeIndex? Spatial { get; }
-        public uint RootPageId => BTree?.RootPageId ?? Vector?.RootPageId ?? Spatial?.RootPageId ?? 0;
+        public FullTextIndex? FullText { get; }
+        /// <summary>
+        /// Key format of a full-text index's pages, persisted as its <see cref="IndexMetadata.KeyFormat"/>.
+        /// Kept per index so persisting the metadata never marks an index that still awaits its
+        /// rebuild as current.
+        /// </summary>
+        public byte KeyFormat { get; init; } = FullTextIndex.FormatVersion;
+        public uint RootPageId => BTree?.RootPageId ?? Vector?.RootPageId ?? Spatial?.RootPageId ?? FullText?.RootPageId ?? 0;
 
         public DynamicSecondaryIndex(BTreeIndex btree, string fieldPath, IndexOptions options)
         { Kind = DynamicIndexKind.BTree; BTree = btree; FieldPath = fieldPath; Options = options; }
@@ -79,6 +88,9 @@ public sealed class DynamicCollection : IDisposable
 
         public DynamicSecondaryIndex(RTreeIndex spatial, string fieldPath, IndexOptions options)
         { Kind = DynamicIndexKind.Spatial; Spatial = spatial; FieldPath = fieldPath; Options = options; }
+
+        public DynamicSecondaryIndex(FullTextIndex fullText, string fieldPath, IndexOptions options)
+        { Kind = DynamicIndexKind.FullText; FullText = fullText; FieldPath = fieldPath; Options = options; }
     }
 
     // Secondary indexes: name → DynamicSecondaryIndex
@@ -110,6 +122,7 @@ public sealed class DynamicCollection : IDisposable
         _isPageLocked = _storage.IsPageLocked;
 
         // Load or create collection metadata
+        var staleFullTextIndexes = new List<string>();
         var metadata = _storage.GetCollectionMetadata(_collectionName);
         uint primaryRootPageId = 0;
 
@@ -158,6 +171,15 @@ public sealed class DynamicCollection : IDisposable
                         _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(spatial, fieldPath, opts);
                         break;
                     }
+                    case IndexType.FullText:
+                    {
+                        var opts = IndexOptions.CreateBTree(idxMeta.PropertyPaths);
+                        var fullText = new FullTextIndex(_storage, opts, idxMeta.RootPageId);
+                        _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(fullText, fieldPath, opts) { KeyFormat = idxMeta.KeyFormat };
+                        if (idxMeta.KeyFormat != FullTextIndex.FormatVersion || fullText.HasForeignKeys())
+                            staleFullTextIndexes.Add(idxMeta.Name);
+                        break;
+                    }
                 }
             }
         }
@@ -188,13 +210,112 @@ public sealed class DynamicCollection : IDisposable
                 rootsChanged = true;
             }
         }
+        // Re-record the features the indexes require if a release that predates them rewrote the
+        // record and dropped them (a read-only open cannot, and the indexes still protect it).
+        if (!_storage.IsReadOnly && CollectionFeatures.SyncIndexFeatures(metadata))
+            rootsChanged = true;
         // Only the root ids are patched in place so index entries this constructor does not
         // restore (unknown types, no property paths) are preserved as stored.
         if (rootsChanged)
             _storage.SaveCollectionMetadata(metadata);
 
+        // A full-text index written with another analyzer or key layout is rebuilt: deleting a
+        // document relies on reproducing the keys it was indexed under.
+        foreach (var name in staleFullTextIndexes)
+            RebuildFullTextIndex(name);
+
         // Rebuild the free-space index from existing page headers on cold start.
         RebuildFreeSpaceIndex();
+    }
+
+    /// <summary>
+    /// Rebuilds full-text index <paramref name="name"/> into a fresh tree, swaps it in once the
+    /// rebuild committed, persists it with the current format version and frees the old tree.
+    /// If the rebuild or the swap fails, the fresh tree's pages are freed and the old index stays
+    /// persisted as it was, so the next open retries.
+    /// </summary>
+    private void RebuildFullTextIndex(string name)
+    {
+        var old = _secondaryIndexes[name];
+        var fresh = new DynamicSecondaryIndex(new FullTextIndex(_storage, old.Options), old.FieldPath, old.Options);
+        // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+        Task.Run(() => FillUnregisteredFullTextIndexAsync(fresh)).GetAwaiter().GetResult();
+
+        var oldPages = old.FullText!.CollectAllPages();
+        PublishFullTextIndex(name, fresh, old);
+        foreach (var pageId in oldPages)
+            _storage.FreePage(pageId);
+    }
+
+    /// <summary>
+    /// Fills a full-text index that is not registered yet from every document, in its own
+    /// transaction, and commits it. If a document cannot be read or indexed, or the commit fails,
+    /// every page of the index is freed, including the pages its splits added, and the exception
+    /// propagates.
+    /// </summary>
+    private async Task FillUnregisteredFullTextIndexAsync(DynamicSecondaryIndex index)
+    {
+        var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        try
+        {
+            foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+            {
+                var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
+                if (doc != null) IndexInsert(index, doc, e.Location, transaction);
+            }
+            await transaction.CommitAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // Collect the pages through the transaction before rolling it back: pages added by
+            // splits are allocated outside the transaction but linked only from nodes written in
+            // it, so after the rollback they could not be found any more.
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = index.FullText!.CollectAllPages(transaction.TransactionId); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            try { await transaction.RollbackAsync().ConfigureAwait(false); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            FreePagesBestEffort(pages);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Registers the filled full-text index <paramref name="index"/> under <paramref name="name"/>
+    /// in place of <paramref name="previous"/> (null: none) and persists the metadata. If that
+    /// fails, the previous registration is restored, the index's pages are freed and the exception
+    /// propagates.
+    /// </summary>
+    private void PublishFullTextIndex(string name, DynamicSecondaryIndex index, DynamicSecondaryIndex? previous)
+    {
+        _secondaryIndexes[name] = index;
+        try
+        {
+            PersistIndexMetadata();
+        }
+        catch
+        {
+            if (previous != null) _secondaryIndexes[name] = previous;
+            else _secondaryIndexes.Remove(name);
+
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = index.FullText!.CollectAllPages(); }
+            catch { /* best-effort: never mask the original failure */ }
+            FreePagesBestEffort(pages);
+            throw;
+        }
+    }
+
+    private void FreePagesBestEffort(IReadOnlyList<uint> pages)
+    {
+        try
+        {
+            foreach (var pageId in pages)
+                _storage.FreePage(pageId);
+        }
+        catch { /* best-effort: never mask the original failure */ }
     }
 
     private void RebuildFreeSpaceIndex()
@@ -1011,6 +1132,45 @@ public sealed class DynamicCollection : IDisposable
     }
 
     /// <summary>
+    /// Returns the <paramref name="k"/> documents that best match <paramref name="query"/> in a
+    /// full-text index, best first, each with its BM25 relevance score.
+    /// The field must have been indexed via <see cref="CreateFullTextIndexAsync"/>.
+    /// </summary>
+    /// <param name="indexName">The name of the full-text index to search.</param>
+    /// <param name="query">The terms to look for, analyzed like the indexed text.</param>
+    /// <param name="k">Maximum number of documents to return.</param>
+    /// <param name="matchAllTerms">
+    /// <c>true</c> (the default) to return only documents containing every query term;
+    /// <c>false</c> to return documents containing any of them, ranked by relevance.
+    /// </param>
+    public async IAsyncEnumerable<FullTextSearchResult<BsonDocument>> FullTextSearchAsync(
+        string indexName,
+        string query,
+        int k,
+        bool matchAllTerms = true,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (!_secondaryIndexes.TryGetValue(indexName, out var entry) || entry.Kind != DynamicIndexKind.FullText || entry.FullText == null)
+            throw new ArgumentException($"Full-text index '{indexName}' not found on collection '{_collectionName}'");
+
+        int returned = 0;
+        foreach (var (location, score) in entry.FullText.SearchExpanding(query, k, matchAllTerms, null))
+        {
+            ct.ThrowIfCancellationRequested();
+            var doc = ReadDocumentAt(location, 0UL);
+            if (doc == null) continue;
+
+            // Re-check the hit, so a stale posting can never surface another document; candidates
+            // past the first k are taken until k hits survive the re-check.
+            var text = TryGetNestedValue(doc, entry.FieldPath, out var val) && val.IsString ? val.AsString : null;
+            if (!(matchAllTerms ? FullTextAnalyzer.Matches(text, query) : FullTextAnalyzer.MatchesAny(text, query))) continue;
+
+            yield return new FullTextSearchResult<BsonDocument>(doc, score);
+            if (++returned == k) yield break;
+        }
+    }
+
+    /// <summary>
     /// Asynchronously yields documents matching the specified predicate.
     /// </summary>
     public async IAsyncEnumerable<BsonDocument> FindAsync(Func<BsonDocument, bool> predicate, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -1640,6 +1800,7 @@ public sealed class DynamicCollection : IDisposable
                         DynamicIndexKind.BTree    => new DynamicSecondaryIndex(new BTreeIndex(_storage, entry.Options), entry.FieldPath, entry.Options),
                         DynamicIndexKind.Vector   => new DynamicSecondaryIndex(new VectorSearchIndex(_storage, entry.Options), entry.FieldPath, entry.Options),
                         DynamicIndexKind.Spatial  => new DynamicSecondaryIndex(new RTreeIndex(_storage, entry.Options, 0), entry.FieldPath, entry.Options),
+                        DynamicIndexKind.FullText => new DynamicSecondaryIndex(new FullTextIndex(_storage, entry.Options), entry.FieldPath, entry.Options),
                         _                         => entry
                     };
                     rebuildEntries[name] = freshEntry;
@@ -1790,6 +1951,46 @@ public sealed class DynamicCollection : IDisposable
         PersistIndexMetadata();
     }
 
+    /// <summary>
+    /// Creates a full-text index on a string field (dot-notation for nested fields), filled from
+    /// the documents already in the collection. Search it with <see cref="FullTextSearchAsync"/>.
+    /// The default name is <c>idx_fts_{field}</c>.
+    /// <para>
+    /// Compatibility: the collection records that it requires full-text indexes, so BLite 5.3 and
+    /// later versions without them refuse to open it. Older releases cannot refuse: do not open a
+    /// database with full-text indexes for writing with BLite &lt; 5.3.
+    /// </para>
+    /// </summary>
+    public async Task CreateFullTextIndexAsync(string fieldPath, string? name = null)
+    {
+        name ??= $"idx_fts_{fieldPath.ToLowerInvariant()}";
+        fieldPath = fieldPath.ToLowerInvariant();
+
+        // Block writers while the index is filled: a document inserted meanwhile would miss the
+        // index, which only starts receiving writes once it is registered.
+        if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs).ConfigureAwait(false))
+            throw new TimeoutException("Timed out acquiring collection write lock (CreateFullTextIndexAsync).");
+        try
+        {
+            if (_secondaryIndexes.ContainsKey(name))
+                throw new InvalidOperationException($"Index '{name}' already exists");
+
+            RegisterNestedPathKeys(fieldPath);
+
+            var opts = IndexOptions.CreateBTree(fieldPath);
+            var entry = new DynamicSecondaryIndex(new FullTextIndex(_storage, opts), fieldPath, opts);
+
+            // Fill before registering, so a crash or a failure leaves no partial index persisted;
+            // a failed fill or registration frees the index's pages.
+            await FillUnregisteredFullTextIndexAsync(entry).ConfigureAwait(false);
+            PublishFullTextIndex(name, entry, previous: null);
+        }
+        finally
+        {
+            _collectionLock.Release();
+        }
+    }
+
     /// <summary>Drops a secondary index by name.</summary>
     public bool DropIndex(string name)
     {
@@ -1848,8 +2049,9 @@ public sealed class DynamicCollection : IDisposable
         {
             var type = kvp.Value.Kind switch
             {
-                DynamicIndexKind.Vector  => IndexType.Vector,
-                DynamicIndexKind.Spatial => IndexType.Spatial,
+                DynamicIndexKind.Vector   => IndexType.Vector,
+                DynamicIndexKind.Spatial  => IndexType.Spatial,
+                DynamicIndexKind.FullText => IndexType.FullText,
                 _                        => IndexType.BTree
             };
             return new DynamicIndexDescriptor(
@@ -1891,10 +2093,15 @@ public sealed class DynamicCollection : IDisposable
                 case DynamicIndexKind.Spatial:
                     idxMeta.Type = IndexType.Spatial;
                     break;
+                case DynamicIndexKind.FullText:
+                    idxMeta.Type = IndexType.FullText;
+                    idxMeta.KeyFormat = idx.KeyFormat;
+                    break;
             }
 
             metadata.Indexes.Add(idxMeta);
         }
+        CollectionFeatures.SyncIndexFeatures(metadata);
 
         _storage.SaveCollectionMetadata(metadata);
     }
@@ -1990,6 +2197,9 @@ public sealed class DynamicCollection : IDisposable
                 var coords = ExtractCoordinates(val);
                 if (coords.HasValue) idx.Spatial!.Insert(GeoBox.FromPoint(new GeoPoint(coords.Value.Lat, coords.Value.Lon)), location, transaction);
                 break;
+            case DynamicIndexKind.FullText:
+                if (val.IsString) idx.FullText!.Insert(val.AsString, location, transaction);
+                break;
         }
     }
 
@@ -2011,6 +2221,9 @@ public sealed class DynamicCollection : IDisposable
             case DynamicIndexKind.Spatial:
                 var coords = ExtractCoordinates(val);
                 if (coords.HasValue) idx.Spatial!.Delete(GeoBox.FromPoint(new GeoPoint(coords.Value.Lat, coords.Value.Lon)), location, transaction);
+                break;
+            case DynamicIndexKind.FullText:
+                if (val.IsString) idx.FullText!.Delete(val.AsString, location, transaction);
                 break;
         }
     }

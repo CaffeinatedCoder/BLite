@@ -898,12 +898,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
     /// <summary>
     /// Decimal properties used to be indexed as <c>(double)value</c>. An index whose persisted
-    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is rebuilt from the
+    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding, or a full-text
+    /// index written in another format or holding keys it did not write, is rebuilt from the
     /// documents into a copy that queries don't see, the first time the collection is opened. Only
-    /// after the copy committed is it swapped in, with the current format, in one metadata save, and
+    /// after the copy committed is it swapped in, with its target format, in one metadata save, and
     /// the old tree freed. If the rebuild fails or is interrupted, the copy's pages are freed and the
-    /// old index stays registered in its old format, so the next open repeats the migration.
-    /// No-op for every other index.
+    /// old index stays registered as it was, so it still needs the migration (whatever triggered it)
+    /// and the next open repeats it. No-op for every other index.
     /// </summary>
     private void MigrateLegacyDecimalIndexes()
     {
@@ -915,7 +916,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             try
             {
                 var fresh = _indexManager.CreateUnregistered(index.Definition);
-                fresh.KeyFormat = IndexMetadata.CurrentKeyFormat;
+                fresh.KeyFormat = fresh.TargetKeyFormat;
                 // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
                 // A document that cannot be loaded fails the migration rather than silently leaving
                 // the rebuilt index incomplete.
@@ -925,7 +926,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
-                    $"Failed to rebuild index '{name}' of collection '{_collectionName}' with the exact decimal key format; the migration is retried on the next open.", ex);
+                    $"Failed to rebuild index '{name}' of collection '{_collectionName}' in its current key format; the migration is retried on the next open.", ex);
             }
         }
     }
@@ -1024,6 +1025,53 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     /// <summary>
+    /// Creates a full-text index on a string property, filled from the documents already in the
+    /// collection, or returns the existing index of that name. Query it with
+    /// <see cref="FullTextExtensions.FullTextMatch"/> in LINQ or rank with
+    /// <see cref="FullTextSearchAsync"/>. The default name is <c>idx_fts_{property}</c>.
+    /// <para>
+    /// Each document touches one index page per distinct term, so single-document writes cost
+    /// noticeably more than without the index; insert and update in batches
+    /// (<c>InsertBulkAsync</c> or one explicit transaction) where possible.
+    /// </para>
+    /// <para>
+    /// Compatibility: the collection records that it requires full-text indexes, so BLite 5.3 and
+    /// later versions without them refuse to open it. Older releases cannot refuse: do not open a
+    /// database with full-text indexes for writing with BLite &lt; 5.3.
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">An index of that name exists and is not a full-text index.</exception>
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    public async Task<ICollectionIndex<TId, T>> CreateFullTextIndexAsync(
+        System.Linq.Expressions.Expression<Func<T, string?>> keySelector,
+        string? name = null,
+        CancellationToken ct = default)
+    {
+        if (keySelector == null) throw new ArgumentNullException(nameof(keySelector));
+
+        // Block writers while the index is filled: a document inserted meanwhile would miss the
+        // index, which only starts receiving writes once it is registered.
+        if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct).ConfigureAwait(false))
+            throw new TimeoutException("Timed out acquiring collection write lock (CreateFullTextIndexAsync).");
+        try
+        {
+            var existing = _indexManager.GetIndex(CollectionIndexManager<TId, T>.ResolveIndexName(keySelector, name, IndexType.FullText));
+            if (existing != null && existing.Definition.Type != IndexType.FullText)
+                throw new InvalidOperationException($"Index '{existing.Name}' already exists and is not a full-text index.");
+
+            var builder = new Metadata.IndexBuilder<T>(keySelector, name, false, IndexType.FullText);
+            await Task.Run(() => ApplyIndexBuilder(builder, ct), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _collectionLock.Release();
+        }
+
+        var indexName = CollectionIndexManager<TId, T>.ResolveIndexName(keySelector, name, IndexType.FullText);
+        return await BindReaderAndReturn(_indexManager.GetIndex(indexName)!);
+    }
+
+    /// <summary>
     /// Asynchronously creates a vector (HNSW) index for similarity search.
     /// </summary>
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
@@ -1104,9 +1152,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder)
+    internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder, CancellationToken ct = default)
     {
-        var name = CollectionIndexManager<TId, T>.ResolveIndexName(builder.KeySelector, builder.Name);
+        var name = CollectionIndexManager<TId, T>.ResolveIndexName(builder.KeySelector, builder.Name, builder.Type);
         if (_indexManager.GetIndex(name) != null)
             return;
 
@@ -1119,7 +1167,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         try
         {
             // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
-            Task.Run(() => FillUnregisteredIndexAsync(index, CancellationToken.None)).GetAwaiter().GetResult();
+            Task.Run(() => FillUnregisteredIndexAsync(index, ct)).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -3576,6 +3624,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         if (indexOpt != null
             && !indexOpt.IsVectorSearch
             && !indexOpt.IsSpatialSearch
+            && !indexOpt.IsFullTextSearch
             && !indexOpt.HasResiduePredicate)
         {
             var index = _indexManager.GetIndex(indexOpt.IndexName);
@@ -3997,7 +4046,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             // Path: IndexOptimizer → CollectionSecondaryIndex.Seek (TryFindFirst) → FindByLocationAsync.
             var indexOpt = Query.IndexOptimizer.TryOptimize<T>(predicate, GetIndexes(), ConverterRegistry);
             if (indexOpt != null && !indexOpt.IsRange && !indexOpt.IsVectorSearch && !indexOpt.IsSpatialSearch
-                && indexOpt.MinValue != null)
+                && !indexOpt.IsFullTextSearch && indexOpt.MinValue != null)
             {
                 var index = _indexManager.GetIndex(indexOpt.IndexName);
                 if (index != null)
@@ -4096,6 +4145,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                             continue;
                         yield return item;
                         if (++yielded >= fetchLimit) yield break;
+                    }
+                }
+                else if (indexOpt.IsFullTextSearch)
+                {
+                    // Every hit is re-checked with the full predicate: a posting left behind by an
+                    // analyzer change must not surface the document that now holds its location.
+                    var ftsIndex = _indexManager.GetIndex(indexOpt.IndexName)!;
+                    foreach (var location in ftsIndex.FullTextMatch(indexOpt.FullTextQuery!, transaction))
+                    {
+                        var item = await FindByLocationAsync(location, transaction?.TransactionId ?? 0UL, ct);
+                        if (item != null && GetCompiled()(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
                     }
                 }
                 else if (indexOpt.IsSpatialSearch)
@@ -4322,6 +4382,43 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             ct.ThrowIfCancellationRequested();
             var doc = await FindByLocationAsync(result.Location, 0UL, ct);
             if (doc != null) yield return doc;
+        }
+    }
+
+    /// <summary>
+    /// Returns the <paramref name="k"/> documents that best match <paramref name="query"/> in a
+    /// full-text index, best first, each with its BM25 relevance score.
+    /// </summary>
+    /// <param name="indexName">The name of the full-text index to search.</param>
+    /// <param name="query">The terms to look for, analyzed like the indexed text.</param>
+    /// <param name="k">Maximum number of documents to return.</param>
+    /// <param name="matchAllTerms">
+    /// <c>true</c> (the default) to return only documents containing every query term;
+    /// <c>false</c> to return documents containing any of them, ranked by relevance.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    public async IAsyncEnumerable<FullTextSearchResult<T>> FullTextSearchAsync(
+        string indexName,
+        string query,
+        int k,
+        bool matchAllTerms = true,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var index = _indexManager.GetIndex(indexName);
+        if (index == null)
+            throw new ArgumentException($"Index '{indexName}' not found.", nameof(indexName));
+
+        // Hits are re-checked against the document, so a stale posting can never surface another
+        // document; candidates past the first k are taken until k hits survive the re-check.
+        int returned = 0;
+        foreach (var (location, score) in index.FullTextSearchExpanding(query, k, matchAllTerms))
+        {
+            ct.ThrowIfCancellationRequested();
+            var doc = await FindByLocationAsync(location, 0UL, ct);
+            if (doc == null || !index.FullTextContains(doc, query, matchAllTerms)) continue;
+
+            yield return new FullTextSearchResult<T>(doc, score);
+            if (++returned == k) yield break;
         }
     }
 
