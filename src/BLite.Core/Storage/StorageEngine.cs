@@ -47,6 +47,16 @@ public sealed partial class StorageEngine : IDisposable
     // Compared against _shm.ReadWalEndOffset() on BeginTransaction to detect
     // cross-process commits and trigger incremental WAL replay (Phase 7).
     private long _lastKnownWalEndOffset;
+
+    // Multi-process: the generation of the shared WAL (WalSharedMemory.ReadWalGeneration) that the
+    // pages this engine replayed or read from it belong to, and how often it has discarded them.
+    // Both change only under _replayLock, which also guards caching a page read from the WAL.
+    private long _knownWalGeneration;
+    private long _replayEpoch;
+    private readonly object _replayLock = new();
+
+    // Multi-process: catch-ups in a row that could not replay the shared WAL (under _commitLock).
+    private int _failedCatchUps;
     
     // Collection-per-file: collectionName → IPageStorage dedicated
     // Null if CollectionDataDirectory not configured (embedded mode, single file)
@@ -212,6 +222,7 @@ public sealed partial class StorageEngine : IDisposable
                 var shmPath = walPath + "-shm";
                 _shm = Transactions.WalSharedMemory.Open(shmPath, config.PageSize);
                 _walOffsets = new ConcurrentDictionary<uint, long>();
+                _knownWalGeneration = _shm.ReadWalGeneration();
 
                 // If a previous writer crashed without releasing the writer lock, the
                 // recorded PID will not be alive — clear it so this process (or another)

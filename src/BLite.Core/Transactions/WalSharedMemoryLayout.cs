@@ -26,7 +26,9 @@ internal static class WalSharedMemoryLayout
     public const int OffsetWalEndOffset       = 24;
     public const int OffsetCheckpointedOffset = 32;
     public const int OffsetWriterOwnerPid     = 40;
-    // bytes 44..63 reserved for future use (padding to 64-byte cache line)
+    // bytes 44..47 reserved
+    public const int OffsetWalGeneration      = 48;
+    // bytes 56..63 reserved for future use (padding to 64-byte cache line)
 
     /// <summary>Total header size in bytes (also the offset of the first reader slot).</summary>
     public const int HeaderSize = 64;
