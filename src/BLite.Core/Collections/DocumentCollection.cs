@@ -535,9 +535,19 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         return false;
     }
 
-    private async IAsyncEnumerable<(IndexEntry Entry, byte[] RawBytes)> EnumerateOwnedRawDocumentsAsync(
+    /// <summary>Processes the raw BSON of one document in place; returns whether to yield <paramref name="result"/>.</summary>
+    private delegate bool RawDocumentVisitor<TResult>(ReadOnlySpan<byte> bson, out TResult result);
+
+    /// <summary>
+    /// Visits the raw BSON of every document in primary-key order. Single-page documents are
+    /// handed to <paramref name="visit"/> straight from the page buffer, without a copy; only
+    /// overflow documents are reassembled. Each page is read once and kept until the scan ends:
+    /// primary-key order is not page order (ObjectIds created in the same second are not
+    /// monotonic), so a bounded window of pages would read the same pages over and over.
+    /// </summary>
+    private async IAsyncEnumerable<TResult> VisitRawDocumentsAsync<TResult>(
         ulong txnId,
-        bool includeOverflow,
+        RawDocumentVisitor<TResult> visit,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var pageCache = new Dictionary<uint, byte[]>();
@@ -550,25 +560,40 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (!pageCache.TryGetValue(entry.Location.PageId, out var cachedBuffer))
+                if (!pageCache.TryGetValue(entry.Location.PageId, out var pageBuffer))
                 {
-                    cachedBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
-                    _storage.ReadPage(entry.Location.PageId, txnId, cachedBuffer);
-                    pageCache[entry.Location.PageId] = cachedBuffer;
+                    pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
+                    _storage.ReadPage(entry.Location.PageId, txnId, pageBuffer);
+                    pageCache[entry.Location.PageId] = pageBuffer;
                 }
 
-                var rawBytes = ReadRawBytesAt(entry.Location, txnId, includeOverflow, cachedBuffer);
-                if (rawBytes is null) continue;
-                if (!MatchesIndexEntryKey(rawBytes, entry.Key)) continue;
-
-                yield return (entry, rawBytes);
+                if (TryVisitRawDocument(entry, txnId, pageBuffer, visit, out var result))
+                    yield return result;
             }
         }
         finally
         {
-            foreach (var buf in pageCache.Values)
-                ArrayPool<byte>.Shared.Return(buf);
+            foreach (var buf in pageCache.Values) ArrayPool<byte>.Shared.Return(buf);
         }
+    }
+
+    /// <summary>
+    /// Applies <paramref name="visit"/> to the document <paramref name="entry"/> points at, if that
+    /// slot still holds the document with this primary key.
+    /// </summary>
+    private bool TryVisitRawDocument<TResult>(IndexEntry entry, ulong txnId, byte[] pageBuffer, RawDocumentVisitor<TResult> visit, out TResult result)
+    {
+        result = default!;
+
+        var pageType = (PageType)pageBuffer[4];
+        if (pageType == PageType.Free || pageType == PageType.Empty || pageType == PageType.TimeSeries)
+            return false;
+
+        if (TryReadInlineRawBytes(pageBuffer, entry.Location.SlotIndex, out var inline))
+            return MatchesIndexEntryKey(inline, entry.Key) && visit(inline, out result);
+
+        var reassembled = ReadRawBytesAt(entry.Location, txnId, includeOverflow: true, pageBuffer);
+        return reassembled is not null && MatchesIndexEntryKey(reassembled, entry.Key) && visit(reassembled, out result);
     }
 
     /// <summary>
@@ -1131,10 +1156,15 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
         try
         {
-            await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+            await foreach (var document in VisitRawDocumentsAsync<T>(txnId, (ReadOnlySpan<byte> bson, out T doc) =>
+                {
+                    doc = default!;
+                    if (!predicate(new BsonSpanReader(bson, keyMap))) return false;
+                    doc = _mapper.Deserialize(new BsonSpanReader(bson, keyMap));
+                    return true;
+                }, ct).ConfigureAwait(false))
             {
-                if (!predicate(new BsonSpanReader(rawBytes, keyMap))) continue;
-                yield return _mapper.Deserialize(new BsonSpanReader(rawBytes, keyMap));
+                yield return document;
             }
         }
         finally
@@ -1296,10 +1326,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var txnId = 0UL;
         var keyMap = _storage.GetKeyReverseMap();
 
-        await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+        await foreach (var result in VisitRawDocumentsAsync<TResult>(txnId, (ReadOnlySpan<byte> bson, out TResult projected) =>
+            {
+                projected = projector(new BsonSpanReader(bson, keyMap))!;
+                return projected is not null;
+            }, ct).ConfigureAwait(false))
         {
-            var result = projector(new BsonSpanReader(rawBytes, keyMap));
-            if (result is not null) yield return result;
+            yield return result;
         }
     }
 
@@ -1322,16 +1355,20 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         int count = 0;
         var keyMap = _storage.GetKeyReverseMap();
 
-        await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+        await foreach (var _ in VisitRawDocumentsAsync<bool>(txnId, (ReadOnlySpan<byte> bson, out bool matched) =>
+            {
+                try
+                {
+                    matched = predicate(new BsonSpanReader(bson, keyMap));
+                }
+                catch
+                {
+                    matched = false; // Malformed BSON — skip silently.
+                }
+                return matched;
+            }, ct).ConfigureAwait(false))
         {
-            try
-            {
-                if (predicate(new BsonSpanReader(rawBytes, keyMap))) count++;
-            }
-            catch
-            {
-                // Malformed BSON — skip silently.
-            }
+            count++;
         }
 
         return count;
@@ -3581,6 +3618,331 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             count++;
         }
         return count;
+    }
+
+    /// <summary>
+    /// Computes <c>Sum</c>, <c>Average</c>, <c>Min</c> or <c>Max</c> of <paramref name="selector"/> over
+    /// the documents matching <paramref name="whereClause"/> without materialising them, with the
+    /// result LINQ would compute over the entities. Returns <c>Handled = false</c> when the query
+    /// must run the usual way.
+    /// <para>
+    /// Only for a property the mapper restores verbatim from a BSON field
+    /// (<see cref="DocumentMapperBase{TId, T}.GetVerbatimFieldName"/>): the stored value, in the
+    /// document or in an index key, is then the value of the materialised property. Ignored,
+    /// computed and converted properties, and ones whose accessors have logic, are materialised.
+    /// </para>
+    /// <list type="number">
+    ///   <item>An <c>int</c>/<c>long</c> property with a B-Tree index on exactly that property, and
+    ///         no filter or one the same index covers exactly, is aggregated from the index keys
+    ///         alone (<c>Min</c>/<c>Max</c> read one entry). Keys are in value order, so a
+    ///         <c>Sum</c>/<c>Average</c> for which LINQ could overflow in one order but not in
+    ///         another is not taken from them.</item>
+    ///   <item>Otherwise, when no index serves the filter, the property is read from the raw BSON
+    ///         of each document in primary-key order, the order a scan yields the entities in. A
+    ///         document without the field, or holding a type the entity would not be read from
+    ///         unchanged, ends the attempt so the query runs the usual way.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="selector">A plain property access, <c>x =&gt; x.Property</c>.</param>
+    /// <param name="resultType">The result type of the LINQ operator.</param>
+    [RequiresDynamicCode("Aggregate push-down uses index optimization and Expression.Compile() which require dynamic code generation.")]
+    [RequiresUnreferencedCode("Aggregate push-down uses reflection to resolve members at runtime. Ensure all entity types are preserved.")]
+    internal Task<(bool Handled, object? Value)> TryAggregateAsync(
+        AggregateOperator op,
+        LambdaExpression selector,
+        LambdaExpression? whereClause,
+        Type resultType,
+        CancellationToken ct = default)
+    {
+        if (selector.Body is not MemberExpression { Member: System.Reflection.PropertyInfo property } member
+            || member.Expression != selector.Parameters[0]
+            || selector.ReturnType != property.PropertyType
+            || ConverterRegistry.HasConverter(property.Name))
+            return Task.FromResult<(bool, object?)>(default);
+
+        var valueType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+        bool nullable = valueType != property.PropertyType;
+
+        if (valueType == typeof(int)) return TryAggregateAsync<int>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(long)) return TryAggregateAsync<long>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(double)) return TryAggregateAsync<double>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(float)) return TryAggregateAsync<float>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(decimal)) return TryAggregateAsync<decimal>(op, property, nullable, whereClause, resultType, ct);
+        return Task.FromResult<(bool, object?)>(default);
+    }
+
+    [RequiresDynamicCode("Aggregate push-down uses index optimization and Expression.Compile() which require dynamic code generation.")]
+    [RequiresUnreferencedCode("Aggregate push-down uses reflection to resolve members at runtime. Ensure all entity types are preserved.")]
+    private async Task<(bool Handled, object? Value)> TryAggregateAsync<TValue>(
+        AggregateOperator op,
+        System.Reflection.PropertyInfo property,
+        bool nullable,
+        LambdaExpression? whereClause,
+        Type resultType,
+        CancellationToken ct)
+        where TValue : struct, IComparable<TValue>
+    {
+        if (LinqAggregate<TValue>.ResultType(op, nullable) != resultType)
+            return default;
+
+        // The field the mapper restores the property from unchanged. Without it, neither the raw
+        // field nor an index key (computed from the property when the document was written) is
+        // known to be the value the materialised entity returns.
+        var fieldName = (_mapper as DocumentMapperBase<TId, T>)?.GetVerbatimFieldName(property.Name);
+        if (fieldName == null)
+            return default;
+
+        var plan = whereClause == null ? null : Query.IndexOptimizer.TryOptimize<T>(whereClause, GetIndexes(), ConverterRegistry);
+
+        // Index keys hold the exact int/long value. Not for the other types: floating-point sums
+        // depend on the order of the values, decimal keys drop trailing zeros (1.50 → 1.5), and the
+        // first of equal Min/Max values wins (-0.0 vs 0.0, 1.0 vs 1.00).
+        if (typeof(TValue) == typeof(int) || typeof(TValue) == typeof(long))
+        {
+            var index = _indexManager.GetAllIndexes().FirstOrDefault(i =>
+                i.Definition.Type == IndexType.BTree
+                && !i.Definition.IsPrimary
+                && i.Definition.PropertyPaths.Length == 1
+                && i.Definition.PropertyPaths[0] == property.Name
+                && KeysAreValuesOf(i.Definition, property, typeof(TValue)));
+
+            if (index != null)
+            {
+                (bool Handled, object? Value) fromKeys = default;
+                if (whereClause == null)
+                {
+                    fromKeys = AggregateIndexKeys<TValue>(op, nullable, index, null, null, true, true);
+                }
+                else if (plan != null
+                    && plan.IndexName == index.Name
+                    && !plan.HasResiduePredicate
+                    && !plan.IsVectorSearch
+                    && !plan.IsSpatialSearch
+                    && plan.InValues == null
+                    && plan.MinValue is null or TValue
+                    && plan.MaxValue is null or TValue)
+                {
+                    // The optimizer keeps the constant's own type (r.Count < 9.5 gives a double
+                    // bound), and keys carry no type tag, so a bound of another type would be
+                    // compared bytewise against the int/long keys. Such filters take the path below,
+                    // which post-filters the documents the index returns.
+                    fromKeys = AggregateIndexKeys<TValue>(op, nullable, index, plan.MinValue, plan.MaxValue, plan.StartInclusive, plan.EndInclusive);
+                }
+                if (fromKeys.Handled)
+                    return fromKeys;
+                // Otherwise aggregate the values in the order LINQ sees them, below.
+            }
+        }
+
+        // An index serves the filter: fetching the matching documents through it is cheaper than
+        // scanning them all, and keeps the order the values are aggregated in unchanged.
+        if (plan != null)
+            return default;
+
+        BsonReaderPredicate? predicate = null;
+        if (whereClause != null)
+        {
+            predicate = BsonExpressionEvaluator.TryCompile<T>(whereClause, ConverterRegistry, _storage.GetKeyMap());
+            if (predicate == null) return default;
+        }
+
+        return await AggregateRawFieldAsync<TValue>(op, nullable, fieldName, predicate, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the keys of the index <paramref name="definition"/> are the values of
+    /// <paramref name="property"/> itself (<c>x =&gt; x.Property</c>), encoded as
+    /// <paramref name="valueType"/>: the user key is encoded from the boxed value the selector
+    /// returns, so this fixes the key layout the index path decodes.
+    /// </summary>
+    private static bool KeysAreValuesOf(CollectionIndexDefinition<T> definition, System.Reflection.PropertyInfo property, Type valueType)
+    {
+        var body = definition.KeySelectorExpression.Body;
+        while (body is UnaryExpression { NodeType: ExpressionType.Convert } convert && convert.Type == typeof(object))
+            body = convert.Operand;
+
+        return body is MemberExpression { Member: System.Reflection.PropertyInfo keyProperty } access
+            && access.Expression == definition.KeySelectorExpression.Parameters[0]
+            && keyProperty.Name == property.Name
+            && (Nullable.GetUnderlyingType(access.Type) ?? access.Type) == valueType;
+    }
+
+    /// <summary>Aggregates the values of the index entries in the given range from their keys.</summary>
+    private static (bool Handled, object? Value) AggregateIndexKeys<TValue>(
+        AggregateOperator op,
+        bool nullable,
+        CollectionSecondaryIndex<TId, T> index,
+        object? min,
+        object? max,
+        bool startInclusive,
+        bool endInclusive)
+        where TValue : struct, IComparable<TValue>
+    {
+        var aggregate = new LinqAggregate<TValue>(op, nullable, anyOrder: true);
+
+        if (op == AggregateOperator.Max)
+        {
+            // Keys are [value][document id]: the last entry holds the largest value.
+            var last = index.LastKey(min, max, startInclusive, endInclusive);
+            if (last is { } key)
+            {
+                if (!IndexKeyValueVisitor<TValue>.TryDecode(key.Data, out var value)) return default;
+                aggregate.Add(value);
+            }
+            return (true, aggregate.Result());
+        }
+
+        var visitor = new IndexKeyValueVisitor<TValue>(aggregate, stopAfterFirst: op == AggregateOperator.Min);
+        index.ScanKeys(min, max, startInclusive, endInclusive, ref visitor);
+        return visitor.Malformed || aggregate.DependsOnOrder ? default : (true, aggregate.Result());
+    }
+
+    /// <summary>
+    /// Feeds the value prefix of each <c>[value][document id]</c> key of an <c>int</c> or
+    /// <c>long</c> index to a <see cref="LinqAggregate{TValue}"/>.
+    /// </summary>
+    private struct IndexKeyValueVisitor<TValue> : BTreeIndex.IKeyVisitor
+        where TValue : struct, IComparable<TValue>
+    {
+        private readonly LinqAggregate<TValue> _aggregate;
+        private readonly bool _stopAfterFirst;
+
+        public IndexKeyValueVisitor(LinqAggregate<TValue> aggregate, bool stopAfterFirst)
+        {
+            _aggregate = aggregate;
+            _stopAfterFirst = stopAfterFirst;
+            Malformed = false;
+        }
+
+        /// <summary>A key did not start with an encoded value of the expected type.</summary>
+        public bool Malformed { get; private set; }
+
+        public bool Visit(ReadOnlySpan<byte> key)
+        {
+            if (!TryDecode(key, out var value))
+            {
+                Malformed = true;
+                return false;
+            }
+            _aggregate.Add(value);
+            // Past an order-dependent sum the remaining keys cannot change the outcome.
+            return !_stopAfterFirst && !_aggregate.DependsOnOrder;
+        }
+
+        /// <summary>
+        /// Decodes the <see cref="IndexKey(int)"/> / <see cref="IndexKey(long)"/> prefix of a
+        /// <c>[value][document id]</c> key. The index was checked to be keyed by a
+        /// <typeparamref name="TValue"/> (<see cref="KeysAreValuesOf"/>); a key not laid out that way
+        /// (no prefix byte, or no document id after the value) is reported as malformed rather than
+        /// decoded.
+        /// </summary>
+        public static bool TryDecode(ReadOnlySpan<byte> key, out TValue value)
+        {
+            value = default;
+            if (key.Length == 0 || key[0] != IndexKey.KeyPrefix) return false;
+
+            if (typeof(TValue) == typeof(int))
+            {
+                if (key.Length <= 5) return false;
+                value = (TValue)(object)(int)(BinaryPrimitives.ReadUInt32BigEndian(key.Slice(1)) ^ 0x8000_0000u);
+                return true;
+            }
+            if (typeof(TValue) == typeof(long))
+            {
+                if (key.Length <= 9) return false;
+                value = (TValue)(object)(long)(BinaryPrimitives.ReadUInt64BigEndian(key.Slice(1)) ^ 0x8000_0000_0000_0000UL);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Aggregates field <paramref name="fieldName"/> of every document matching
+    /// <paramref name="predicate"/> from raw BSON, in primary-key order. Gives up (<c>Handled =
+    /// false</c>) on a document without the field, with a BSON type other than the one the mapper
+    /// writes for <typeparamref name="TValue"/> (or <c>null</c> for a nullable property), or that
+    /// fails to evaluate, since materialising the entity could then yield a different value.
+    /// </summary>
+    private async Task<(bool Handled, object? Value)> AggregateRawFieldAsync<TValue>(
+        AggregateOperator op,
+        bool nullable,
+        string fieldName,
+        BsonReaderPredicate? predicate,
+        CancellationToken ct)
+        where TValue : struct, IComparable<TValue>
+    {
+        if (!_storage.GetKeyMap().TryGetValue(fieldName, out var fieldId))
+            return default; // never written: every document lacks it
+
+        var expectedType =
+            typeof(TValue) == typeof(int) ? BsonType.Int32 :
+            typeof(TValue) == typeof(long) ? BsonType.Int64 :
+            typeof(TValue) == typeof(decimal) ? BsonType.Decimal128 :
+            BsonType.Double; // double and float
+        var keyMap = _storage.GetKeyReverseMap();
+        var aggregate = new LinqAggregate<TValue>(op, nullable);
+
+        // Adds the document's value if it matches; false to give up.
+        bool Fold(ReadOnlySpan<byte> bson)
+        {
+            try
+            {
+                if (predicate != null && !predicate(new BsonSpanReader(bson, keyMap)))
+                    return true;
+
+                var reader = new BsonSpanReader(bson, keyMap);
+                reader.ReadDocumentSize();
+                var firstElement = reader.Position;
+                if (!reader.TrySeekToField(fieldId, out var type))
+                {
+                    // No usable offset table entry: look for the field from the first element on.
+                    reader.Seek(firstElement);
+                    if (!SeekField(ref reader, fieldName, out type))
+                        return false;
+                }
+
+                if (type == BsonType.Null)
+                    return nullable;
+                if (type != expectedType)
+                    return false;
+
+                aggregate.Add(ReadValue<TValue>(ref reader));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // The scan yields only for a document that ends the attempt.
+        await foreach (var _ in VisitRawDocumentsAsync<bool>(0UL, (ReadOnlySpan<byte> bson, out bool giveUp) => giveUp = !Fold(bson), ct).ConfigureAwait(false))
+            return default;
+
+        return (true, aggregate.Result());
+
+        static bool SeekField(ref BsonSpanReader reader, string name, out BsonType type)
+        {
+            while (reader.Remaining > 1)
+            {
+                type = reader.ReadBsonType();
+                if (type == BsonType.EndOfDocument) break;
+                if (reader.ReadElementHeader() == name) return true;
+                reader.SkipValue(type);
+            }
+            type = BsonType.EndOfDocument;
+            return false;
+        }
+
+        static TV ReadValue<TV>(ref BsonSpanReader reader)
+        {
+            if (typeof(TV) == typeof(int)) return (TV)(object)reader.ReadInt32();
+            if (typeof(TV) == typeof(long)) return (TV)(object)reader.ReadInt64();
+            if (typeof(TV) == typeof(double)) return (TV)(object)reader.ReadDouble();
+            if (typeof(TV) == typeof(float)) return (TV)(object)(float)reader.ReadDouble();
+            return (TV)(object)reader.ReadDecimal128();
+        }
     }
 
     /// <summary>

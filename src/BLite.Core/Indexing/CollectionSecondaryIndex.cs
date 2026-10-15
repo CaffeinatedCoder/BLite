@@ -445,6 +445,44 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         //     [userKey][realId] are <= this boundary, so they are included.
         //   Exclusive end:   lower composite boundary [userKey][MinId] — all real entries
         //     [userKey][realId] are > this boundary, so they are excluded.
+        var (actualMinKey, actualMaxKey) = CompositeRange(minKey, maxKey, startInclusive, endInclusive);
+        return _btreeIndex.CountRange(actualMinKey, actualMaxKey, transaction?.TransactionId);
+    }
+
+    /// <summary>
+    /// Hands the stored keys of the entries in the range to <paramref name="visitor"/>, in ascending
+    /// order and without allocating per entry; bounds as for <see cref="CountRange"/>. Each key is
+    /// <c>[user key][document id]</c>, so the indexed value is its prefix.
+    /// </summary>
+    internal void ScanKeys<TVisitor>(object? minKey, object? maxKey, bool startInclusive, bool endInclusive, ref TVisitor visitor, ITransaction? transaction = null)
+        where TVisitor : struct, BTreeIndex.IKeyVisitor
+    {
+        if (_btreeIndex == null) return;
+
+        var (actualMinKey, actualMaxKey) = CompositeRange(minKey, maxKey, startInclusive, endInclusive);
+        _btreeIndex.ScanRange(actualMinKey, actualMaxKey, transaction?.TransactionId, ref visitor);
+    }
+
+    /// <summary>
+    /// The stored key of the last entry in the range (bounds as for <see cref="CountRange"/>), read
+    /// from the end of the range; <c>null</c> when the range is empty.
+    /// </summary>
+    internal IndexKey? LastKey(object? minKey, object? maxKey, bool startInclusive, bool endInclusive, ITransaction? transaction = null)
+    {
+        if (_btreeIndex == null) return null;
+
+        var (actualMinKey, actualMaxKey) = CompositeRange(minKey, maxKey, startInclusive, endInclusive);
+        foreach (var entry in _btreeIndex.Range(actualMinKey, actualMaxKey, IndexDirection.Backward, transaction?.TransactionId))
+            return entry.Key;
+        return null;
+    }
+
+    /// <summary>
+    /// The composite B-Tree bounds covering every entry whose user key lies between
+    /// <paramref name="minKey"/> and <paramref name="maxKey"/> (<c>null</c> = unbounded).
+    /// </summary>
+    private (IndexKey Min, IndexKey Max) CompositeRange(object? minKey, object? maxKey, bool startInclusive, bool endInclusive)
+    {
         IndexKey actualMinKey = IndexKey.MinKey;
         IndexKey actualMaxKey = s_maxBoundaryKey;
 
@@ -464,7 +502,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             actualMaxKey = CreateCompositeKeyBoundary(userMax, useMinObjectId: !endInclusive);
         }
 
-        return _btreeIndex.CountRange(actualMinKey, actualMaxKey, transaction?.TransactionId);
+        return (actualMinKey, actualMaxKey);
     }
 
     /// <summary>

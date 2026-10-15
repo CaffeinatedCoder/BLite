@@ -17,7 +17,7 @@ public struct IndexKey : IEquatable<IndexKey>, IComparable<IndexKey>
     // Guarantees NullSentinel (0x00) and NullSentinelNext (0x01) sort strictly before
     // all encoded user values, including int.MinValue which encodes to { 0x00, 0x00, 0x00, 0x00 }
     // without the prefix.
-    private const byte KeyPrefix = 0x02;
+    internal const byte KeyPrefix = 0x02;
 
     // Prefix of decimal keys. Distinct from KeyPrefix so that an index whose keys were written by an
     // older version (decimal stored as double under KeyPrefix) can be told apart from a current one.

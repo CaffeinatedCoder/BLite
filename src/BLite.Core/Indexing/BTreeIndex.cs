@@ -294,8 +294,33 @@ public sealed class BTreeIndex
     /// </summary>
     internal int CountRange(IndexKey minKey, IndexKey maxKey, ulong? transactionId = null)
     {
+        var counter = new CountingVisitor();
+        ScanRange(minKey, maxKey, transactionId, ref counter);
+        return counter.Count;
+    }
+
+    /// <summary>Receives the keys of a <see cref="ScanRange{TVisitor}"/>, in key order.</summary>
+    internal interface IKeyVisitor
+    {
+        /// <summary>Handles one key; returns <c>false</c> to stop the scan.</summary>
+        bool Visit(ReadOnlySpan<byte> key);
+    }
+
+    private struct CountingVisitor : IKeyVisitor
+    {
+        public int Count;
+        public bool Visit(ReadOnlySpan<byte> key) { Count++; return true; }
+    }
+
+    /// <summary>
+    /// Hands every leaf key in [<paramref name="minKey"/>, <paramref name="maxKey"/>] (inclusive)
+    /// to <paramref name="visitor"/> straight from the page buffer, in ascending order, without
+    /// allocating per entry. The key span is only valid during the call.
+    /// </summary>
+    internal void ScanRange<TVisitor>(IndexKey minKey, IndexKey maxKey, ulong? transactionId, ref TVisitor visitor)
+        where TVisitor : struct, IKeyVisitor
+    {
         var txnId = transactionId ?? 0;
-        int count = 0;
         var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
         {
@@ -329,11 +354,14 @@ public sealed class BTreeIndex
                     }
 
                     // inRange: compare against maxKey only.
-                    if (IndexKey.CompareRaw(entryKeySpan, maxKey.Data) <= 0)
-                        count++;
-                    else
+                    if (IndexKey.CompareRaw(entryKeySpan, maxKey.Data) > 0)
                     {
                         stopScan = true; // past maxKey — no more matches in any leaf
+                        break;
+                    }
+                    if (!visitor.Visit(entryKeySpan))
+                    {
+                        stopScan = true; // the visitor has seen enough
                         break;
                     }
 
@@ -348,8 +376,8 @@ public sealed class BTreeIndex
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(pageBuffer);
         }
-        return count;
     }
+
 
     /// <summary>
     /// Finds the first leaf entry in [minKey, maxKey] (inclusive) without allocating an

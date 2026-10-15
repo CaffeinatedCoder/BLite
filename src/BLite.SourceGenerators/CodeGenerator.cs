@@ -174,6 +174,8 @@ namespace BLite.SourceGenerators
             {
                 sb.AppendLine();
                 GenerateIdAccessors(sb, entity);
+                sb.AppendLine();
+                GenerateVerbatimFieldNames(sb, entity);
             }
 
             // Emit PersonalData static members (WP1)
@@ -1073,6 +1075,41 @@ namespace BLite.SourceGenerators
                 sb.AppendLine($"        public override {qualifiedKeyType} FromIndexKey(global::BLite.Core.Indexing.IndexKey key) => ");
                 sb.AppendLine($"            _idConverter.ConvertFromProvider(key.As<{providerType}>());");
             }
+        }
+
+        /// <summary>
+        /// Emits <c>GetVerbatimFieldName</c>: for each scalar property that <c>Deserialize</c> restores
+        /// unchanged from its field, the field name, so queries can read the value from raw BSON. A
+        /// property qualifies when it is an auto-property with a setter, has no converter, and is not
+        /// passed to the constructor (which could transform it); computed, ignored and get-only
+        /// properties are not in <see cref="EntityInfo.Properties"/> or have no setter.
+        /// </summary>
+        private static void GenerateVerbatimFieldNames(StringBuilder sb, EntityInfo entity)
+        {
+            var ctorParams = entity.SelectedConstructorParameters != null
+                ? new HashSet<string>(entity.SelectedConstructorParameters.Select(p => p.MatchedPropertyName))
+                : new HashSet<string>();
+
+            var verbatim = entity.Properties
+                .Where(p => p.IsAutoProperty
+                            && p.HasAnySetter
+                            && p.ConverterTypeName == null
+                            && !p.IsCollection && !p.IsDictionary && !p.IsNestedObject && !p.IsEnum
+                            && !ctorParams.Contains(p.Name))
+                .ToList();
+
+            sb.AppendLine($"        public override string? GetVerbatimFieldName(string propertyName)");
+            sb.AppendLine($"        {{");
+            sb.AppendLine($"            switch (propertyName)");
+            sb.AppendLine($"            {{");
+            foreach (var prop in verbatim)
+            {
+                var fieldName = prop.IsKey ? BLiteConventions.BsonIdFieldName : prop.BsonFieldName;
+                sb.AppendLine($"                case \"{prop.Name}\": return \"{fieldName}\";");
+            }
+            sb.AppendLine($"                default: return null;");
+            sb.AppendLine($"            }}");
+            sb.AppendLine($"        }}");
         }
 
         private static string GetBaseMapperClass(PropertyInfo? keyProp, EntityInfo entity)

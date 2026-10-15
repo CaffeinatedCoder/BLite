@@ -19,31 +19,6 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     private readonly DocumentCollection<TId, T> _collection;
     private readonly ValueConverterRegistry _converterRegistry;
 
-    // ── Reflection cache (computed once per TId+T combination) ────────────────
-    // BsonProjectionCompiler.TryCompile<T, TResult> generic method definition.
-    // Targets the 3-parameter overload (selectLambda, whereLambda, keyMap) so that
-    // the key map can be threaded in for offset-table fast paths.
-#pragma warning disable IL2026, IL2075
-    private static readonly MethodInfo s_tryCompileMethod =
-        typeof(BsonProjectionCompiler)
-            .GetMethods(BindingFlags.Static | BindingFlags.Public)
-            .Single(m => m.Name == nameof(BsonProjectionCompiler.TryCompile)
-                         && m.GetParameters().Length == 3);
-
-    // DocumentCollection<TId,T>.ScanAsync<TResult>(BsonReaderProjector<TResult>, CancellationToken) — generic overload.
-    private static readonly MethodInfo s_scanProjectorMethod =
-        typeof(DocumentCollection<TId, T>)
-            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
-            .Single(m => m.Name == "ScanAsync" && m.IsGenericMethodDefinition);
-#pragma warning restore IL2026, IL2075
-
-    // ── Per-projection-type MakeGenericMethod cache (Fase 3) ─────────────────
-    // Keyed on TProj. Avoids calling MakeGenericMethod on every query execution.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo>
-        s_compiledSelectMethods = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo>
-        s_compiledScanMethods = new();
-
     public BTreeQueryProvider(DocumentCollection<TId, T> collection, ValueConverterRegistry? registry = null)
     {
         _collection = collection;
@@ -269,33 +244,18 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             if (typeof(TResult) == typeof(object)) return (TResult)(object)count;
         }
 
-        // ── Fast path: Sum / Average / Min / Max via BSON field-projection scan ─
-        // Reads only the target field from raw BSON — T is never fully instantiated.
-        // Fires for both no-WHERE and WHERE variants:
-        //   - No WHERE:  projector reads only the selector field.
-        //   - With WHERE: BsonProjectionCompiler merges WHERE + SELECT fields into one
-        //     BSON pass; documents that fail the WHERE return null and are skipped.
-        // HasComplexOperators is intentionally NOT checked here: VisitAggregate always
-        // sets it so that queries that cannot be pushed down fall back to EnumerableRewriter.
-        if (model.AggregateOp is not null && model.AggregateSelector is not null)
+        // ── Fast path: Sum / Average / Min / Max of a property without materialising T ─
+        // From index keys or raw BSON, with the result LINQ computes over the entities. Only for
+        // an aggregate applied straight to Where clauses over the collection: any other operator
+        // in between (Take, Skip, OrderBy, Select, Distinct, ...) changes which values are
+        // aggregated or their order, so those queries run the usual way.
+        if (model.AggregateOp is not null && model.AggregateSelector is not null
+            && IsAggregateOverFilteredRoot(expression)
+            && Enum.TryParse<AggregateOperator>(model.AggregateOp, out var aggregateOp))
         {
-            if (TryBsonAggregate<TResult>(model.AggregateOp, model.AggregateSelector, model.WhereClause, out var aggResult))
-                return aggResult;
-        }
-
-        // ── Push-down SELECT (+ optional WHERE) ───────────────────────────────
-        // Single-pass BSON projection: no T instantiation, no EnumerableRewriter.
-        // Only applicable when the projection is the whole query: no post-scan ordering,
-        // paging or other operators. A terminal after the Select (Any, Max, Count(pred), ...)
-        // runs the usual way.
-        if (model.SelectClause is not null
-            && model.OrderByClause is null
-            && !model.Take.HasValue
-            && !model.Skip.HasValue
-            && !model.HasComplexOperators
-            && TryPushDownSelect<TResult>(model.SelectClause, model.WhereClause, out var pushed))
-        {
-            return pushed;
+            var (handled, value) = await _collection.TryAggregateAsync(
+                aggregateOp, model.AggregateSelector, model.WhereClause, typeof(TResult), cancellationToken).ConfigureAwait(false);
+            if (handled) return (TResult)value!;
         }
 
         // ── Several query sources ─────────────────────────────────────────────
@@ -436,7 +396,7 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         if (model.Skip.HasValue) data = data.Skip(model.Skip.Value);
         if (model.Take.HasValue) data = data.Take(model.Take.Value);
 
-        // SELECT (with ORDER BY / SKIP / TAKE — rare path, push-down already handled the common case)
+        // SELECT
         if (model.SelectClause != null)
             return ProjectEnumerable<TResult>(data, model.SelectClause);
 
@@ -616,217 +576,28 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             $"BLite query pipeline: unsupported terminal result type '{typeof(TResult)}'.");
     }
 
-    // ─── BSON-level aggregate push-down ──────────────────────────────────────
+    // ─── Aggregate push-down ─────────────────────────────────────────────────
 
     /// <summary>
-    /// Attempts to compute Sum or Average entirely by scanning raw BSON bytes,
-    /// without deserialising the full entity <typeparamref name="T"/>.
+    /// Whether <paramref name="expression"/> is <c>Sum</c>/<c>Average</c>/<c>Min</c>/<c>Max</c> with a
+    /// selector, applied to zero or more <c>Where(x =&gt; ...)</c> calls over the collection itself.
     /// </summary>
-    /// <returns>
-    /// <c>true</c> and a populated <paramref name="result"/> on success;
-    /// <c>false</c> to signal the caller should fall through to the standard path.
-    /// </returns>
-    [RequiresDynamicCode("BLite LINQ queries use Expression.Compile() and MakeGenericMethod which require dynamic code generation.")]
-    [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
-    private bool TryBsonAggregate<TResult>(
-        string aggregateOp,
-        LambdaExpression selector,
-        LambdaExpression? whereClause,
-        out TResult result)
+    private static bool IsAggregateOverFilteredRoot(Expression expression)
     {
-        result = default!;
-        var fieldType = selector.ReturnType;
-
-        // Only numeric types are supported; others fall through to EnumerableRewriter.
-        if (fieldType != typeof(decimal) && fieldType != typeof(double) &&
-            fieldType != typeof(float) && fieldType != typeof(int) &&
-            fieldType != typeof(long))
+        if (expression is not MethodCallExpression call
+            || call.Method.DeclaringType != typeof(Queryable)
+            || call.Arguments.Count != 2)
             return false;
 
-        // Compile a BSON projector for the target field.
-        // When whereClause is provided, BsonProjectionCompiler merges WHERE + SELECT fields
-        // into one BSON pass; documents that fail the WHERE return null and are skipped
-        // by ScanAsync<FieldType>.
-        object? projector;
-        try
+        var source = call.Arguments[0];
+        while (source is MethodCallExpression where
+               && where.Method.DeclaringType == typeof(Queryable)
+               && where.Method.Name == nameof(Queryable.Where)
+               && where.Arguments[1] is UnaryExpression { Operand: LambdaExpression { Parameters.Count: 1 } })
         {
-            var compileMethod = s_compiledSelectMethods.GetOrAdd(
-                fieldType, t => s_tryCompileMethod.MakeGenericMethod(typeof(T), t));
-            projector = compileMethod.Invoke(null, [selector, whereClause, _collection.GetKeyMap()]);
+            source = where.Arguments[0];
         }
-        catch { return false; }
-
-        if (projector is null) return false; // field shape too complex for BSON push-down
-
-        // Execute the BSON scan — yields only non-null field values.
-        System.Collections.IEnumerable? values;
-        try
-        {
-            var scanMethod = s_compiledScanMethods.GetOrAdd(
-                fieldType, t => s_scanProjectorMethod.MakeGenericMethod(t));
-            values = scanMethod.Invoke(_collection, [projector]) as System.Collections.IEnumerable;
-        }
-        catch { return false; }
-
-        if (values is null) return false;
-
-        try { return AggregateValues<TResult>(aggregateOp, values, fieldType, out result); }
-        catch { return false; }
-    }
-
-    private static bool AggregateValues<TResult>(
-        string op,
-        System.Collections.IEnumerable values,
-        Type fieldType,
-        out TResult result)
-    {
-        result = default!;
-
-        if (fieldType == typeof(decimal))
-        {
-            var typed = (IEnumerable<decimal>)values;
-            decimal agg = op switch
-            {
-                "Sum"     => typed.Sum(),
-                "Average" => typed.DefaultIfEmpty().Average(),
-                "Min"     => typed.DefaultIfEmpty().Min(),
-                "Max"     => typed.DefaultIfEmpty().Max(),
-                _         => throw new NotSupportedException($"Unsupported aggregate op: {op}")
-            };
-            if (typeof(TResult) == typeof(decimal)) { result = (TResult)(object)agg; return true; }
-        }
-        else if (fieldType == typeof(double))
-        {
-            var typed = (IEnumerable<double>)values;
-            double agg = op switch
-            {
-                "Sum"     => typed.Sum(),
-                "Average" => typed.DefaultIfEmpty().Average(),
-                "Min"     => typed.DefaultIfEmpty().Min(),
-                "Max"     => typed.DefaultIfEmpty().Max(),
-                _         => throw new NotSupportedException($"Unsupported aggregate op: {op}")
-            };
-            if (typeof(TResult) == typeof(double)) { result = (TResult)(object)agg; return true; }
-        }
-        else if (fieldType == typeof(float))
-        {
-            var typed = (IEnumerable<float>)values;
-            float agg = op switch
-            {
-                "Sum"     => typed.Sum(),
-                "Average" => typed.DefaultIfEmpty().Average(),
-                "Min"     => typed.DefaultIfEmpty().Min(),
-                "Max"     => typed.DefaultIfEmpty().Max(),
-                _         => throw new NotSupportedException($"Unsupported aggregate op: {op}")
-            };
-            if (typeof(TResult) == typeof(float)) { result = (TResult)(object)agg; return true; }
-        }
-        else if (fieldType == typeof(int))
-        {
-            var typed = (IEnumerable<int>)values;
-            if (op == "Sum")
-            {
-                long sum = 0;
-                foreach (var v in typed) sum += v;
-                if (typeof(TResult) == typeof(long)) { result = (TResult)(object)sum; return true; }
-                if (typeof(TResult) == typeof(int)) { result = (TResult)(object)(int)sum; return true; }
-            }
-            else if (op == "Average")
-            {
-                double avg = typed.DefaultIfEmpty().Average();
-                if (typeof(TResult) == typeof(double)) { result = (TResult)(object)avg; return true; }
-            }
-            else if (op == "Min")
-            {
-                int min = typed.DefaultIfEmpty().Min();
-                if (typeof(TResult) == typeof(int)) { result = (TResult)(object)min; return true; }
-            }
-            else if (op == "Max")
-            {
-                int max = typed.DefaultIfEmpty().Max();
-                if (typeof(TResult) == typeof(int)) { result = (TResult)(object)max; return true; }
-            }
-        }
-        else if (fieldType == typeof(long))
-        {
-            var typed = (IEnumerable<long>)values;
-            if (op == "Sum")
-            {
-                long sum = 0;
-                foreach (var v in typed) sum += v;
-                if (typeof(TResult) == typeof(long)) { result = (TResult)(object)sum; return true; }
-            }
-            else if (op == "Average")
-            {
-                double avg = typed.DefaultIfEmpty().Select(x => (double)x).Average();
-                if (typeof(TResult) == typeof(double)) { result = (TResult)(object)avg; return true; }
-            }
-            else if (op == "Min")
-            {
-                long min = typed.DefaultIfEmpty().Min();
-                if (typeof(TResult) == typeof(long)) { result = (TResult)(object)min; return true; }
-            }
-            else if (op == "Max")
-            {
-                long max = typed.DefaultIfEmpty().Max();
-                if (typeof(TResult) == typeof(long)) { result = (TResult)(object)max; return true; }
-            }
-        }
-        return false;
-    }
-
-    // ─── Push-down SELECT helper ──────────────────────────────────────────────
-
-    /// <summary>
-    /// Attempts to execute the query entirely via a single-pass BSON projection scan,
-    /// bypassing full <typeparamref name="T"/> deserialisation.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> and the projected <c>IEnumerable&lt;TProj&gt;</c> in <paramref name="result"/>;
-    /// <c>false</c> if push-down is not applicable (caller should fall through to the standard path).
-    /// <c>default(TResult)</c> cannot signal this: for a value-type result such as <c>bool</c> it
-    /// is a valid answer (#181).
-    /// </returns>
-    [RequiresDynamicCode("BLite LINQ queries use Expression.Compile() and MakeGenericMethod which require dynamic code generation.")]
-    [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
-    private bool TryPushDownSelect<TResult>(LambdaExpression selectLambda,
-                                            LambdaExpression? whereLambda,
-                                            out TResult result)
-    {
-        result = default!;
-
-        // We need TResult = IEnumerable<TProj> for some projection type TProj.
-        if (!IsSequenceResult<TResult>()) return false;
-
-        var projType = typeof(TResult).GetGenericArguments()[0];
-        if (projType == typeof(T)) return false; // not a real projection
-
-        // Compile the push-down projector via reflection (TProj is only known at runtime).
-        // BsonProjectionCompiler.TryCompile<T, TProj>(selectLambda, whereLambda?) handles
-        // both the pure-SELECT and the WHERE+SELECT cases in a single BSON pass.
-        object? projector;
-        try
-        {
-            var compileMethod = s_compiledSelectMethods.GetOrAdd(
-                projType,
-                t => s_tryCompileMethod.MakeGenericMethod(typeof(T), t));
-            projector = compileMethod.Invoke(null, [selectLambda, whereLambda, _collection.GetKeyMap()]);
-        }
-        catch { return false; }
-
-        if (projector is null) return false; // compilation soft-failed
-
-        // Invoke _collection.Scan<TProj>(projector) — MethodInfo cached per TProj.
-        try
-        {
-            var scanMethod = s_compiledScanMethods.GetOrAdd(
-                projType,
-                t => s_scanProjectorMethod.MakeGenericMethod(t));
-            if (scanMethod.Invoke(_collection, [projector]) is not TResult scanned) return false;
-            result = scanned;
-            return true;
-        }
-        catch { return false; }
+        return source is ConstantExpression { Value: IQueryable };
     }
 
     // ─── Expression-tree helpers ──────────────────────────────────────────────
