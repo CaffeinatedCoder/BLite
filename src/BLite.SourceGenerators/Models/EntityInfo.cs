@@ -95,6 +95,12 @@ namespace BLite.SourceGenerators.Models
         public bool HasInitOnlySetter { get; set; }
         public bool HasAnySetter { get; set; }
         public bool IsReadOnlyGetter { get; set; }
+
+        /// <summary>
+        /// True when every accessor is compiler-implemented (<c>{ get; set; }</c>, <c>{ get; init; }</c>,
+        /// <c>{ get; private set; }</c>): the getter returns exactly what was last assigned.
+        /// </summary>
+        public bool IsAutoProperty { get; set; }
         public string? BackingFieldName { get; set; }
 
         /// <summary>

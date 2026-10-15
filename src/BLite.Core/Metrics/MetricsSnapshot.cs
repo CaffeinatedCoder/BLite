@@ -37,6 +37,13 @@ public sealed class MetricsSnapshot
     /// <summary>Average checkpoint duration in microseconds. 0 if no checkpoints yet.</summary>
     public double AvgCheckpointLatencyUs { get; init; }
 
+    /// <summary>
+    /// Total number of checkpoints that wrote nothing because they failed: a lock timeout, an
+    /// error, or (multi-process mode) a shared WAL that could not be replayed first. Not included
+    /// in <see cref="CheckpointsTotal"/> or <see cref="AvgCheckpointLatencyUs"/>.
+    /// </summary>
+    public long CheckpointsFailedTotal { get; init; }
+
     // ── Collection operations ───────────────────────────────────────────────
 
     /// <summary>Total document inserts across all collections.</summary>

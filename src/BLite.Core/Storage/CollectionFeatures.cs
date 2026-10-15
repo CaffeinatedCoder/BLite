@@ -43,15 +43,44 @@ internal sealed record RequiredFeature(string Id, FeatureRequirement Requirement
 /// know refuses to open or modify the collection instead of silently damaging it.
 /// </summary>
 /// <remarks>
-/// Only versions that contain this check can refuse; releases before it ignore the record and may
-/// also drop it when they rewrite the collection's metadata. An index of a type newer than any this
-/// version knows is refused the same way, so a new index type stays protected even after such a
-/// release dropped the record.
+/// <para>
+/// Only versions that contain this check can refuse. Releases before it ignore the section and drop
+/// it whenever they rewrite the collection's metadata, so a database that uses a feature must not be
+/// opened for writing by them.
+/// </para>
+/// <para>
+/// An index of a type newer than any this version knows is refused the same way. That protects a new
+/// index type after such a release rewrote the record only if that release kept the index entry, as
+/// its typed collections and its saves that start from the stored record (sequence values, root page
+/// ids) do. A release that rebuilds the index list from the indexes it loaded drops the entry along
+/// with the section, and then nothing is left to refuse: in 5.2.3 that is
+/// <c>DynamicCollection.PersistIndexMetadata</c>, which runs on every dynamic index create or drop and
+/// on a vacuum that rebuilds indexes.
+/// </para>
+/// <para>
+/// Format rule: data a future version needs per index goes only in a trailing section of the record
+/// (as the key formats do), never inline in the index list. <c>ReadCollectionMetadata</c> reads the
+/// list by position; bytes it does not expect there shift everything after them, so the record no
+/// longer parses. <c>GetCollectionMetadata</c> then returns <c>null</c> and a dynamic open treats the
+/// collection as new and saves a fresh record over it, so this refusal never runs. This version's
+/// <c>SaveCollectionMetadata</c> refuses to overwrite a stored record it cannot parse, but that still
+/// turns the newer version's clear refusal into a generic one, and every release before it overwrites
+/// the record.
+/// </para>
 /// </remarks>
 internal static class CollectionFeatures
 {
-    // Features this version implements. Empty until a feature that needs protecting ships.
-    private static readonly HashSet<string> s_known = new(StringComparer.Ordinal);
+    /// <summary>
+    /// Full-text indexes (#70), recorded while the collection has at least one. Needed to open: a
+    /// version without them reads a full-text index as a B-Tree index, so its query planner would
+    /// answer equality, range and IN lookups on the property from the postings, and its writes
+    /// would leave keys and stale postings behind.
+    /// </summary>
+    internal static readonly RequiredFeature FullTextIndexes =
+        new("fulltext-index", FeatureRequirement.Open, "full-text indexes (BLite 5.3 or later)");
+
+    // Features this version implements.
+    private static readonly HashSet<string> s_known = new(StringComparer.Ordinal) { FullTextIndexes.Id };
 
     // Highest IndexType this version knows; larger values come from newer versions. 0 is accepted:
     // older releases could persist an index whose type was never set.
@@ -67,6 +96,24 @@ internal static class CollectionFeatures
 
     /// <summary>Whether this version implements the feature with the given id.</summary>
     internal static bool IsKnown(string id) => s_known.Contains(id);
+
+    /// <summary>
+    /// Records the features the indexes in <paramref name="metadata"/> require and removes those
+    /// none of them requires any more (today: <see cref="FullTextIndexes"/> while there is a
+    /// full-text index). Call after changing the index list, before saving the record. Other
+    /// features, including ones this version does not know, are left as they are.
+    /// </summary>
+    /// <returns>Whether <paramref name="metadata"/> changed.</returns>
+    internal static bool SyncIndexFeatures(CollectionMetadata metadata)
+    {
+        bool needed = metadata.Indexes.Any(i => i.Type == IndexType.FullText);
+        bool recorded = metadata.RequiredFeatures.Any(f => f.Id == FullTextIndexes.Id);
+        if (needed == recorded) return false;
+
+        if (needed) metadata.RequiredFeatures.Add(FullTextIndexes);
+        else metadata.RequiredFeatures.RemoveAll(f => f.Id == FullTextIndexes.Id);
+        return true;
+    }
 
     /// <summary>
     /// Whether this version may open the collection: every feature it requires is known, except
@@ -109,12 +156,32 @@ internal static class CollectionFeatures
             "supports these features.");
     }
 
+    /// <summary>
+    /// The exception for a stored record of collection <paramref name="name"/> that this version
+    /// cannot parse, e.g. one a newer version wrote in a layout this one does not know. Such a record
+    /// is never overwritten or dropped, since its features cannot be checked.
+    /// </summary>
+    internal static NotSupportedException UnreadableRecord(string name, Exception cause)
+        => new(
+            $"The stored metadata of collection '{name}' cannot be read by BLite {s_version}; it may have " +
+            "been written by a newer version, or be damaged. It was left unchanged; use the BLite version " +
+            "that wrote it.", cause);
+
     private static List<RequiredFeature> Unsupported(CollectionMetadata metadata, bool readOnly)
+        => Unsupported(metadata, readOnly, s_known, s_maxIndexType);
+
+    /// <summary>
+    /// The features that keep a version knowing only <paramref name="known"/> features and index
+    /// types up to <paramref name="maxIndexType"/> from opening (or, with <paramref name="readOnly"/>
+    /// false, modifying) the collection. Takes the version's knowledge as parameters so tests can
+    /// ask what an older version would refuse.
+    /// </summary>
+    internal static List<RequiredFeature> Unsupported(CollectionMetadata metadata, bool readOnly, ICollection<string> known, byte maxIndexType)
     {
         var result = new List<RequiredFeature>();
         foreach (var feature in metadata.RequiredFeatures)
         {
-            if (IsKnown(feature.Id)) continue;
+            if (known.Contains(feature.Id)) continue;
             if (readOnly && feature.Requirement == FeatureRequirement.Write) continue;
             result.Add(feature);
         }
@@ -124,7 +191,7 @@ internal static class CollectionFeatures
         foreach (var index in metadata.Indexes)
         {
             var type = (byte)index.Type;
-            if (type > s_maxIndexType)
+            if (type > maxIndexType)
                 result.Add(new RequiredFeature($"index-type-{type}", FeatureRequirement.Open,
                     $"index '{index.Name}' of type {type}, which this version does not know"));
         }

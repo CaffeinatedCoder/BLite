@@ -37,6 +37,7 @@ internal sealed class MetricsDispatcher : IDisposable
     // ── Checkpoint counters ─────────────────────────────────────────────────
     private long _checkpoints;
     private long _checkpointLatencySum; // microseconds
+    private long _checkpointsFailed;
 
     // ── Global collection counters ──────────────────────────────────────────
     private long _inserts;
@@ -185,6 +186,7 @@ internal sealed class MetricsDispatcher : IDisposable
             GroupCommitAvgBatchSize   = gcBatches > 0 ? (double)gcSizeSum / gcBatches : 0,
             CheckpointsTotal          = cpCount,
             AvgCheckpointLatencyUs    = cpCount > 0 ? (double)cpLatSum / cpCount : 0,
+            CheckpointsFailedTotal    = Interlocked.Read(ref _checkpointsFailed),
             InsertsTotal              = inserts,
             UpdatesTotal              = updates,
             DeletesTotal              = deletes,
@@ -247,6 +249,11 @@ internal sealed class MetricsDispatcher : IDisposable
                 break;
 
             case MetricEventType.Checkpoint:
+                if (!evt.Success)
+                {
+                    Interlocked.Increment(ref _checkpointsFailed);
+                    break;
+                }
                 Interlocked.Increment(ref _checkpoints);
                 Interlocked.Add(ref _checkpointLatencySum, micros);
                 break;

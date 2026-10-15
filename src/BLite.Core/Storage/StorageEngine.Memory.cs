@@ -444,6 +444,13 @@ public sealed partial class StorageEngine
                         toFree.Add(pageId);
                     break;
                 }
+                case IndexType.FullText:
+                {
+                    var ftsIndex = new FullTextIndex(this, IndexOptions.CreateBTree(idx.PropertyPaths), idx.RootPageId);
+                    foreach (var pageId in ftsIndex.CollectAllPages())
+                        toFree.Add(pageId);
+                    break;
+                }
                 case IndexType.Spatial:
                 {
                     var opts = IndexOptions.CreateSpatial(idx.PropertyPaths);

@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BLite.Bson;
+using BLite.Core.Text;
 using BLite.Core.Audit;
 using BLite.Core.CDC;
 using BLite.Core.Collections;
@@ -28,6 +29,7 @@ public sealed record DynamicIndexDescriptor(
 {
     public bool IsVector => Type == IndexType.Vector;
     public bool IsSpatial => Type == IndexType.Spatial;
+    public bool IsFullText => Type == IndexType.FullText;
     public bool IsStandard => Type == IndexType.BTree;
 }
 
@@ -59,7 +61,7 @@ public sealed class DynamicCollection : IDisposable
     private int _retentionRunning; // 0=idle, 1=running (Interlocked flag)
 
     // ── Discriminated union for secondary indexes ─────────────────────────────
-    private enum DynamicIndexKind { BTree, Vector, Spatial }
+    private enum DynamicIndexKind { BTree, Vector, Spatial, FullText }
 
     private sealed class DynamicSecondaryIndex
     {
@@ -69,7 +71,14 @@ public sealed class DynamicCollection : IDisposable
         public BTreeIndex? BTree { get; }
         public VectorSearchIndex? Vector { get; }
         public RTreeIndex? Spatial { get; }
-        public uint RootPageId => BTree?.RootPageId ?? Vector?.RootPageId ?? Spatial?.RootPageId ?? 0;
+        public FullTextIndex? FullText { get; }
+        /// <summary>
+        /// Key format of a full-text index's pages, persisted as its <see cref="IndexMetadata.KeyFormat"/>.
+        /// Kept per index so persisting the metadata never marks an index that still awaits its
+        /// rebuild as current.
+        /// </summary>
+        public byte KeyFormat { get; init; } = FullTextIndex.FormatVersion;
+        public uint RootPageId => BTree?.RootPageId ?? Vector?.RootPageId ?? Spatial?.RootPageId ?? FullText?.RootPageId ?? 0;
 
         public DynamicSecondaryIndex(BTreeIndex btree, string fieldPath, IndexOptions options)
         { Kind = DynamicIndexKind.BTree; BTree = btree; FieldPath = fieldPath; Options = options; }
@@ -79,6 +88,9 @@ public sealed class DynamicCollection : IDisposable
 
         public DynamicSecondaryIndex(RTreeIndex spatial, string fieldPath, IndexOptions options)
         { Kind = DynamicIndexKind.Spatial; Spatial = spatial; FieldPath = fieldPath; Options = options; }
+
+        public DynamicSecondaryIndex(FullTextIndex fullText, string fieldPath, IndexOptions options)
+        { Kind = DynamicIndexKind.FullText; FullText = fullText; FieldPath = fieldPath; Options = options; }
     }
 
     // Secondary indexes: name → DynamicSecondaryIndex
@@ -114,6 +126,7 @@ public sealed class DynamicCollection : IDisposable
         using var openLock = _storage.EnterOpenLock();
 
         // Load or create collection metadata
+        var staleFullTextIndexes = new List<string>();
         var metadata = _storage.GetCollectionMetadata(_collectionName);
         uint primaryRootPageId = 0;
 
@@ -162,6 +175,15 @@ public sealed class DynamicCollection : IDisposable
                         _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(spatial, fieldPath, opts);
                         break;
                     }
+                    case IndexType.FullText:
+                    {
+                        var opts = IndexOptions.CreateBTree(idxMeta.PropertyPaths);
+                        var fullText = new FullTextIndex(_storage, opts, idxMeta.RootPageId);
+                        _secondaryIndexes[idxMeta.Name] = new DynamicSecondaryIndex(fullText, fieldPath, opts) { KeyFormat = idxMeta.KeyFormat };
+                        if (idxMeta.KeyFormat != FullTextIndex.FormatVersion || fullText.HasForeignKeys())
+                            staleFullTextIndexes.Add(idxMeta.Name);
+                        break;
+                    }
                 }
             }
         }
@@ -192,13 +214,112 @@ public sealed class DynamicCollection : IDisposable
                 rootsChanged = true;
             }
         }
+        // Re-record the features the indexes require if a release that predates them rewrote the
+        // record and dropped them (a read-only open cannot, and the indexes still protect it).
+        if (!_storage.IsReadOnly && CollectionFeatures.SyncIndexFeatures(metadata))
+            rootsChanged = true;
         // Only the root ids are patched in place so index entries this constructor does not
         // restore (unknown types, no property paths) are preserved as stored.
         if (rootsChanged)
             _storage.SaveCollectionMetadata(metadata);
 
+        // A full-text index written with another analyzer or key layout is rebuilt: deleting a
+        // document relies on reproducing the keys it was indexed under.
+        foreach (var name in staleFullTextIndexes)
+            RebuildFullTextIndex(name);
+
         // Rebuild the free-space index from existing page headers on cold start.
         RebuildFreeSpaceIndex();
+    }
+
+    /// <summary>
+    /// Rebuilds full-text index <paramref name="name"/> into a fresh tree, swaps it in once the
+    /// rebuild committed, persists it with the current format version and frees the old tree.
+    /// If the rebuild or the swap fails, the fresh tree's pages are freed and the old index stays
+    /// persisted as it was, so the next open retries.
+    /// </summary>
+    private void RebuildFullTextIndex(string name)
+    {
+        var old = _secondaryIndexes[name];
+        var fresh = new DynamicSecondaryIndex(new FullTextIndex(_storage, old.Options), old.FieldPath, old.Options);
+        // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+        Task.Run(() => FillUnregisteredFullTextIndexAsync(fresh)).GetAwaiter().GetResult();
+
+        var oldPages = old.FullText!.CollectAllPages();
+        PublishFullTextIndex(name, fresh, old);
+        foreach (var pageId in oldPages)
+            _storage.FreePage(pageId);
+    }
+
+    /// <summary>
+    /// Fills a full-text index that is not registered yet from every document, in its own
+    /// transaction, and commits it. If a document cannot be read or indexed, or the commit fails,
+    /// every page of the index is freed, including the pages its splits added, and the exception
+    /// propagates.
+    /// </summary>
+    private async Task FillUnregisteredFullTextIndexAsync(DynamicSecondaryIndex index)
+    {
+        var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        try
+        {
+            foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+            {
+                var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
+                if (doc != null) IndexInsert(index, doc, e.Location, transaction);
+            }
+            await transaction.CommitAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // Collect the pages through the transaction before rolling it back: pages added by
+            // splits are allocated outside the transaction but linked only from nodes written in
+            // it, so after the rollback they could not be found any more.
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = index.FullText!.CollectAllPages(transaction.TransactionId); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            try { await transaction.RollbackAsync().ConfigureAwait(false); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            FreePagesBestEffort(pages);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Registers the filled full-text index <paramref name="index"/> under <paramref name="name"/>
+    /// in place of <paramref name="previous"/> (null: none) and persists the metadata. If that
+    /// fails, the previous registration is restored, the index's pages are freed and the exception
+    /// propagates.
+    /// </summary>
+    private void PublishFullTextIndex(string name, DynamicSecondaryIndex index, DynamicSecondaryIndex? previous)
+    {
+        _secondaryIndexes[name] = index;
+        try
+        {
+            PersistIndexMetadata();
+        }
+        catch
+        {
+            if (previous != null) _secondaryIndexes[name] = previous;
+            else _secondaryIndexes.Remove(name);
+
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = index.FullText!.CollectAllPages(); }
+            catch { /* best-effort: never mask the original failure */ }
+            FreePagesBestEffort(pages);
+            throw;
+        }
+    }
+
+    private void FreePagesBestEffort(IReadOnlyList<uint> pages)
+    {
+        try
+        {
+            foreach (var pageId in pages)
+                _storage.FreePage(pageId);
+        }
+        catch { /* best-effort: never mask the original failure */ }
     }
 
     private void RebuildFreeSpaceIndex()
@@ -603,6 +724,11 @@ public sealed class DynamicCollection : IDisposable
             document = PrependId(document, id);
         }
 
+        // Everything that can reject the document is checked before any page is written, so a
+        // rejected insert leaves nothing behind (BLiteValidationException keeps the transaction usable).
+        var key = new IndexKey(id.ToBytes());
+        ValidateWrite(id, key, document, oldDocument: null, isInsert: true, transaction);
+
         // Write raw BSON to storage
         var docData = document.RawData;
         DocumentLocation location = default;
@@ -633,11 +759,11 @@ public sealed class DynamicCollection : IDisposable
         }
         else
         {
-            throw new InvalidOperationException($"Document size {docData.Length} exceeds maximum single page size. Overflow not yet supported in DynamicCollection.");
+            // Unreachable: ValidateWrite rejects documents that do not fit in a page.
+            throw new BLiteValidationException($"Document size {docData.Length} exceeds maximum single page size. Overflow not yet supported in DynamicCollection.");
         }
 
         // Index the _id
-        var key = new IndexKey(id.ToBytes());
         _primaryIndex.Insert(key, location, transaction.TransactionId);
 
         // UpdateAsync secondary indexes
@@ -692,6 +818,14 @@ public sealed class DynamicCollection : IDisposable
     /// If the document has no _id field, one is auto-generated.
     /// Returns the BsonId of the inserted document.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<BsonId> InsertAsync(BsonDocument document, ITransaction? transaction, CancellationToken ct = default)
     {
         if (document == null) throw new ArgumentNullException(nameof(document));
@@ -705,6 +839,8 @@ public sealed class DynamicCollection : IDisposable
         // ─────────────────────────────────────────────────────────────────────
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Insert).");
@@ -729,9 +865,9 @@ public sealed class DynamicCollection : IDisposable
             success = true;
             return result;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex);
             throw;
         }
         finally
@@ -788,18 +924,28 @@ public sealed class DynamicCollection : IDisposable
     /// Inserts multiple BsonDocuments asynchronously in a single transaction.
     /// Returns the list of generated/existing BsonIds in insertion order.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<List<BsonId>> InsertBulkAsync(IEnumerable<BsonDocument> documents, ITransaction? transaction, CancellationToken ct = default)
     {
         if (documents == null) throw new ArgumentNullException(nameof(documents));
         bool autoCommit = transaction == null;
 
+        WriteFailure.EnsureWritable(transaction);
+
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (InsertBulk).");
 
         transaction ??= _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        var ids = new List<BsonId>();
         try
         {
-            var ids = new List<BsonId>();
             foreach (var doc in documents)
             {
                 ct.ThrowIfCancellationRequested();
@@ -820,9 +966,9 @@ public sealed class DynamicCollection : IDisposable
             }
             return ids;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: ids.Count > 0);
             throw;
         }
         finally
@@ -990,6 +1136,45 @@ public sealed class DynamicCollection : IDisposable
     }
 
     /// <summary>
+    /// Returns the <paramref name="k"/> documents that best match <paramref name="query"/> in a
+    /// full-text index, best first, each with its BM25 relevance score.
+    /// The field must have been indexed via <see cref="CreateFullTextIndexAsync"/>.
+    /// </summary>
+    /// <param name="indexName">The name of the full-text index to search.</param>
+    /// <param name="query">The terms to look for, analyzed like the indexed text.</param>
+    /// <param name="k">Maximum number of documents to return.</param>
+    /// <param name="matchAllTerms">
+    /// <c>true</c> (the default) to return only documents containing every query term;
+    /// <c>false</c> to return documents containing any of them, ranked by relevance.
+    /// </param>
+    public async IAsyncEnumerable<FullTextSearchResult<BsonDocument>> FullTextSearchAsync(
+        string indexName,
+        string query,
+        int k,
+        bool matchAllTerms = true,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (!_secondaryIndexes.TryGetValue(indexName, out var entry) || entry.Kind != DynamicIndexKind.FullText || entry.FullText == null)
+            throw new ArgumentException($"Full-text index '{indexName}' not found on collection '{_collectionName}'");
+
+        int returned = 0;
+        foreach (var (location, score) in entry.FullText.SearchExpanding(query, k, matchAllTerms, null))
+        {
+            ct.ThrowIfCancellationRequested();
+            var doc = ReadDocumentAt(location, 0UL);
+            if (doc == null) continue;
+
+            // Re-check the hit, so a stale posting can never surface another document; candidates
+            // past the first k are taken until k hits survive the re-check.
+            var text = TryGetNestedValue(doc, entry.FieldPath, out var val) && val.IsString ? val.AsString : null;
+            if (!(matchAllTerms ? FullTextAnalyzer.Matches(text, query) : FullTextAnalyzer.MatchesAny(text, query))) continue;
+
+            yield return new FullTextSearchResult<BsonDocument>(doc, score);
+            if (++returned == k) yield break;
+        }
+    }
+
+    /// <summary>
     /// Asynchronously yields documents matching the specified predicate.
     /// </summary>
     public async IAsyncEnumerable<BsonDocument> FindAsync(Func<BsonDocument, bool> predicate, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -1012,6 +1197,14 @@ public sealed class DynamicCollection : IDisposable
     /// <summary>
     /// Updates a document by its BsonId asynchronously. Replaces the entire document.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<bool> UpdateAsync(BsonId id, BsonDocument newDocument, ITransaction? transaction, CancellationToken ct = default)
     {
         if (newDocument == null) throw new ArgumentNullException(nameof(newDocument));
@@ -1019,6 +1212,8 @@ public sealed class DynamicCollection : IDisposable
         var sw = _storage.MetricsDispatcher != null ? Metrics.ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Update).");
@@ -1036,9 +1231,9 @@ public sealed class DynamicCollection : IDisposable
             success = true;
             return true;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex);
             throw;
         }
         finally
@@ -1065,24 +1260,20 @@ public sealed class DynamicCollection : IDisposable
     private async Task UpdateAtLocationCore(BsonId id, IndexKey key, BsonDocument newDocument, DocumentLocation oldLocation, ITransaction transaction)
     {
         var oldDoc = ReadDocumentAt(oldLocation, transaction.TransactionId);
-        DeleteSlot(oldLocation, transaction);
 
         if (!newDocument.TryGetId(out _))
             newDocument = PrependId(newDocument, id);
 
+        // Everything that can reject the document is checked before any page is written.
+        ValidateWrite(id, key, newDocument, oldDoc, isInsert: false, transaction);
+
+        DeleteSlot(oldLocation, transaction);
+
         var docData = newDocument.RawData;
-        DocumentLocation newLocation;
-        if (docData.Length + SlotEntry.Size <= _maxDocumentSizeForSinglePage)
-        {
-            var pageId = FindPageWithSpace(docData.Length + SlotEntry.Size, transaction.TransactionId);
-            if (pageId == 0) pageId = AllocateNewDataPage(transaction);
-            var slotIndex = InsertIntoPage(pageId, docData, transaction);
-            newLocation = new DocumentLocation(pageId, slotIndex);
-        }
-        else
-        {
-            throw new InvalidOperationException("Document too large for single page. Overflow not yet supported in DynamicCollection.");
-        }
+        var pageId = FindPageWithSpace(docData.Length + SlotEntry.Size, transaction.TransactionId);
+        if (pageId == 0) pageId = AllocateNewDataPage(transaction);
+        var slotIndex = InsertIntoPage(pageId, docData, transaction);
+        var newLocation = new DocumentLocation(pageId, slotIndex);
 
         _primaryIndex.Delete(key, oldLocation, transaction.TransactionId);
         _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
@@ -1103,6 +1294,14 @@ public sealed class DynamicCollection : IDisposable
         => UpsertAsync(document, null, ct);
 
     /// <inheritdoc cref="UpsertAsync(BsonDocument, CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<UpsertResult<BsonId>> UpsertAsync(BsonDocument document, ITransaction? transaction, CancellationToken ct = default)
     {
         if (document == null) throw new ArgumentNullException(nameof(document));
@@ -1115,6 +1314,8 @@ public sealed class DynamicCollection : IDisposable
         bool success = false;
         bool inserted = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Upsert).");
@@ -1138,9 +1339,9 @@ public sealed class DynamicCollection : IDisposable
             success = true;
             return result;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex);
             throw;
         }
         finally
@@ -1194,18 +1395,28 @@ public sealed class DynamicCollection : IDisposable
         => UpsertBulkAsync(documents, null, ct);
 
     /// <inheritdoc cref="UpsertBulkAsync(IEnumerable{BsonDocument}, CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<List<UpsertResult<BsonId>>> UpsertBulkAsync(IEnumerable<BsonDocument> documents, ITransaction? transaction, CancellationToken ct = default)
     {
         if (documents == null) throw new ArgumentNullException(nameof(documents));
         bool autoCommit = transaction == null;
 
+        WriteFailure.EnsureWritable(transaction);
+
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (UpsertBulk).");
 
         transaction ??= _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        var results = new List<UpsertResult<BsonId>>();
         try
         {
-            var results = new List<UpsertResult<BsonId>>();
             bool anyInserted = false;
             foreach (var doc in documents)
             {
@@ -1228,9 +1439,9 @@ public sealed class DynamicCollection : IDisposable
             }
             return results;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: results.Count > 0);
             throw;
         }
         finally
@@ -1273,18 +1484,28 @@ public sealed class DynamicCollection : IDisposable
     /// Updates multiple documents asynchronously in a single transaction.
     /// Returns the number of documents successfully updated.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<int> UpdateBulkAsync(IEnumerable<(BsonId Id, BsonDocument Document)> updates, ITransaction? transaction, CancellationToken ct = default)
     {
         if (updates == null) throw new ArgumentNullException(nameof(updates));
         bool autoCommit = transaction == null;
 
+        WriteFailure.EnsureWritable(transaction);
+
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (UpdateBulk).");
 
         transaction ??= _storage.BeginTransaction(IsolationLevel.ReadCommitted);
+        var count = 0;
         try
         {
-            var count = 0;
             foreach (var (id, doc) in updates)
             {
                 ct.ThrowIfCancellationRequested();
@@ -1292,37 +1513,15 @@ public sealed class DynamicCollection : IDisposable
                 if (!_primaryIndex.TryFind(key, out var oldLocation, transaction.TransactionId))
                     continue;
 
-                var oldDoc = ReadDocumentAt(oldLocation, transaction.TransactionId);
-                DeleteSlot(oldLocation, transaction);
-
-                var newDoc = doc;
-                if (!newDoc.TryGetId(out _))
-                    newDoc = PrependId(newDoc, id);
-
-                var docData = newDoc.RawData;
-                if (docData.Length + SlotEntry.Size > _maxDocumentSizeForSinglePage)
-                    throw new InvalidOperationException("Document too large for single page.");
-
-                var pageId = FindPageWithSpace(docData.Length + SlotEntry.Size, transaction.TransactionId);
-                if (pageId == 0) pageId = AllocateNewDataPage(transaction);
-                var slotIndex = InsertIntoPage(pageId, docData, transaction);
-                var newLocation = new DocumentLocation(pageId, slotIndex);
-
-                _primaryIndex.Delete(key, oldLocation, transaction.TransactionId);
-                _primaryIndex.Insert(key, newLocation, transaction.TransactionId);
-
-                foreach (var (_, idx) in _secondaryIndexes)
-                    IndexUpdate(idx, oldDoc, newDoc, oldLocation, newLocation, transaction);
-
-                await NotifyCdcAsync(OperationType.Update, id, transaction, newDoc.RawData);
+                await UpdateAtLocationCore(id, key, doc, oldLocation, transaction);
                 count++;
             }
             if (autoCommit) await transaction.CommitAsync(ct);
             return count;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: count > 0);
             throw;
         }
         finally
@@ -1343,11 +1542,18 @@ public sealed class DynamicCollection : IDisposable
     /// <summary>
     /// Deletes a document by its BsonId asynchronously.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async ValueTask<bool> DeleteAsync(BsonId id, ITransaction? transaction, CancellationToken ct = default)
     {
         var sw = _storage.MetricsDispatcher != null ? Metrics.ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Delete).");
@@ -1374,9 +1580,9 @@ public sealed class DynamicCollection : IDisposable
             success = true;
             return true;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex);
             throw;
         }
         finally
@@ -1402,10 +1608,17 @@ public sealed class DynamicCollection : IDisposable
     /// Deletes multiple documents asynchronously in a single transaction.
     /// Returns the number of documents successfully deleted.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async ValueTask<int> DeleteBulkAsync(IEnumerable<BsonId> ids, ITransaction? transaction, CancellationToken ct = default)
     {
         if (ids == null) throw new ArgumentNullException(nameof(ids));
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (DeleteBulk).");
@@ -1437,9 +1650,9 @@ public sealed class DynamicCollection : IDisposable
             if (autoCommit) await transaction.CommitAsync(ct);
             return count;
         }
-        catch
+        catch (Exception ex)
         {
-            await transaction.RollbackAsync();
+            await WriteFailure.HandleAsync(transaction, autoCommit, ex);
             throw;
         }
         finally
@@ -1591,6 +1804,7 @@ public sealed class DynamicCollection : IDisposable
                         DynamicIndexKind.BTree    => new DynamicSecondaryIndex(new BTreeIndex(_storage, entry.Options), entry.FieldPath, entry.Options),
                         DynamicIndexKind.Vector   => new DynamicSecondaryIndex(new VectorSearchIndex(_storage, entry.Options), entry.FieldPath, entry.Options),
                         DynamicIndexKind.Spatial  => new DynamicSecondaryIndex(new RTreeIndex(_storage, entry.Options, 0), entry.FieldPath, entry.Options),
+                        DynamicIndexKind.FullText => new DynamicSecondaryIndex(new FullTextIndex(_storage, entry.Options), entry.FieldPath, entry.Options),
                         _                         => entry
                     };
                     rebuildEntries[name] = freshEntry;
@@ -1741,6 +1955,46 @@ public sealed class DynamicCollection : IDisposable
         PersistIndexMetadata();
     }
 
+    /// <summary>
+    /// Creates a full-text index on a string field (dot-notation for nested fields), filled from
+    /// the documents already in the collection. Search it with <see cref="FullTextSearchAsync"/>.
+    /// The default name is <c>idx_fts_{field}</c>.
+    /// <para>
+    /// Compatibility: the collection records that it requires full-text indexes, so BLite 5.3 and
+    /// later versions without them refuse to open it. Older releases cannot refuse: do not open a
+    /// database with full-text indexes for writing with BLite &lt; 5.3.
+    /// </para>
+    /// </summary>
+    public async Task CreateFullTextIndexAsync(string fieldPath, string? name = null)
+    {
+        name ??= $"idx_fts_{fieldPath.ToLowerInvariant()}";
+        fieldPath = fieldPath.ToLowerInvariant();
+
+        // Block writers while the index is filled: a document inserted meanwhile would miss the
+        // index, which only starts receiving writes once it is registered.
+        if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs).ConfigureAwait(false))
+            throw new TimeoutException("Timed out acquiring collection write lock (CreateFullTextIndexAsync).");
+        try
+        {
+            if (_secondaryIndexes.ContainsKey(name))
+                throw new InvalidOperationException($"Index '{name}' already exists");
+
+            RegisterNestedPathKeys(fieldPath);
+
+            var opts = IndexOptions.CreateBTree(fieldPath);
+            var entry = new DynamicSecondaryIndex(new FullTextIndex(_storage, opts), fieldPath, opts);
+
+            // Fill before registering, so a crash or a failure leaves no partial index persisted;
+            // a failed fill or registration frees the index's pages.
+            await FillUnregisteredFullTextIndexAsync(entry).ConfigureAwait(false);
+            PublishFullTextIndex(name, entry, previous: null);
+        }
+        finally
+        {
+            _collectionLock.Release();
+        }
+    }
+
     /// <summary>Drops a secondary index by name.</summary>
     public bool DropIndex(string name)
     {
@@ -1799,8 +2053,9 @@ public sealed class DynamicCollection : IDisposable
         {
             var type = kvp.Value.Kind switch
             {
-                DynamicIndexKind.Vector  => IndexType.Vector,
-                DynamicIndexKind.Spatial => IndexType.Spatial,
+                DynamicIndexKind.Vector   => IndexType.Vector,
+                DynamicIndexKind.Spatial  => IndexType.Spatial,
+                DynamicIndexKind.FullText => IndexType.FullText,
                 _                        => IndexType.BTree
             };
             return new DynamicIndexDescriptor(
@@ -1842,15 +2097,90 @@ public sealed class DynamicCollection : IDisposable
                 case DynamicIndexKind.Spatial:
                     idxMeta.Type = IndexType.Spatial;
                     break;
+                case DynamicIndexKind.FullText:
+                    idxMeta.Type = IndexType.FullText;
+                    idxMeta.KeyFormat = idx.KeyFormat;
+                    break;
             }
 
             metadata.Indexes.Add(idxMeta);
         }
+        CollectionFeatures.SyncIndexFeatures(metadata);
 
         _storage.SaveCollectionMetadata(metadata);
     }
 
     // ── Index dispatch helpers ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="document"/> cannot be written:
+    /// it is too large for a page, its id is already taken (insert) or too large, a unique index
+    /// already holds its value, a vector does not match its index dimensions, or a B-Tree key is
+    /// larger than a node page. Called before any page is written, so a rejected write leaves the
+    /// data and every index untouched instead of failing halfway through the indexes.
+    /// </summary>
+    /// <param name="oldDocument">Stored version of the document on update; null on insert.</param>
+    private void ValidateWrite(BsonId id, IndexKey key, BsonDocument document, BsonDocument? oldDocument, bool isInsert, ITransaction transaction)
+    {
+        var size = document.RawData.Length;
+        if (!_isTimeSeries && size + SlotEntry.Size > _maxDocumentSizeForSinglePage)
+            throw new BLiteValidationException(
+                $"Document size {size} exceeds maximum single page size. Overflow not yet supported in DynamicCollection.");
+
+        if (key.Data.Length > _primaryIndex.MaxKeySize)
+            throw new BLiteValidationException(
+                $"Id of {key.Data.Length} bytes is too large for the primary index of collection '{_collectionName}' (maximum {_primaryIndex.MaxKeySize} bytes).");
+
+        if (isInsert && _primaryIndex.TryFind(key, out _, transaction.TransactionId))
+            throw new BLiteValidationException(
+                $"Duplicate key violation: a document with _id '{id}' already exists in collection '{_collectionName}'.");
+
+        foreach (var (name, idx) in _secondaryIndexes)
+        {
+            if (!TryGetNestedValue(document, idx.FieldPath, out var val)) continue;
+
+            switch (idx.Kind)
+            {
+                case DynamicIndexKind.BTree:
+                {
+                    if (BsonValueToIndexKey(val) is not { } indexKey) break;
+
+                    if (indexKey.Data.Length > idx.BTree!.MaxKeySize)
+                        throw new BLiteValidationException(
+                            $"Key of {indexKey.Data.Length} bytes is too large for index '{name}' (maximum {idx.BTree.MaxKeySize} bytes).");
+
+                    if (!idx.Options.Unique) break;
+
+                    // On update an unchanged key keeps its entry (IndexUpdate deletes it first),
+                    // so documents that already share a value can still be updated.
+                    if (oldDocument != null
+                        && TryGetNestedValue(oldDocument, idx.FieldPath, out var oldVal)
+                        && BsonValueToIndexKey(oldVal) is { } oldKey
+                        && oldKey.Data.SequenceEqual(indexKey.Data))
+                        break;
+
+                    if (idx.BTree.TryFind(indexKey, out _, transaction.TransactionId))
+                        throw new BLiteValidationException($"Duplicate key violation for unique index '{name}'");
+                    break;
+                }
+                case DynamicIndexKind.Vector:
+                {
+                    float[]? vector;
+                    try { vector = ExtractFloatVector(val); }
+                    catch (InvalidOperationException ex)
+                    {
+                        throw new BLiteValidationException(
+                            $"Field '{idx.FieldPath}' of vector index '{name}' is not a numeric array.", ex);
+                    }
+
+                    if (vector != null && vector.Length != idx.Options.Dimensions)
+                        throw new BLiteValidationException(
+                            $"Vector dimension mismatch for index '{name}'. Expected {idx.Options.Dimensions}, got {vector.Length}");
+                    break;
+                }
+            }
+        }
+    }
 
     private void IndexInsert(DynamicSecondaryIndex idx, BsonDocument document, DocumentLocation location, ITransaction transaction)
     {
@@ -1870,6 +2200,9 @@ public sealed class DynamicCollection : IDisposable
             case DynamicIndexKind.Spatial:
                 var coords = ExtractCoordinates(val);
                 if (coords.HasValue) idx.Spatial!.Insert(GeoBox.FromPoint(new GeoPoint(coords.Value.Lat, coords.Value.Lon)), location, transaction);
+                break;
+            case DynamicIndexKind.FullText:
+                if (val.IsString) idx.FullText!.Insert(val.AsString, location, transaction);
                 break;
         }
     }
@@ -1892,6 +2225,9 @@ public sealed class DynamicCollection : IDisposable
             case DynamicIndexKind.Spatial:
                 var coords = ExtractCoordinates(val);
                 if (coords.HasValue) idx.Spatial!.Delete(GeoBox.FromPoint(new GeoPoint(coords.Value.Lat, coords.Value.Lon)), location, transaction);
+                break;
+            case DynamicIndexKind.FullText:
+                if (val.IsString) idx.FullText!.Delete(val.AsString, location, transaction);
                 break;
         }
     }

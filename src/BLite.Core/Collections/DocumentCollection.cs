@@ -535,9 +535,19 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         return false;
     }
 
-    private async IAsyncEnumerable<(IndexEntry Entry, byte[] RawBytes)> EnumerateOwnedRawDocumentsAsync(
+    /// <summary>Processes the raw BSON of one document in place; returns whether to yield <paramref name="result"/>.</summary>
+    private delegate bool RawDocumentVisitor<TResult>(ReadOnlySpan<byte> bson, out TResult result);
+
+    /// <summary>
+    /// Visits the raw BSON of every document in primary-key order. Single-page documents are
+    /// handed to <paramref name="visit"/> straight from the page buffer, without a copy; only
+    /// overflow documents are reassembled. Each page is read once and kept until the scan ends:
+    /// primary-key order is not page order (ObjectIds created in the same second are not
+    /// monotonic), so a bounded window of pages would read the same pages over and over.
+    /// </summary>
+    private async IAsyncEnumerable<TResult> VisitRawDocumentsAsync<TResult>(
         ulong txnId,
-        bool includeOverflow,
+        RawDocumentVisitor<TResult> visit,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var pageCache = new Dictionary<uint, byte[]>();
@@ -550,25 +560,40 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (!pageCache.TryGetValue(entry.Location.PageId, out var cachedBuffer))
+                if (!pageCache.TryGetValue(entry.Location.PageId, out var pageBuffer))
                 {
-                    cachedBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
-                    _storage.ReadPage(entry.Location.PageId, txnId, cachedBuffer);
-                    pageCache[entry.Location.PageId] = cachedBuffer;
+                    pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
+                    _storage.ReadPage(entry.Location.PageId, txnId, pageBuffer);
+                    pageCache[entry.Location.PageId] = pageBuffer;
                 }
 
-                var rawBytes = ReadRawBytesAt(entry.Location, txnId, includeOverflow, cachedBuffer);
-                if (rawBytes is null) continue;
-                if (!MatchesIndexEntryKey(rawBytes, entry.Key)) continue;
-
-                yield return (entry, rawBytes);
+                if (TryVisitRawDocument(entry, txnId, pageBuffer, visit, out var result))
+                    yield return result;
             }
         }
         finally
         {
-            foreach (var buf in pageCache.Values)
-                ArrayPool<byte>.Shared.Return(buf);
+            foreach (var buf in pageCache.Values) ArrayPool<byte>.Shared.Return(buf);
         }
+    }
+
+    /// <summary>
+    /// Applies <paramref name="visit"/> to the document <paramref name="entry"/> points at, if that
+    /// slot still holds the document with this primary key.
+    /// </summary>
+    private bool TryVisitRawDocument<TResult>(IndexEntry entry, ulong txnId, byte[] pageBuffer, RawDocumentVisitor<TResult> visit, out TResult result)
+    {
+        result = default!;
+
+        var pageType = (PageType)pageBuffer[4];
+        if (pageType == PageType.Free || pageType == PageType.Empty || pageType == PageType.TimeSeries)
+            return false;
+
+        if (TryReadInlineRawBytes(pageBuffer, entry.Location.SlotIndex, out var inline))
+            return MatchesIndexEntryKey(inline, entry.Key) && visit(inline, out result);
+
+        var reassembled = ReadRawBytesAt(entry.Location, txnId, includeOverflow: true, pageBuffer);
+        return reassembled is not null && MatchesIndexEntryKey(reassembled, entry.Key) && visit(reassembled, out result);
     }
 
     /// <summary>
@@ -721,7 +746,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 foreach (var index in _indexManager.GetAllIndexes())
                 {
-                    await RebuildIndexFromScratchAsync(index.Name, ct).ConfigureAwait(false);
+                    await RebuildIndexFromScratchAsync(index, ct).ConfigureAwait(false);
                 }
             }
 
@@ -752,10 +777,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         => TruncateAsync(null, ct);
 
     /// <inheritdoc cref="TruncateAsync(CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async Task<int> TruncateAsync(ITransaction? transaction, CancellationToken ct = default)
     {
         int deleted = 0;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct).ConfigureAwait(false))
             throw new TimeoutException("Timed out acquiring collection lock (TruncateAsync).");
@@ -787,10 +819,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 if (autoCommit)
                     await transaction.CommitAsync(ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit)
-                    await transaction.RollbackAsync().ConfigureAwait(false);
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -871,10 +902,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
     /// <summary>
     /// Decimal properties used to be indexed as <c>(double)value</c>. An index whose persisted
-    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is replaced by an
-    /// empty tree, repopulated from the documents and then marked with the current format, the first
-    /// time the collection is opened. The format is recorded only after the rebuild committed, so a
-    /// crash in between just repeats the migration on the next open. No-op for every other index.
+    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding, or a full-text
+    /// index written in another format or holding keys it did not write, is rebuilt from the
+    /// documents into a copy that queries don't see, the first time the collection is opened. Only
+    /// after the copy committed is it swapped in, with its target format, in one metadata save, and
+    /// the old tree freed. If the rebuild fails or is interrupted, the copy's pages are freed and the
+    /// old index stays registered as it was, so it still needs the migration (whatever triggered it)
+    /// and the next open repeats it. No-op for every other index.
     /// </summary>
     private void MigrateLegacyDecimalIndexes()
     {
@@ -885,17 +919,18 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             var name = index.Name;
             try
             {
-                var fresh = _indexManager.RecreateIndex(name);
+                var fresh = _indexManager.CreateUnregistered(index.Definition);
+                fresh.KeyFormat = fresh.TargetKeyFormat;
                 // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
                 // A document that cannot be loaded fails the migration rather than silently leaving
                 // the rebuilt index incomplete.
-                Task.Run(() => RebuildIndexAsync(fresh, skipUnreadableDocuments: false)).GetAwaiter().GetResult();
-                _indexManager.SetKeyFormat(name, IndexMetadata.CurrentKeyFormat);
+                Task.Run(() => FillUnregisteredIndexAsync(fresh, CancellationToken.None)).GetAwaiter().GetResult();
+                PublishFilledIndex(fresh, copy => _indexManager.ReplaceIndex(name, copy));
             }
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
-                    $"Failed to rebuild index '{name}' of collection '{_collectionName}' with the exact decimal key format; the migration is retried on the next open.", ex);
+                    $"Failed to rebuild index '{name}' of collection '{_collectionName}' in its current key format; the migration is retried on the next open.", ex);
             }
         }
     }
@@ -994,6 +1029,53 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     /// <summary>
+    /// Creates a full-text index on a string property, filled from the documents already in the
+    /// collection, or returns the existing index of that name. Query it with
+    /// <see cref="FullTextExtensions.FullTextMatch"/> in LINQ or rank with
+    /// <see cref="FullTextSearchAsync"/>. The default name is <c>idx_fts_{property}</c>.
+    /// <para>
+    /// Each document touches one index page per distinct term, so single-document writes cost
+    /// noticeably more than without the index; insert and update in batches
+    /// (<c>InsertBulkAsync</c> or one explicit transaction) where possible.
+    /// </para>
+    /// <para>
+    /// Compatibility: the collection records that it requires full-text indexes, so BLite 5.3 and
+    /// later versions without them refuse to open it. Older releases cannot refuse: do not open a
+    /// database with full-text indexes for writing with BLite &lt; 5.3.
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">An index of that name exists and is not a full-text index.</exception>
+    [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
+    public async Task<ICollectionIndex<TId, T>> CreateFullTextIndexAsync(
+        System.Linq.Expressions.Expression<Func<T, string?>> keySelector,
+        string? name = null,
+        CancellationToken ct = default)
+    {
+        if (keySelector == null) throw new ArgumentNullException(nameof(keySelector));
+
+        // Block writers while the index is filled: a document inserted meanwhile would miss the
+        // index, which only starts receiving writes once it is registered.
+        if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct).ConfigureAwait(false))
+            throw new TimeoutException("Timed out acquiring collection write lock (CreateFullTextIndexAsync).");
+        try
+        {
+            var existing = _indexManager.GetIndex(CollectionIndexManager<TId, T>.ResolveIndexName(keySelector, name, IndexType.FullText));
+            if (existing != null && existing.Definition.Type != IndexType.FullText)
+                throw new InvalidOperationException($"Index '{existing.Name}' already exists and is not a full-text index.");
+
+            var builder = new Metadata.IndexBuilder<T>(keySelector, name, false, IndexType.FullText);
+            await Task.Run(() => ApplyIndexBuilder(builder, ct), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _collectionLock.Release();
+        }
+
+        var indexName = CollectionIndexManager<TId, T>.ResolveIndexName(keySelector, name, IndexType.FullText);
+        return await BindReaderAndReturn(_indexManager.GetIndex(indexName)!);
+    }
+
+    /// <summary>
     /// Asynchronously creates a vector (HNSW) index for similarity search.
     /// </summary>
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
@@ -1074,30 +1156,31 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
-    internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder)
+    internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder, CancellationToken ct = default)
     {
-        // Use the IndexManager directly to ensure the index exists
-        // We need to convert the LambdaExpression to a typed expression if possible, 
-        // or add an untyped CreateIndexAsync to IndexManager.
+        var name = CollectionIndexManager<TId, T>.ResolveIndexName(builder.KeySelector, builder.Name, builder.Type);
+        if (_indexManager.GetIndex(name) != null)
+            return;
 
-        // For now, let's use a dynamic approach or cast if we know it's Func<T, object>
-        if (builder.Type == IndexType.Vector)
+        // The collection may already hold documents, e.g. when a new app version adds the index.
+        // Fill the index before registering it, so neither a crash nor a document that cannot be
+        // indexed leaves an empty index persisted that later opens would trust.
+        var definition = CollectionIndexManager<TId, T>.BuildDefinition(
+            builder.KeySelector, name, builder.IsUnique, builder.Type, builder.Dimensions, builder.Metric);
+        var index = _indexManager.CreateUnregistered(definition);
+        try
         {
-            _indexManager.CreateVectorIndexUntyped(builder.KeySelector, builder.Dimensions, builder.Metric, builder.Name);
+            // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+            Task.Run(() => FillUnregisteredIndexAsync(index, ct)).GetAwaiter().GetResult();
         }
-        else if (builder.Type == IndexType.Spatial)
+        catch (Exception ex)
         {
-            _indexManager.CreateSpatialIndexUntyped(builder.KeySelector, builder.Name);
+            throw new InvalidOperationException(
+                $"Cannot build index '{name}' of collection '{_collectionName}' from the documents already in it: {ex.Message.TrimEnd('.')}. " +
+                "Nothing was saved, but every open fails the same way until those documents can be indexed or the index " +
+                "is removed from the model (OnModelCreating).", ex);
         }
-        else if (builder.KeySelector is System.Linq.Expressions.Expression<Func<T, object>> selector)
-        {
-            _indexManager.EnsureIndex(selector, builder.Name, builder.IsUnique);
-        }
-        else
-        {
-            // Try to rebuild the expression or use untyped version
-            _indexManager.EnsureIndexUntyped(builder.KeySelector, builder.Name, builder.IsUnique);
-        }
+        PublishFilledIndex(index, _indexManager.Register);
     }
 
     /// <summary>
@@ -1125,10 +1208,15 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
         try
         {
-            await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+            await foreach (var document in VisitRawDocumentsAsync<T>(txnId, (ReadOnlySpan<byte> bson, out T doc) =>
+                {
+                    doc = default!;
+                    if (!predicate(new BsonSpanReader(bson, keyMap))) return false;
+                    doc = _mapper.Deserialize(new BsonSpanReader(bson, keyMap));
+                    return true;
+                }, ct).ConfigureAwait(false))
             {
-                if (!predicate(new BsonSpanReader(rawBytes, keyMap))) continue;
-                yield return _mapper.Deserialize(new BsonSpanReader(rawBytes, keyMap));
+                yield return document;
             }
         }
         finally
@@ -1290,10 +1378,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var txnId = 0UL;
         var keyMap = _storage.GetKeyReverseMap();
 
-        await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+        await foreach (var result in VisitRawDocumentsAsync<TResult>(txnId, (ReadOnlySpan<byte> bson, out TResult projected) =>
+            {
+                projected = projector(new BsonSpanReader(bson, keyMap))!;
+                return projected is not null;
+            }, ct).ConfigureAwait(false))
         {
-            var result = projector(new BsonSpanReader(rawBytes, keyMap));
-            if (result is not null) yield return result;
+            yield return result;
         }
     }
 
@@ -1316,16 +1407,20 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         int count = 0;
         var keyMap = _storage.GetKeyReverseMap();
 
-        await foreach (var (_, rawBytes) in EnumerateOwnedRawDocumentsAsync(txnId, includeOverflow: true, ct).ConfigureAwait(false))
+        await foreach (var _ in VisitRawDocumentsAsync<bool>(txnId, (ReadOnlySpan<byte> bson, out bool matched) =>
+            {
+                try
+                {
+                    matched = predicate(new BsonSpanReader(bson, keyMap));
+                }
+                catch
+                {
+                    matched = false; // Malformed BSON — skip silently.
+                }
+                return matched;
+            }, ct).ConfigureAwait(false))
         {
-            try
-            {
-                if (predicate(new BsonSpanReader(rawBytes, keyMap))) count++;
-            }
-            catch
-            {
-                // Malformed BSON — skip silently.
-            }
+            count++;
         }
 
         return count;
@@ -1601,55 +1696,75 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     /// <summary>
-    /// Populates an empty copy of index <paramref name="name"/> from the documents and swaps it in
+    /// Populates an empty copy of <paramref name="current"/> from the documents and swaps it in
     /// only after the rebuild committed; the old tree is then freed. If any document cannot be
     /// loaded or indexed, the rebuild fails and the existing index stays in place untouched,
     /// instead of being replaced by an incomplete one.
     /// </summary>
-    private async Task RebuildIndexFromScratchAsync(string name, CancellationToken ct)
+    private async Task RebuildIndexFromScratchAsync(CollectionSecondaryIndex<TId, T> current, CancellationToken ct)
     {
-        var fresh = _indexManager.CreateUnregisteredCopy(name);
+        var fresh = _indexManager.CreateUnregistered(current.Definition);
+        await FillUnregisteredIndexAsync(fresh, ct).ConfigureAwait(false);
+        PublishFilledIndex(fresh, copy => _indexManager.ReplaceIndex(current.Name, copy));
+    }
+
+    /// <summary>
+    /// Fills an index that is not registered yet (see <see cref="CollectionIndexManager{TId,T}.CreateUnregistered"/>)
+    /// from every document, in its own transaction, and commits it. If a document cannot be loaded
+    /// or indexed, or the commit fails, every page of the index is freed, including the pages its
+    /// splits added, the index is disposed and the exception propagates.
+    /// </summary>
+    private async Task FillUnregisteredIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct)
+    {
         var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
         try
         {
-            await FillIndexAsync(fresh, transaction, skipUnreadableDocuments: false, ct).ConfigureAwait(false);
+            await FillIndexAsync(index, transaction, skipUnreadableDocuments: false, ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct);
         }
         catch
         {
-            // Collect the copy's pages through the transaction before rolling it back: pages added
+            // Collect the index's pages through the transaction before rolling it back: pages added
             // by splits are allocated outside the transaction but linked only from nodes written
             // in it, so after the rollback they could not be found any more.
             IReadOnlyList<uint> pages = Array.Empty<uint>();
-            try { pages = fresh.CollectAllPages(transaction.TransactionId); }
+            try { pages = index.CollectAllPages(transaction.TransactionId); }
             catch { /* best-effort: never mask the original failure */ }
 
             try { await transaction.RollbackAsync(); }
             catch { /* best-effort: never mask the original failure */ }
 
-            FreeUnregisteredCopy(fresh, pages);
+            FreeUnregisteredIndex(index, pages);
             throw;
         }
+    }
 
+    /// <summary>
+    /// Hands an index filled by <see cref="FillUnregisteredIndexAsync"/> to <paramref name="register"/>
+    /// (<see cref="CollectionIndexManager{TId,T}.Register"/> or <see cref="CollectionIndexManager{TId,T}.ReplaceIndex"/>).
+    /// If that fails and the index did not get registered, nothing refers to it any more, so its
+    /// pages are freed and it is disposed.
+    /// </summary>
+    private void PublishFilledIndex(CollectionSecondaryIndex<TId, T> index, Action<CollectionSecondaryIndex<TId, T>> register)
+    {
         try
         {
-            _indexManager.ReplaceIndex(name, fresh);
+            register(index);
         }
         catch
         {
-            // The copy is committed but, unless the swap itself went through, nothing refers to it.
-            if (!ReferenceEquals(_indexManager.GetIndex(name), fresh))
+            if (!ReferenceEquals(_indexManager.GetIndex(index.Name), index))
             {
                 IReadOnlyList<uint> pages = Array.Empty<uint>();
-                try { pages = fresh.CollectAllPages(0); }
+                try { pages = index.CollectAllPages(0); }
                 catch { /* best-effort: never mask the original failure */ }
-                FreeUnregisteredCopy(fresh, pages);
+                FreeUnregisteredIndex(index, pages);
             }
             throw;
         }
     }
 
-    private void FreeUnregisteredCopy(CollectionSecondaryIndex<TId, T> copy, IReadOnlyList<uint> pages)
+    private void FreeUnregisteredIndex(CollectionSecondaryIndex<TId, T> index, IReadOnlyList<uint> pages)
     {
         try
         {
@@ -1657,7 +1772,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 _storage.FreePage(pageId);
         }
         catch { /* best-effort: never mask the original failure */ }
-        copy.Dispose();
+        index.Dispose();
     }
 
     private async Task RebuildIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct = default, bool skipUnreadableDocuments = true)
@@ -2063,6 +2178,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously inserts a new document into the collection
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<TId> InsertAsync(T entity, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entity == null) throw new ArgumentNullException(nameof(entity));
@@ -2070,6 +2193,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var sw = _storage.MetricsDispatcher != null ? ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Insert).");
@@ -2096,9 +2221,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = true;
                 return id;
             }
-            catch
+            catch (Exception ex)
             {
-                await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2120,12 +2245,22 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously inserts multiple documents in a single transaction.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<List<TId>> InsertBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
 
         var entityList = entities.ToList();
         var ids = new List<TId>(entityList.Count);
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (InsertBulk).");
@@ -2152,9 +2287,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
                 return ids;
             }
-            catch
+            catch (Exception ex)
             {
-                await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: ids.Count > 0);
                 throw;
             }
         }
@@ -2265,8 +2400,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             : default;
         // ────────────────────────────────────────────────────────────────────
 
-        // Unique secondary indexes are checked before any page is written.
+        // Everything that can reject the document is checked before any page is written, so a
+        // rejected insert leaves nothing behind (BLiteValidationException keeps the transaction usable).
+        var key = _mapper.ToIndexKey(id);
+        ValidatePrimaryKeyForInsert(id, key, transaction);
         _indexManager.EnsureUniqueInAll(entity, null, transaction);
+        _indexManager.ValidateKeysInAll(entity);
 
         DocumentLocation location;
         if (_isTimeSeries)
@@ -2290,7 +2429,6 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             location = new DocumentLocation(pageId, slotIndex);
         }
 
-        var key = _mapper.ToIndexKey(id);
         _primaryIndex.Insert(key, location, transaction.TransactionId);
         _indexManager.InsertIntoAll(entity, location, transaction);
 
@@ -2324,6 +2462,21 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
         // Notify CDC
         await NotifyCdc(OperationType.Insert, id, transaction, docData);
+    }
+
+    /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="key"/> cannot be inserted
+    /// into the primary index: it is already taken, or it is larger than a node page.
+    /// </summary>
+    private void ValidatePrimaryKeyForInsert(TId id, IndexKey key, ITransaction transaction)
+    {
+        if (key.Data.Length > _primaryIndex.MaxKeySize)
+            throw new BLiteValidationException(
+                $"Id of {key.Data.Length} bytes is too large for the primary index of collection '{_collectionName}' (maximum {_primaryIndex.MaxKeySize} bytes).");
+
+        if (_primaryIndex.TryFind(key, out _, transaction.TransactionId))
+            throw new BLiteValidationException(
+                $"Duplicate key violation: a document with id '{id}' already exists in collection '{_collectionName}'.");
     }
 
     /// <summary>
@@ -2687,6 +2840,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously updates an existing document in the collection
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<bool> UpdateAsync(T entity, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entity == null) throw new ArgumentNullException(nameof(entity));
@@ -2694,6 +2855,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var sw = _storage.MetricsDispatcher != null ? ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Update).");
@@ -2708,9 +2871,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = result;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2732,6 +2895,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously updates multiple documents in a single transaction.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<int> UpdateBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
@@ -2739,6 +2910,10 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var entityList = entities.ToList();
         int updateCount = 0;
         bool autoCommit = transaction == null;
+        // Documents of this call written so far: a failure after the first one must roll back.
+        var progress = new StrongBox<int>();
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (UpdateBulk).");
@@ -2748,13 +2923,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         {
             try
             {
-                updateCount = await UpdateBulkInternal(entityList, transaction);
+                updateCount = await UpdateBulkInternal(entityList, transaction, progress);
                 if (autoCommit) await transaction.CommitAsync(ct);
                 return updateCount;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: progress.Value > 0);
                 throw;
             }
         }
@@ -2764,7 +2939,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         }
     }
 
-    private async Task<int> UpdateBulkInternal(List<T> entityList, ITransaction transaction)
+    private async Task<int> UpdateBulkInternal(List<T> entityList, ITransaction transaction, StrongBox<int> progress)
     {
         int updateCount = 0;
         const int BATCH_SIZE = 50;
@@ -2806,7 +2981,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 try
                 {
                     if (await UpdateDataCore(id, entity, docData, transaction, length))
-                        updateCount++;
+                        progress.Value = ++updateCount;
                 }
                 finally
                 {
@@ -2856,9 +3031,11 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var oldEntity = await FindByLocation(oldLocation, transaction);
         if (oldEntity == null) return false;
 
-        // Unique secondary indexes are checked before any page is written; only those whose
-        // key changed, so documents that already share a value can still be updated.
+        // Everything that can reject the document is checked before any page is written.
+        // Unique indexes only where the key changed, so documents that already share a value
+        // can still be updated.
         _indexManager.EnsureUniqueInAll(entity, oldEntity, transaction);
+        _indexManager.ValidateKeysInAll(entity);
 
         // Read old page
         var pageBuffer = ArrayPool<byte>.Shared.Rent(_storage.PageSize);
@@ -2928,6 +3105,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         => UpsertAsync(entity, null, ct);
 
     /// <inheritdoc cref="UpsertAsync(T, CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     public async ValueTask<UpsertResult<TId>> UpsertAsync(T entity, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entity == null) throw new ArgumentNullException(nameof(entity));
@@ -2936,6 +3121,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         bool success = false;
         bool inserted = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Upsert).");
@@ -2962,9 +3149,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = true;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
-                await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -2991,6 +3178,14 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         => UpsertBulkAsync(entities, null, ct);
 
     /// <inheritdoc cref="UpsertBulkAsync(IEnumerable{T}, CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     public async ValueTask<List<UpsertResult<TId>>> UpsertBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
@@ -2998,6 +3193,8 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         var entityList = entities.ToList();
         var results = new List<UpsertResult<TId>>(entityList.Count);
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (UpsertBulk).");
@@ -3028,9 +3225,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 }
                 return results;
             }
-            catch
+            catch (Exception ex)
             {
-                await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex, callHasWritten: results.Count > 0);
                 throw;
             }
         }
@@ -3081,11 +3278,18 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously deletes a document by its primary key.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async ValueTask<bool> DeleteAsync(TId id, ITransaction? transaction, CancellationToken ct = default)
     {
         var sw = _storage.MetricsDispatcher != null ? ValueStopwatch.StartNew() : default;
         bool success = false;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (Delete).");
@@ -3100,9 +3304,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 success = result;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -3124,12 +3328,19 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     /// <summary>
     /// Asynchronously deletes multiple documents in a single transaction.
     /// </summary>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     public async ValueTask<int> DeleteBulkAsync(IEnumerable<TId> ids, ITransaction? transaction, CancellationToken ct = default)
     {
         if (ids == null) throw new ArgumentNullException(nameof(ids));
 
         int deleteCount = 0;
         bool autoCommit = transaction == null;
+
+        WriteFailure.EnsureWritable(transaction);
 
         if (!await _collectionLock.WaitAsync(WriteLockTimeoutMs, ct))
             throw new TimeoutException("Timed out acquiring collection lock (DeleteBulk).");
@@ -3143,9 +3354,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 if (autoCommit) await transaction.CommitAsync(ct);
                 return deleteCount;
             }
-            catch
+            catch (Exception ex)
             {
-                if (autoCommit) await transaction.RollbackAsync();
+                await WriteFailure.HandleAsync(transaction, autoCommit, ex);
                 throw;
             }
         }
@@ -3417,6 +3628,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         if (indexOpt != null
             && !indexOpt.IsVectorSearch
             && !indexOpt.IsSpatialSearch
+            && !indexOpt.IsFullTextSearch
             && !indexOpt.HasResiduePredicate)
         {
             var index = _indexManager.GetIndex(indexOpt.IndexName);
@@ -3459,6 +3671,331 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             count++;
         }
         return count;
+    }
+
+    /// <summary>
+    /// Computes <c>Sum</c>, <c>Average</c>, <c>Min</c> or <c>Max</c> of <paramref name="selector"/> over
+    /// the documents matching <paramref name="whereClause"/> without materialising them, with the
+    /// result LINQ would compute over the entities. Returns <c>Handled = false</c> when the query
+    /// must run the usual way.
+    /// <para>
+    /// Only for a property the mapper restores verbatim from a BSON field
+    /// (<see cref="DocumentMapperBase{TId, T}.GetVerbatimFieldName"/>): the stored value, in the
+    /// document or in an index key, is then the value of the materialised property. Ignored,
+    /// computed and converted properties, and ones whose accessors have logic, are materialised.
+    /// </para>
+    /// <list type="number">
+    ///   <item>An <c>int</c>/<c>long</c> property with a B-Tree index on exactly that property, and
+    ///         no filter or one the same index covers exactly, is aggregated from the index keys
+    ///         alone (<c>Min</c>/<c>Max</c> read one entry). Keys are in value order, so a
+    ///         <c>Sum</c>/<c>Average</c> for which LINQ could overflow in one order but not in
+    ///         another is not taken from them.</item>
+    ///   <item>Otherwise, when no index serves the filter, the property is read from the raw BSON
+    ///         of each document in primary-key order, the order a scan yields the entities in. A
+    ///         document without the field, or holding a type the entity would not be read from
+    ///         unchanged, ends the attempt so the query runs the usual way.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="selector">A plain property access, <c>x =&gt; x.Property</c>.</param>
+    /// <param name="resultType">The result type of the LINQ operator.</param>
+    [RequiresDynamicCode("Aggregate push-down uses index optimization and Expression.Compile() which require dynamic code generation.")]
+    [RequiresUnreferencedCode("Aggregate push-down uses reflection to resolve members at runtime. Ensure all entity types are preserved.")]
+    internal Task<(bool Handled, object? Value)> TryAggregateAsync(
+        AggregateOperator op,
+        LambdaExpression selector,
+        LambdaExpression? whereClause,
+        Type resultType,
+        CancellationToken ct = default)
+    {
+        if (selector.Body is not MemberExpression { Member: System.Reflection.PropertyInfo property } member
+            || member.Expression != selector.Parameters[0]
+            || selector.ReturnType != property.PropertyType
+            || ConverterRegistry.HasConverter(property.Name))
+            return Task.FromResult<(bool, object?)>(default);
+
+        var valueType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+        bool nullable = valueType != property.PropertyType;
+
+        if (valueType == typeof(int)) return TryAggregateAsync<int>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(long)) return TryAggregateAsync<long>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(double)) return TryAggregateAsync<double>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(float)) return TryAggregateAsync<float>(op, property, nullable, whereClause, resultType, ct);
+        if (valueType == typeof(decimal)) return TryAggregateAsync<decimal>(op, property, nullable, whereClause, resultType, ct);
+        return Task.FromResult<(bool, object?)>(default);
+    }
+
+    [RequiresDynamicCode("Aggregate push-down uses index optimization and Expression.Compile() which require dynamic code generation.")]
+    [RequiresUnreferencedCode("Aggregate push-down uses reflection to resolve members at runtime. Ensure all entity types are preserved.")]
+    private async Task<(bool Handled, object? Value)> TryAggregateAsync<TValue>(
+        AggregateOperator op,
+        System.Reflection.PropertyInfo property,
+        bool nullable,
+        LambdaExpression? whereClause,
+        Type resultType,
+        CancellationToken ct)
+        where TValue : struct, IComparable<TValue>
+    {
+        if (LinqAggregate<TValue>.ResultType(op, nullable) != resultType)
+            return default;
+
+        // The field the mapper restores the property from unchanged. Without it, neither the raw
+        // field nor an index key (computed from the property when the document was written) is
+        // known to be the value the materialised entity returns.
+        var fieldName = (_mapper as DocumentMapperBase<TId, T>)?.GetVerbatimFieldName(property.Name);
+        if (fieldName == null)
+            return default;
+
+        var plan = whereClause == null ? null : Query.IndexOptimizer.TryOptimize<T>(whereClause, GetIndexes(), ConverterRegistry);
+
+        // Index keys hold the exact int/long value. Not for the other types: floating-point sums
+        // depend on the order of the values, decimal keys drop trailing zeros (1.50 → 1.5), and the
+        // first of equal Min/Max values wins (-0.0 vs 0.0, 1.0 vs 1.00).
+        if (typeof(TValue) == typeof(int) || typeof(TValue) == typeof(long))
+        {
+            var index = _indexManager.GetAllIndexes().FirstOrDefault(i =>
+                i.Definition.Type == IndexType.BTree
+                && !i.Definition.IsPrimary
+                && i.Definition.PropertyPaths.Length == 1
+                && i.Definition.PropertyPaths[0] == property.Name
+                && KeysAreValuesOf(i.Definition, property, typeof(TValue)));
+
+            if (index != null)
+            {
+                (bool Handled, object? Value) fromKeys = default;
+                if (whereClause == null)
+                {
+                    fromKeys = AggregateIndexKeys<TValue>(op, nullable, index, null, null, true, true);
+                }
+                else if (plan != null
+                    && plan.IndexName == index.Name
+                    && !plan.HasResiduePredicate
+                    && !plan.IsVectorSearch
+                    && !plan.IsSpatialSearch
+                    && plan.InValues == null
+                    && plan.MinValue is null or TValue
+                    && plan.MaxValue is null or TValue)
+                {
+                    // The optimizer keeps the constant's own type (r.Count < 9.5 gives a double
+                    // bound), and keys carry no type tag, so a bound of another type would be
+                    // compared bytewise against the int/long keys. Such filters take the path below,
+                    // which post-filters the documents the index returns.
+                    fromKeys = AggregateIndexKeys<TValue>(op, nullable, index, plan.MinValue, plan.MaxValue, plan.StartInclusive, plan.EndInclusive);
+                }
+                if (fromKeys.Handled)
+                    return fromKeys;
+                // Otherwise aggregate the values in the order LINQ sees them, below.
+            }
+        }
+
+        // An index serves the filter: fetching the matching documents through it is cheaper than
+        // scanning them all, and keeps the order the values are aggregated in unchanged.
+        if (plan != null)
+            return default;
+
+        BsonReaderPredicate? predicate = null;
+        if (whereClause != null)
+        {
+            predicate = BsonExpressionEvaluator.TryCompile<T>(whereClause, ConverterRegistry, _storage.GetKeyMap());
+            if (predicate == null) return default;
+        }
+
+        return await AggregateRawFieldAsync<TValue>(op, nullable, fieldName, predicate, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the keys of the index <paramref name="definition"/> are the values of
+    /// <paramref name="property"/> itself (<c>x =&gt; x.Property</c>), encoded as
+    /// <paramref name="valueType"/>: the user key is encoded from the boxed value the selector
+    /// returns, so this fixes the key layout the index path decodes.
+    /// </summary>
+    private static bool KeysAreValuesOf(CollectionIndexDefinition<T> definition, System.Reflection.PropertyInfo property, Type valueType)
+    {
+        var body = definition.KeySelectorExpression.Body;
+        while (body is UnaryExpression { NodeType: ExpressionType.Convert } convert && convert.Type == typeof(object))
+            body = convert.Operand;
+
+        return body is MemberExpression { Member: System.Reflection.PropertyInfo keyProperty } access
+            && access.Expression == definition.KeySelectorExpression.Parameters[0]
+            && keyProperty.Name == property.Name
+            && (Nullable.GetUnderlyingType(access.Type) ?? access.Type) == valueType;
+    }
+
+    /// <summary>Aggregates the values of the index entries in the given range from their keys.</summary>
+    private static (bool Handled, object? Value) AggregateIndexKeys<TValue>(
+        AggregateOperator op,
+        bool nullable,
+        CollectionSecondaryIndex<TId, T> index,
+        object? min,
+        object? max,
+        bool startInclusive,
+        bool endInclusive)
+        where TValue : struct, IComparable<TValue>
+    {
+        var aggregate = new LinqAggregate<TValue>(op, nullable, anyOrder: true);
+
+        if (op == AggregateOperator.Max)
+        {
+            // Keys are [value][document id]: the last entry holds the largest value.
+            var last = index.LastKey(min, max, startInclusive, endInclusive);
+            if (last is { } key)
+            {
+                if (!IndexKeyValueVisitor<TValue>.TryDecode(key.Data, out var value)) return default;
+                aggregate.Add(value);
+            }
+            return (true, aggregate.Result());
+        }
+
+        var visitor = new IndexKeyValueVisitor<TValue>(aggregate, stopAfterFirst: op == AggregateOperator.Min);
+        index.ScanKeys(min, max, startInclusive, endInclusive, ref visitor);
+        return visitor.Malformed || aggregate.DependsOnOrder ? default : (true, aggregate.Result());
+    }
+
+    /// <summary>
+    /// Feeds the value prefix of each <c>[value][document id]</c> key of an <c>int</c> or
+    /// <c>long</c> index to a <see cref="LinqAggregate{TValue}"/>.
+    /// </summary>
+    private struct IndexKeyValueVisitor<TValue> : BTreeIndex.IKeyVisitor
+        where TValue : struct, IComparable<TValue>
+    {
+        private readonly LinqAggregate<TValue> _aggregate;
+        private readonly bool _stopAfterFirst;
+
+        public IndexKeyValueVisitor(LinqAggregate<TValue> aggregate, bool stopAfterFirst)
+        {
+            _aggregate = aggregate;
+            _stopAfterFirst = stopAfterFirst;
+            Malformed = false;
+        }
+
+        /// <summary>A key did not start with an encoded value of the expected type.</summary>
+        public bool Malformed { get; private set; }
+
+        public bool Visit(ReadOnlySpan<byte> key)
+        {
+            if (!TryDecode(key, out var value))
+            {
+                Malformed = true;
+                return false;
+            }
+            _aggregate.Add(value);
+            // Past an order-dependent sum the remaining keys cannot change the outcome.
+            return !_stopAfterFirst && !_aggregate.DependsOnOrder;
+        }
+
+        /// <summary>
+        /// Decodes the <see cref="IndexKey(int)"/> / <see cref="IndexKey(long)"/> prefix of a
+        /// <c>[value][document id]</c> key. The index was checked to be keyed by a
+        /// <typeparamref name="TValue"/> (<see cref="KeysAreValuesOf"/>); a key not laid out that way
+        /// (no prefix byte, or no document id after the value) is reported as malformed rather than
+        /// decoded.
+        /// </summary>
+        public static bool TryDecode(ReadOnlySpan<byte> key, out TValue value)
+        {
+            value = default;
+            if (key.Length == 0 || key[0] != IndexKey.KeyPrefix) return false;
+
+            if (typeof(TValue) == typeof(int))
+            {
+                if (key.Length <= 5) return false;
+                value = (TValue)(object)(int)(BinaryPrimitives.ReadUInt32BigEndian(key.Slice(1)) ^ 0x8000_0000u);
+                return true;
+            }
+            if (typeof(TValue) == typeof(long))
+            {
+                if (key.Length <= 9) return false;
+                value = (TValue)(object)(long)(BinaryPrimitives.ReadUInt64BigEndian(key.Slice(1)) ^ 0x8000_0000_0000_0000UL);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Aggregates field <paramref name="fieldName"/> of every document matching
+    /// <paramref name="predicate"/> from raw BSON, in primary-key order. Gives up (<c>Handled =
+    /// false</c>) on a document without the field, with a BSON type other than the one the mapper
+    /// writes for <typeparamref name="TValue"/> (or <c>null</c> for a nullable property), or that
+    /// fails to evaluate, since materialising the entity could then yield a different value.
+    /// </summary>
+    private async Task<(bool Handled, object? Value)> AggregateRawFieldAsync<TValue>(
+        AggregateOperator op,
+        bool nullable,
+        string fieldName,
+        BsonReaderPredicate? predicate,
+        CancellationToken ct)
+        where TValue : struct, IComparable<TValue>
+    {
+        if (!_storage.GetKeyMap().TryGetValue(fieldName, out var fieldId))
+            return default; // never written: every document lacks it
+
+        var expectedType =
+            typeof(TValue) == typeof(int) ? BsonType.Int32 :
+            typeof(TValue) == typeof(long) ? BsonType.Int64 :
+            typeof(TValue) == typeof(decimal) ? BsonType.Decimal128 :
+            BsonType.Double; // double and float
+        var keyMap = _storage.GetKeyReverseMap();
+        var aggregate = new LinqAggregate<TValue>(op, nullable);
+
+        // Adds the document's value if it matches; false to give up.
+        bool Fold(ReadOnlySpan<byte> bson)
+        {
+            try
+            {
+                if (predicate != null && !predicate(new BsonSpanReader(bson, keyMap)))
+                    return true;
+
+                var reader = new BsonSpanReader(bson, keyMap);
+                reader.ReadDocumentSize();
+                var firstElement = reader.Position;
+                if (!reader.TrySeekToField(fieldId, out var type))
+                {
+                    // No usable offset table entry: look for the field from the first element on.
+                    reader.Seek(firstElement);
+                    if (!SeekField(ref reader, fieldName, out type))
+                        return false;
+                }
+
+                if (type == BsonType.Null)
+                    return nullable;
+                if (type != expectedType)
+                    return false;
+
+                aggregate.Add(ReadValue<TValue>(ref reader));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // The scan yields only for a document that ends the attempt.
+        await foreach (var _ in VisitRawDocumentsAsync<bool>(0UL, (ReadOnlySpan<byte> bson, out bool giveUp) => giveUp = !Fold(bson), ct).ConfigureAwait(false))
+            return default;
+
+        return (true, aggregate.Result());
+
+        static bool SeekField(ref BsonSpanReader reader, string name, out BsonType type)
+        {
+            while (reader.Remaining > 1)
+            {
+                type = reader.ReadBsonType();
+                if (type == BsonType.EndOfDocument) break;
+                if (reader.ReadElementHeader() == name) return true;
+                reader.SkipValue(type);
+            }
+            type = BsonType.EndOfDocument;
+            return false;
+        }
+
+        static TV ReadValue<TV>(ref BsonSpanReader reader)
+        {
+            if (typeof(TV) == typeof(int)) return (TV)(object)reader.ReadInt32();
+            if (typeof(TV) == typeof(long)) return (TV)(object)reader.ReadInt64();
+            if (typeof(TV) == typeof(double)) return (TV)(object)reader.ReadDouble();
+            if (typeof(TV) == typeof(float)) return (TV)(object)(float)reader.ReadDouble();
+            return (TV)(object)reader.ReadDecimal128();
+        }
     }
 
     /// <summary>
@@ -3513,7 +4050,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             // Path: IndexOptimizer → CollectionSecondaryIndex.Seek (TryFindFirst) → FindByLocationAsync.
             var indexOpt = Query.IndexOptimizer.TryOptimize<T>(predicate, GetIndexes(), ConverterRegistry);
             if (indexOpt != null && !indexOpt.IsRange && !indexOpt.IsVectorSearch && !indexOpt.IsSpatialSearch
-                && indexOpt.MinValue != null)
+                && !indexOpt.IsFullTextSearch && indexOpt.MinValue != null)
             {
                 var index = _indexManager.GetIndex(indexOpt.IndexName);
                 if (index != null)
@@ -3612,6 +4149,17 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                             continue;
                         yield return item;
                         if (++yielded >= fetchLimit) yield break;
+                    }
+                }
+                else if (indexOpt.IsFullTextSearch)
+                {
+                    // Every hit is re-checked with the full predicate: a posting left behind by an
+                    // analyzer change must not surface the document that now holds its location.
+                    var ftsIndex = _indexManager.GetIndex(indexOpt.IndexName)!;
+                    foreach (var location in ftsIndex.FullTextMatch(indexOpt.FullTextQuery!, transaction))
+                    {
+                        var item = await FindByLocationAsync(location, transaction?.TransactionId ?? 0UL, ct);
+                        if (item != null && GetCompiled()(item)) { yield return item; if (++yielded >= fetchLimit) yield break; }
                     }
                 }
                 else if (indexOpt.IsSpatialSearch)
@@ -3770,7 +4318,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
         }
 
         rentedBuffer = null!; // specific compiler satisfaction, though we throw
-        throw new InvalidOperationException($"Document too large. Maximum size allowed is 16MB.");
+        throw new BLiteValidationException($"Document too large. Maximum size allowed is 16MB.");
     }
 
     /// <summary>
@@ -3838,6 +4386,43 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             ct.ThrowIfCancellationRequested();
             var doc = await FindByLocationAsync(result.Location, 0UL, ct);
             if (doc != null) yield return doc;
+        }
+    }
+
+    /// <summary>
+    /// Returns the <paramref name="k"/> documents that best match <paramref name="query"/> in a
+    /// full-text index, best first, each with its BM25 relevance score.
+    /// </summary>
+    /// <param name="indexName">The name of the full-text index to search.</param>
+    /// <param name="query">The terms to look for, analyzed like the indexed text.</param>
+    /// <param name="k">Maximum number of documents to return.</param>
+    /// <param name="matchAllTerms">
+    /// <c>true</c> (the default) to return only documents containing every query term;
+    /// <c>false</c> to return documents containing any of them, ranked by relevance.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    public async IAsyncEnumerable<FullTextSearchResult<T>> FullTextSearchAsync(
+        string indexName,
+        string query,
+        int k,
+        bool matchAllTerms = true,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var index = _indexManager.GetIndex(indexName);
+        if (index == null)
+            throw new ArgumentException($"Index '{indexName}' not found.", nameof(indexName));
+
+        // Hits are re-checked against the document, so a stale posting can never surface another
+        // document; candidates past the first k are taken until k hits survive the re-check.
+        int returned = 0;
+        foreach (var (location, score) in index.FullTextSearchExpanding(query, k, matchAllTerms))
+        {
+            ct.ThrowIfCancellationRequested();
+            var doc = await FindByLocationAsync(location, 0UL, ct);
+            if (doc == null || !index.FullTextContains(doc, query, matchAllTerms)) continue;
+
+            yield return new FullTextSearchResult<T>(doc, score);
+            if (++returned == k) yield break;
         }
     }
 

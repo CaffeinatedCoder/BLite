@@ -290,6 +290,9 @@ public static class BLiteMigration
             case IndexType.Spatial:
                 await col.CreateSpatialIndexAsync(field, idx.Name);
                 break;
+            case IndexType.FullText:
+                await col.CreateFullTextIndexAsync(field, idx.Name);
+                break;
         }
     }
 

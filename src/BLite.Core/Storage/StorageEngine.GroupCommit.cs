@@ -161,13 +161,14 @@ public sealed partial class StorageEngine
 
             // Another process may have appended to the shared WAL since this engine last wrote
             // to it or replayed it. Replay those records first, so that advancing the bookmark
-            // past this batch below never skips them, and append after them instead of at this
-            // engine's own, stale, write position (which would overwrite them).
+            // past this batch below never skips them, and append right after them instead of at
+            // this engine's own, stale, write position (which would overwrite them) or after the
+            // torn remains of a batch a crashed writer never published.
             bool caughtUp = false;
             if (wal != null)
             {
                 caughtUp = TryCatchUpWithSharedWal(wal);
-                wal.SeekToEnd();
+                wal.SeekToSharedEnd(_shm!.ReadWalEndOffset());
             }
 
             foreach (var commit in batch)

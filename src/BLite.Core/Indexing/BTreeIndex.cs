@@ -78,6 +78,15 @@ public sealed class BTreeIndex
     public uint RootPageId => _rootPageId;
 
     /// <summary>
+    /// The largest key that fits in a node page on its own: page header (32) + node header (20)
+    /// + the leftmost child pointer of an internal node (4) + one entry (4-byte length, key,
+    /// 4-byte child pointer). A larger key can never be inserted, so the collections reject it
+    /// before writing anything. Nodes split by entry count, not by size, so many keys below
+    /// this limit can still overflow a node; that is caught as a failure during the write.
+    /// </summary>
+    internal int MaxKeySize => _storage.PageSize - 32 - 20 - 4 - 4 - 4;
+
+    /// <summary>
     /// Reads a page using StorageEngine for transaction isolation.
     /// Implements "Read Your Own Writes" isolation.
     /// </summary>
@@ -285,8 +294,33 @@ public sealed class BTreeIndex
     /// </summary>
     internal int CountRange(IndexKey minKey, IndexKey maxKey, ulong? transactionId = null)
     {
+        var counter = new CountingVisitor();
+        ScanRange(minKey, maxKey, transactionId, ref counter);
+        return counter.Count;
+    }
+
+    /// <summary>Receives the keys of a <see cref="ScanRange{TVisitor}"/>, in key order.</summary>
+    internal interface IKeyVisitor
+    {
+        /// <summary>Handles one key; returns <c>false</c> to stop the scan.</summary>
+        bool Visit(ReadOnlySpan<byte> key);
+    }
+
+    private struct CountingVisitor : IKeyVisitor
+    {
+        public int Count;
+        public bool Visit(ReadOnlySpan<byte> key) { Count++; return true; }
+    }
+
+    /// <summary>
+    /// Hands every leaf key in [<paramref name="minKey"/>, <paramref name="maxKey"/>] (inclusive)
+    /// to <paramref name="visitor"/> straight from the page buffer, in ascending order, without
+    /// allocating per entry. The key span is only valid during the call.
+    /// </summary>
+    internal void ScanRange<TVisitor>(IndexKey minKey, IndexKey maxKey, ulong? transactionId, ref TVisitor visitor)
+        where TVisitor : struct, IKeyVisitor
+    {
         var txnId = transactionId ?? 0;
-        int count = 0;
         var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
         {
@@ -320,11 +354,14 @@ public sealed class BTreeIndex
                     }
 
                     // inRange: compare against maxKey only.
-                    if (IndexKey.CompareRaw(entryKeySpan, maxKey.Data) <= 0)
-                        count++;
-                    else
+                    if (IndexKey.CompareRaw(entryKeySpan, maxKey.Data) > 0)
                     {
                         stopScan = true; // past maxKey — no more matches in any leaf
+                        break;
+                    }
+                    if (!visitor.Visit(entryKeySpan))
+                    {
+                        stopScan = true; // the visitor has seen enough
                         break;
                     }
 
@@ -339,8 +376,8 @@ public sealed class BTreeIndex
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(pageBuffer);
         }
-        return count;
     }
+
 
     /// <summary>
     /// Finds the first leaf entry in [minKey, maxKey] (inclusive) without allocating an

@@ -58,6 +58,9 @@ internal static class IndexOptimizer
         /// </summary>
         public MethodCallExpression? VectorSearchCall { get; set; }
 
+        public bool IsFullTextSearch { get; set; }
+        public string? FullTextQuery { get; set; }
+
         public bool IsSpatialSearch { get; set; }
         public (double Latitude, double Longitude) SpatialPoint { get; set; }
         public double RadiusKm { get; set; }
@@ -178,7 +181,8 @@ internal static class IndexOptimizer
             }
 
             if (left != null && right != null && left.IndexName == right.IndexName
-                && !left.IsSpatialSearch && !right.IsSpatialSearch)
+                && !left.IsSpatialSearch && !right.IsSpatialSearch
+                && !left.IsFullTextSearch && !right.IsFullTextSearch)
             {
                 // Both sides are covered by the same index — combine into a single range.
                 // Propagate the stricter completeness: if either branch required a post-filter
@@ -255,7 +259,7 @@ internal static class IndexOptimizer
             bareMember.Type == typeof(bool))
         {
             CollectionIndexInfo? ix = null;
-            foreach (var idx in indexes) { if (Matches(idx, bareMember.Member.Name)) { ix = idx; break; } }
+            foreach (var idx in indexes) { if (SupportsKeyLookup(idx) && Matches(idx, bareMember.Member.Name)) { ix = idx; break; } }
             if (ix != null)
                 return new OptimizationResult { IndexName = ix.Name, MinValue = true, MaxValue = true, IsRange = false, FilterCompleteness = FilterCompleteness.Exact };
         }
@@ -266,7 +270,7 @@ internal static class IndexOptimizer
             notMember.Type == typeof(bool))
         {
             CollectionIndexInfo? ix = null;
-            foreach (var idx in indexes) { if (Matches(idx, notMember.Member.Name)) { ix = idx; break; } }
+            foreach (var idx in indexes) { if (SupportsKeyLookup(idx) && Matches(idx, notMember.Member.Name)) { ix = idx; break; } }
             if (ix != null)
                 return new OptimizationResult { IndexName = ix.Name, MinValue = false, MaxValue = false, IsRange = false, FilterCompleteness = FilterCompleteness.Exact };
         }
@@ -276,7 +280,7 @@ internal static class IndexOptimizer
         if (propertyName != null)
         {
             CollectionIndexInfo? index = null;
-            foreach (var idx in indexes) { if (Matches(idx, propertyName)) { index = idx; break; } }
+            foreach (var idx in indexes) { if (SupportsKeyLookup(idx) && Matches(idx, propertyName)) { index = idx; break; } }
             if (index != null)
             {
                 var result = new OptimizationResult { IndexName = index.Name };
@@ -346,7 +350,7 @@ internal static class IndexOptimizer
         if (TryParseContainsInPredicate(expression, parameter, registry, out var inPropertyPath, out var inValues))
         {
             CollectionIndexInfo? index = null;
-            foreach (var idx in indexes) { if (Matches(idx, inPropertyPath)) { index = idx; break; } }
+            foreach (var idx in indexes) { if (SupportsKeyLookup(idx) && Matches(idx, inPropertyPath)) { index = idx; break; } }
             if (index != null)
             {
                 return new OptimizationResult
@@ -389,6 +393,23 @@ internal static class IndexOptimizer
         // Handle Method Calls (VectorSearch, Near, Within)
         if (expression is MethodCallExpression mcall)
         {
+            // FullTextMatch(this string text, string query)
+            if (mcall.Method.Name == "FullTextMatch" && mcall.Method.DeclaringType == typeof(FullTextExtensions)
+                && mcall.Arguments[0] is MemberExpression tMember && tMember.Expression == parameter)
+            {
+                CollectionIndexInfo? index = null;
+                foreach (var idx in indexes) { if (idx.Type == IndexType.FullText && Matches(idx, tMember.Member.Name)) { index = idx; break; } }
+                if (index != null)
+                {
+                    return new OptimizationResult
+                    {
+                        IndexName = index.Name,
+                        IsFullTextSearch = true,
+                        FullTextQuery = EvaluateExpression<string>(mcall.Arguments[1])
+                    };
+                }
+            }
+
             // VectorSearch(this float[] vector, float[] query, int k)
             if (mcall.Method.Name == "VectorSearch" && mcall.Arguments[0] is MemberExpression vMember && vMember.Expression == parameter)
             {
@@ -572,6 +593,13 @@ internal static class IndexOptimizer
         value = obj;
         return true;
     }
+
+    /// <summary>
+    /// Whether equality, range and IN lookups can use the index. Vector, spatial and full-text
+    /// indexes do not store property values in key order.
+    /// </summary>
+    private static bool SupportsKeyLookup(CollectionIndexInfo index)
+        => index.Type is not (IndexType.Vector or IndexType.Spatial or IndexType.FullText);
 
     private static bool Matches(CollectionIndexInfo index, string propertyName)
     {
