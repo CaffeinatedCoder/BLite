@@ -152,7 +152,9 @@ The WAL index is a double-buffered open-addressing hash table mapping `uint page
 
 **Configuration mismatch.** A well-formed `.wal-shm` whose page size or reader-slot count differs from the opening process's configuration is re-initialised only if nothing shows it in use (a WAL end offset of 0, no live writer or reader PID); otherwise `Open` throws `InvalidOperationException`. On re-initialisation `WalGeneration` is incremented and `NextTransactionId` kept, so neither ever goes back.
 
-**Commit paths.** Only group commit appends under the cross-process writer lock, after catching up with the shared WAL, and publishes the new end offset. The direct commit path `CommitTransactionAsync(ulong)` and two-phase commit (`PrepareTransactionAsync`, `MarkTransactionCommittedAsync`) do none of that and throw `NotSupportedException` in multi-process mode ([#188](https://github.com/EntglDb/BLite/issues/188)).
+**Commit paths.** Only group commit appends under the cross-process writer lock, after catching up with the shared WAL, and publishes the new end offset. The direct commit path `CommitTransactionAsync(ulong)` and two-phase commit (`PrepareTransactionAsync`, `MarkTransactionCommittedAsync`) do none of that and throw `NotSupportedException` in multi-process mode ([#188](https://github.com/EntglDb/BLite/issues/188)). Group commit appends at the published `WalEndOffset` and cuts off whatever lies beyond it: the remains of a batch whose writer died before publishing it, never acknowledged.
+
+**Unreadable records.** A catch-up that cannot read a record inside the published range keeps its bookmark, so it never skips the records after it; it retries on the next transaction, commit or checkpoint. Meanwhile that process's checkpoints write nothing (reported as failed in the `Checkpoint` metric, `MetricsSnapshot.CheckpointsFailedTotal`), and a trace warning names the WAL and the offset of the record: the first failure, then every power of two in a row, and from 16 in a row it calls the replay stalled.
 
 ---
 
