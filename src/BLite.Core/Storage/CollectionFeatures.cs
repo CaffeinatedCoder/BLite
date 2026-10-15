@@ -43,10 +43,30 @@ internal sealed record RequiredFeature(string Id, FeatureRequirement Requirement
 /// know refuses to open or modify the collection instead of silently damaging it.
 /// </summary>
 /// <remarks>
-/// Only versions that contain this check can refuse; releases before it ignore the record and may
-/// also drop it when they rewrite the collection's metadata. An index of a type newer than any this
-/// version knows is refused the same way, so a new index type stays protected even after such a
-/// release dropped the record.
+/// <para>
+/// Only versions that contain this check can refuse. Releases before it ignore the section and drop
+/// it whenever they rewrite the collection's metadata, so a database that uses a feature must not be
+/// opened for writing by them.
+/// </para>
+/// <para>
+/// An index of a type newer than any this version knows is refused the same way. That protects a new
+/// index type after such a release rewrote the record only if that release kept the index entry, as
+/// its typed collections and its saves that start from the stored record (sequence values, root page
+/// ids) do. A release that rebuilds the index list from the indexes it loaded drops the entry along
+/// with the section, and then nothing is left to refuse: in 5.2.3 that is
+/// <c>DynamicCollection.PersistIndexMetadata</c>, which runs on every dynamic index create or drop and
+/// on a vacuum that rebuilds indexes.
+/// </para>
+/// <para>
+/// Format rule: data a future version needs per index goes only in a trailing section of the record
+/// (as the key formats do), never inline in the index list. <c>ReadCollectionMetadata</c> reads the
+/// list by position; bytes it does not expect there shift everything after them, so the record no
+/// longer parses. <c>GetCollectionMetadata</c> then returns <c>null</c> and a dynamic open treats the
+/// collection as new and saves a fresh record over it, so this refusal never runs. This version's
+/// <c>SaveCollectionMetadata</c> refuses to overwrite a stored record it cannot parse, but that still
+/// turns the newer version's clear refusal into a generic one, and every release before it overwrites
+/// the record.
+/// </para>
 /// </remarks>
 internal static class CollectionFeatures
 {
@@ -108,6 +128,17 @@ internal static class CollectionFeatures
             $"{Describe(unsupported)}. It cannot be modified by this version; use a BLite version that " +
             "supports these features.");
     }
+
+    /// <summary>
+    /// The exception for a stored record of collection <paramref name="name"/> that this version
+    /// cannot parse, e.g. one a newer version wrote in a layout this one does not know. Such a record
+    /// is never overwritten or dropped, since its features cannot be checked.
+    /// </summary>
+    internal static NotSupportedException UnreadableRecord(string name, Exception cause)
+        => new(
+            $"The stored metadata of collection '{name}' cannot be read by BLite {s_version}; it may have " +
+            "been written by a newer version, or be damaged. It was left unchanged; use the BLite version " +
+            "that wrote it.", cause);
 
     private static List<RequiredFeature> Unsupported(CollectionMetadata metadata, bool readOnly)
     {
