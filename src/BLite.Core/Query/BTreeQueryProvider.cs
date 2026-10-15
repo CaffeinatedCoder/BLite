@@ -285,14 +285,31 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
 
         // ── Push-down SELECT (+ optional WHERE) ───────────────────────────────
         // Single-pass BSON projection: no T instantiation, no EnumerableRewriter.
-        // Only applicable when there is no post-scan ordering or paging.
+        // Only applicable when the projection is the whole query: no post-scan ordering,
+        // paging or other operators. A terminal after the Select (Any, Max, Count(pred), ...)
+        // runs the usual way.
         if (model.SelectClause is not null
             && model.OrderByClause is null
             && !model.Take.HasValue
-            && !model.Skip.HasValue)
+            && !model.Skip.HasValue
+            && !model.HasComplexOperators
+            && TryPushDownSelect<TResult>(model.SelectClause, model.WhereClause, out var pushed))
         {
-            var pushed = TryPushDownSelect<TResult>(model.SelectClause, model.WhereClause);
-            if (pushed is not null) return pushed;
+            return pushed;
+        }
+
+        // ── Several query sources ─────────────────────────────────────────────
+        // A query that reads a queryable outside its main chain (q.Where(...).Concat(q), a
+        // self-join, a subquery inside a lambda) cannot be served by one filtered or paged
+        // fetch: the model mixes the clauses of the different uses, and EnumerableRewriter
+        // replaces every use of the root with the same source. Replay the whole query over
+        // the whole collection.
+        if (HasSecondaryQuery(expression))
+        {
+            var all = new List<T>();
+            await foreach (var item in _collection.FetchAsync(null, int.MaxValue, cancellationToken))
+                all.Add(item);
+            return ExecuteViaEnumerableRewriter<TResult>(expression, all);
         }
 
         // 2. Data fetching.
@@ -307,20 +324,37 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // O(n log n) in-memory sort over all documents.  Skip is performed at the
         // index-entry level (no document reads for skipped positions), so only the
         // requested page window is ever deserialised.
-        if (model.WhereClause == null && model.OrderByClause != null && model.Take.HasValue)
+        if (model.WhereClause == null && model.OrderByClause != null && model.Take.HasValue
+            && TryGetIndexWindow(expression, model.OrderByClause, out int windowEnd, out bool plainWindow))
         {
             var orderOpt = IndexOptimizer.TryOptimizeOrderBy(model, _collection.GetIndexes());
             if (orderOpt is not null)
             {
                 bool ascending = !model.OrderDescending;
-                int skip = model.Skip ?? 0;
-                int take = model.Take.Value;
-                var topN = new List<T>(take);
-                await foreach (var item in _collection.QueryIndexAsync(orderOpt.IndexName, null, null, ascending, skip, take, cancellationToken))
-                    topN.Add(item);
-                if (model.SelectClause != null)
-                    return ProjectEnumerable<TResult>(topN, model.SelectClause);
-                return TerminalReturn<TResult>(topN);
+                if (plainWindow && !model.HasComplexOperators
+                    && (model.SelectClause == null || IsSequenceResult<TResult>()))
+                {
+                    int skip = model.Skip ?? 0;
+                    int take = model.Take.Value;
+                    var topN = new List<T>(take);
+                    await foreach (var item in _collection.QueryIndexAsync(orderOpt.IndexName, null, null, ascending, skip, take, cancellationToken))
+                        topN.Add(item);
+                    if (model.SelectClause != null)
+                        return ProjectEnumerable<TResult>(topN, model.SelectClause);
+                    return TerminalReturn<TResult>(topN);
+                }
+
+                // Operators after the window (a terminal with a predicate or selector, a scalar
+                // after Select, ...): read the first windowEnd entries in index order and replay the
+                // whole query over them. OrderBy is a stable sort, so the replay keeps the index
+                // order and its Skip/Take select the same window.
+                // This needs the root queryable to be the query's only source: EnumerableRewriter
+                // replaces every use of it with the prefix. A query that reads a queryable again
+                // (Concat(q), Join(q, ...)) took the HasSecondaryQuery path above.
+                var prefix = new List<T>(windowEnd);
+                await foreach (var item in _collection.QueryIndexAsync(orderOpt.IndexName, null, null, ascending, 0, windowEnd, cancellationToken))
+                    prefix.Add(item);
+                return ExecuteViaEnumerableRewriter<TResult>(expression, prefix);
             }
         }
 
@@ -355,6 +389,11 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
         // Func<T, object> from that lambda, which throws ArgumentException at runtime.
         // Fall back to EnumerableRewriter which rewrites the full expression tree correctly.
         if (model.OrderByClause != null && model.OrderByClause.Parameters[0].Type != typeof(T))
+            return ExecuteViaEnumerableRewriter<TResult>(expression, sourceData);
+
+        // The direct pipeline can only project into a sequence. A scalar terminal after a
+        // Select (e.g. Take(n).Select(...).Count()) needs the full expression.
+        if (model.SelectClause != null && !IsSequenceResult<TResult>())
             return ExecuteViaEnumerableRewriter<TResult>(expression, sourceData);
 
         // 3. Direct pipeline — no expression-tree rewrite, no EnumerableRewriter, no Compile().
@@ -414,11 +453,11 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
     private TResult ProjectEnumerable<TResult>(IEnumerable<T> source, LambdaExpression selectLambda)
     {
-        var resultType = typeof(TResult);
-        if (!resultType.IsGenericType || resultType.GetGenericTypeDefinition() != typeof(IEnumerable<>))
-            return default!;
+        if (!IsSequenceResult<TResult>())
+            throw new NotSupportedException(
+                $"BLite query pipeline: cannot project into result type '{typeof(TResult)}'.");
 
-        var projType = resultType.GetGenericArguments()[0];
+        var projType = typeof(TResult).GetGenericArguments()[0];
         var method = s_projectMethodCache.GetOrAdd(
             projType,
             t => typeof(BTreeQueryProvider<TId, T>)
@@ -438,6 +477,120 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo>
         s_projectMethodCache = new();
+
+    /// <summary>Whether <typeparamref name="TResult"/> is <c>IEnumerable&lt;TElement&gt;</c>, i.e. the query is enumerated rather than ended by a terminal.</summary>
+    private static bool IsSequenceResult<TResult>()
+        => typeof(TResult).IsGenericType && typeof(TResult).GetGenericTypeDefinition() == typeof(IEnumerable<>);
+
+    /// <summary>
+    /// Checks that <paramref name="expression"/> starts with <c>OrderBy</c>/<c>OrderByDescending</c>
+    /// on the collection (the call whose key selector is <paramref name="orderBy"/>), followed by
+    /// <c>Skip</c>/<c>Take</c> calls that bound it, so that the result only depends on the first
+    /// <paramref name="windowEnd"/> documents in that order.
+    /// </summary>
+    /// <param name="plainWindow">
+    /// <c>true</c> when the window is exactly <c>Take(n)</c> or <c>Skip(s).Take(n)</c>, as
+    /// <see cref="QueryModel.Skip"/> and <see cref="QueryModel.Take"/> describe it, and only
+    /// <c>Select</c> or a plain <c>Count()</c>/<c>LongCount()</c> follows it.
+    /// </param>
+    private static bool TryGetIndexWindow(Expression expression, LambdaExpression orderBy,
+                                          out int windowEnd, out bool plainWindow)
+    {
+        windowEnd = 0;
+        plainWindow = false;
+
+        // Collect the Queryable calls from the root outwards.
+        var calls = new List<MethodCallExpression>();
+        var current = expression;
+        while (current is MethodCallExpression call && call.Method.DeclaringType == typeof(Queryable))
+        {
+            calls.Add(call);
+            current = call.Arguments[0];
+        }
+        if (current is not ConstantExpression { Value: IQueryable } || calls.Count < 2) return false;
+        calls.Reverse();
+
+        var first = calls[0];
+        if (first.Method.Name is not ("OrderBy" or "OrderByDescending")
+            || first.Arguments[1] is not UnaryExpression { Operand: var key }
+            || !ReferenceEquals(key, orderBy))
+            return false;
+
+        long start = 0, length = long.MaxValue;
+        int i = 1;
+        for (; i < calls.Count && calls[i].Method.Name is "Skip" or "Take"; i++)
+        {
+            if (calls[i].Arguments[1] is not ConstantExpression { Value: int n }) return false;
+            n = Math.Max(n, 0);
+            if (calls[i].Method.Name == "Skip")
+            {
+                start += n;
+                if (length != long.MaxValue) length = Math.Max(0, length - n);
+            }
+            else
+            {
+                length = Math.Min(length, n);
+            }
+        }
+
+        // No Take bounds the window, or a ThenBy refines the order of the documents at its edge.
+        if (length == long.MaxValue) return false;
+        if (i < calls.Count && calls[i].Method.Name is "ThenBy" or "ThenByDescending") return false;
+
+        long end = start + length;
+        if (end > int.MaxValue) return false;
+        windowEnd = (int)end;
+
+        var window = calls.GetRange(1, i - 1).ConvertAll(c => c.Method.Name);
+        plainWindow = (window.Count == 1 && window[0] == "Take"
+                       || window.Count == 2 && window[0] == "Skip" && window[1] == "Take")
+                      && calls.Skip(i).All(c => c.Method.Name == "Select"
+                                                || c.Method.Name is "Count" or "LongCount" && c.Arguments.Count == 1);
+        return true;
+    }
+
+    /// <summary>
+    /// Whether an operator of the main chain (the <c>Queryable</c> calls from the result down
+    /// to the root) has an argument other than its source that holds a queryable or calls a
+    /// <c>Queryable</c> operator: a second use of the root (<c>Concat(q)</c>, <c>Join(q, ...)</c>,
+    /// <c>Union(q.Select(...))</c>), another source, or a subquery inside a lambda.
+    /// </summary>
+    private static bool HasSecondaryQuery(Expression expression)
+    {
+        var finder = new SecondaryQueryFinder();
+        for (var current = expression;
+             current is MethodCallExpression call && call.Method.DeclaringType == typeof(Queryable);
+             current = call.Arguments[0])
+        {
+            for (int i = 1; i < call.Arguments.Count && !finder.Found; i++)
+                finder.Visit(call.Arguments[i]);
+            if (finder.Found) return true;
+        }
+        return false;
+    }
+
+    private sealed class SecondaryQueryFinder : ExpressionVisitor
+    {
+        public bool Found { get; private set; }
+
+        public override Expression? Visit(Expression? node) => Found ? node : base.Visit(node);
+
+        protected override Expression VisitConstant(ConstantExpression node)
+        {
+            if (node.Value is IQueryable) Found = true;
+            return node;
+        }
+
+        protected override Expression VisitMethodCall(MethodCallExpression node)
+        {
+            if (node.Method.DeclaringType == typeof(Queryable))
+            {
+                Found = true;
+                return node;
+            }
+            return base.VisitMethodCall(node);
+        }
+    }
 
     /// <summary>
     /// Type-switch dispatch for terminal results — first-match, no reflection per call.
@@ -628,20 +781,25 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
     /// Attempts to execute the query entirely via a single-pass BSON projection scan,
     /// bypassing full <typeparamref name="T"/> deserialisation.
     /// </summary>
-    /// <returns>The projected <c>IEnumerable&lt;TProj&gt;</c>, or <c>null</c> if push-down is
-    /// not applicable (caller should fall through to the standard path).</returns>
+    /// <returns>
+    /// <c>true</c> and the projected <c>IEnumerable&lt;TProj&gt;</c> in <paramref name="result"/>;
+    /// <c>false</c> if push-down is not applicable (caller should fall through to the standard path).
+    /// <c>default(TResult)</c> cannot signal this: for a value-type result such as <c>bool</c> it
+    /// is a valid answer (#181).
+    /// </returns>
     [RequiresDynamicCode("BLite LINQ queries use Expression.Compile() and MakeGenericMethod which require dynamic code generation.")]
     [RequiresUnreferencedCode("BLite LINQ queries use reflection to resolve methods and types at runtime. Ensure all entity types and their members are preserved.")]
-    private TResult? TryPushDownSelect<TResult>(LambdaExpression selectLambda,
-                                                   LambdaExpression? whereLambda = null)
+    private bool TryPushDownSelect<TResult>(LambdaExpression selectLambda,
+                                            LambdaExpression? whereLambda,
+                                            out TResult result)
     {
-        // We need TResult = IEnumerable<TProj> for some projection type TProj.
-        var resultType = typeof(TResult);
-        if (!resultType.IsGenericType) return default;
-        if (resultType.GetGenericTypeDefinition() != typeof(IEnumerable<>)) return default;
+        result = default!;
 
-        var projType = resultType.GetGenericArguments()[0];
-        if (projType == typeof(T)) return default; // not a real projection
+        // We need TResult = IEnumerable<TProj> for some projection type TProj.
+        if (!IsSequenceResult<TResult>()) return false;
+
+        var projType = typeof(TResult).GetGenericArguments()[0];
+        if (projType == typeof(T)) return false; // not a real projection
 
         // Compile the push-down projector via reflection (TProj is only known at runtime).
         // BsonProjectionCompiler.TryCompile<T, TProj>(selectLambda, whereLambda?) handles
@@ -654,9 +812,9 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
                 t => s_tryCompileMethod.MakeGenericMethod(typeof(T), t));
             projector = compileMethod.Invoke(null, [selectLambda, whereLambda, _collection.GetKeyMap()]);
         }
-        catch { return default; }
+        catch { return false; }
 
-        if (projector is null) return default; // compilation soft-failed
+        if (projector is null) return false; // compilation soft-failed
 
         // Invoke _collection.Scan<TProj>(projector) — MethodInfo cached per TProj.
         try
@@ -664,10 +822,11 @@ public class BTreeQueryProvider<TId, T> : IQueryProvider, IAsyncQueryProvider, I
             var scanMethod = s_compiledScanMethods.GetOrAdd(
                 projType,
                 t => s_scanProjectorMethod.MakeGenericMethod(t));
-            var result = scanMethod.Invoke(_collection, [projector]);
-            return (TResult?)result;
+            if (scanMethod.Invoke(_collection, [projector]) is not TResult scanned) return false;
+            result = scanned;
+            return true;
         }
-        catch { return default; }
+        catch { return false; }
     }
 
     // ─── Expression-tree helpers ──────────────────────────────────────────────
