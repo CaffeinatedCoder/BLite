@@ -3,6 +3,7 @@ using BLite.Core.Transactions;
 using BLite.Core.Collections;
 using BLite.Core.Indexing.Internal;
 using System.Buffers;
+using System.Diagnostics;
 
 namespace BLite.Core.Indexing;
 
@@ -121,6 +122,12 @@ internal class RTreeIndex : IDisposable
     /// Returns all physical page IDs owned by this R-tree.
     /// Used when dropping or rebuilding an index to free storage space.
     /// </summary>
+    /// <remarks>
+    /// The walk does not take this index's lock. Callers must hold the lock that excludes writers
+    /// to the tree: the collection write lock during <c>VacuumAsync</c>'s rebuild, the index
+    /// manager's lock (which every index insert, update and delete also takes) when an index is
+    /// dropped, and a dropped collection is disposed before its pages are collected.
+    /// </remarks>
     public IReadOnlyList<uint> CollectAllPages() => CollectAllPages(0);
 
     /// <summary>
@@ -142,7 +149,15 @@ internal class RTreeIndex : IDisposable
             while (stack.Count > 0)
             {
                 uint pageId = stack.Pop();
-                if (pageId == 0 || !seen.Add(pageId)) continue;
+                if (pageId == 0) continue;
+                if (!seen.Add(pageId))
+                {
+                    // Every node has exactly one parent, so reaching a page twice means a cycle or a
+                    // shared child. The set keeps the walk finite and the page counted once, but the
+                    // tree is corrupt.
+                    Debug.Fail($"R-tree page {pageId} is reachable more than once from root {_rootPageId}.");
+                    continue;
+                }
                 pages.Add(pageId);
 
                 _storage.ReadPage(pageId, transactionId == 0 ? null : transactionId, buffer);

@@ -721,7 +721,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             {
                 foreach (var index in _indexManager.GetAllIndexes())
                 {
-                    await RebuildIndexFromScratchAsync(index.Name, ct).ConfigureAwait(false);
+                    await RebuildIndexFromScratchAsync(index, ct).ConfigureAwait(false);
                 }
             }
 
@@ -867,10 +867,12 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
 
     /// <summary>
     /// Decimal properties used to be indexed as <c>(double)value</c>. An index whose persisted
-    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is replaced by an
-    /// empty tree, repopulated from the documents and then marked with the current format, the first
-    /// time the collection is opened. The format is recorded only after the rebuild committed, so a
-    /// crash in between just repeats the migration on the next open. No-op for every other index.
+    /// <see cref="IndexMetadata.KeyFormat"/> predates the exact decimal encoding is rebuilt from the
+    /// documents into a copy that queries don't see, the first time the collection is opened. Only
+    /// after the copy committed is it swapped in, with the current format, in one metadata save, and
+    /// the old tree freed. If the rebuild fails or is interrupted, the copy's pages are freed and the
+    /// old index stays registered in its old format, so the next open repeats the migration.
+    /// No-op for every other index.
     /// </summary>
     private void MigrateLegacyDecimalIndexes()
     {
@@ -881,12 +883,13 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
             var name = index.Name;
             try
             {
-                var fresh = _indexManager.RecreateIndex(name);
+                var fresh = _indexManager.CreateUnregistered(index.Definition);
+                fresh.KeyFormat = IndexMetadata.CurrentKeyFormat;
                 // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
                 // A document that cannot be loaded fails the migration rather than silently leaving
                 // the rebuilt index incomplete.
-                Task.Run(() => RebuildIndexAsync(fresh, skipUnreadableDocuments: false)).GetAwaiter().GetResult();
-                _indexManager.SetKeyFormat(name, IndexMetadata.CurrentKeyFormat);
+                Task.Run(() => FillUnregisteredIndexAsync(fresh, CancellationToken.None)).GetAwaiter().GetResult();
+                PublishFilledIndex(fresh, copy => _indexManager.ReplaceIndex(name, copy));
             }
             catch (Exception ex)
             {
@@ -1072,28 +1075,29 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     [RequiresDynamicCode("Index creation compiles key selector expressions using Expression.Compile() which requires dynamic code generation.")]
     internal void ApplyIndexBuilder(Metadata.IndexBuilder<T> builder)
     {
-        // Use the IndexManager directly to ensure the index exists
-        // We need to convert the LambdaExpression to a typed expression if possible, 
-        // or add an untyped CreateIndexAsync to IndexManager.
+        var name = CollectionIndexManager<TId, T>.ResolveIndexName(builder.KeySelector, builder.Name);
+        if (_indexManager.GetIndex(name) != null)
+            return;
 
-        // For now, let's use a dynamic approach or cast if we know it's Func<T, object>
-        if (builder.Type == IndexType.Vector)
+        // The collection may already hold documents, e.g. when a new app version adds the index.
+        // Fill the index before registering it, so neither a crash nor a document that cannot be
+        // indexed leaves an empty index persisted that later opens would trust.
+        var definition = CollectionIndexManager<TId, T>.BuildDefinition(
+            builder.KeySelector, name, builder.IsUnique, builder.Type, builder.Dimensions, builder.Metric);
+        var index = _indexManager.CreateUnregistered(definition);
+        try
         {
-            _indexManager.CreateVectorIndexUntyped(builder.KeySelector, builder.Dimensions, builder.Metric, builder.Name);
+            // Run on the thread pool so a captured SynchronizationContext cannot deadlock the wait.
+            Task.Run(() => FillUnregisteredIndexAsync(index, CancellationToken.None)).GetAwaiter().GetResult();
         }
-        else if (builder.Type == IndexType.Spatial)
+        catch (Exception ex)
         {
-            _indexManager.CreateSpatialIndexUntyped(builder.KeySelector, builder.Name);
+            throw new InvalidOperationException(
+                $"Cannot build index '{name}' of collection '{_collectionName}' from the documents already in it: {ex.Message.TrimEnd('.')}. " +
+                "Nothing was saved, but every open fails the same way until those documents can be indexed or the index " +
+                "is removed from the model (OnModelCreating).", ex);
         }
-        else if (builder.KeySelector is System.Linq.Expressions.Expression<Func<T, object>> selector)
-        {
-            _indexManager.EnsureIndex(selector, builder.Name, builder.IsUnique);
-        }
-        else
-        {
-            // Try to rebuild the expression or use untyped version
-            _indexManager.EnsureIndexUntyped(builder.KeySelector, builder.Name, builder.IsUnique);
-        }
+        PublishFilledIndex(index, _indexManager.Register);
     }
 
     /// <summary>
@@ -1597,55 +1601,75 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
     }
 
     /// <summary>
-    /// Populates an empty copy of index <paramref name="name"/> from the documents and swaps it in
+    /// Populates an empty copy of <paramref name="current"/> from the documents and swaps it in
     /// only after the rebuild committed; the old tree is then freed. If any document cannot be
     /// loaded or indexed, the rebuild fails and the existing index stays in place untouched,
     /// instead of being replaced by an incomplete one.
     /// </summary>
-    private async Task RebuildIndexFromScratchAsync(string name, CancellationToken ct)
+    private async Task RebuildIndexFromScratchAsync(CollectionSecondaryIndex<TId, T> current, CancellationToken ct)
     {
-        var fresh = _indexManager.CreateUnregisteredCopy(name);
+        var fresh = _indexManager.CreateUnregistered(current.Definition);
+        await FillUnregisteredIndexAsync(fresh, ct).ConfigureAwait(false);
+        PublishFilledIndex(fresh, copy => _indexManager.ReplaceIndex(current.Name, copy));
+    }
+
+    /// <summary>
+    /// Fills an index that is not registered yet (see <see cref="CollectionIndexManager{TId,T}.CreateUnregistered"/>)
+    /// from every document, in its own transaction, and commits it. If a document cannot be loaded
+    /// or indexed, or the commit fails, every page of the index is freed, including the pages its
+    /// splits added, the index is disposed and the exception propagates.
+    /// </summary>
+    private async Task FillUnregisteredIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct)
+    {
         var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
         try
         {
-            await FillIndexAsync(fresh, transaction, skipUnreadableDocuments: false, ct).ConfigureAwait(false);
+            await FillIndexAsync(index, transaction, skipUnreadableDocuments: false, ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct);
         }
         catch
         {
-            // Collect the copy's pages through the transaction before rolling it back: pages added
+            // Collect the index's pages through the transaction before rolling it back: pages added
             // by splits are allocated outside the transaction but linked only from nodes written
             // in it, so after the rollback they could not be found any more.
             IReadOnlyList<uint> pages = Array.Empty<uint>();
-            try { pages = fresh.CollectAllPages(transaction.TransactionId); }
+            try { pages = index.CollectAllPages(transaction.TransactionId); }
             catch { /* best-effort: never mask the original failure */ }
 
             try { await transaction.RollbackAsync(); }
             catch { /* best-effort: never mask the original failure */ }
 
-            FreeUnregisteredCopy(fresh, pages);
+            FreeUnregisteredIndex(index, pages);
             throw;
         }
+    }
 
+    /// <summary>
+    /// Hands an index filled by <see cref="FillUnregisteredIndexAsync"/> to <paramref name="register"/>
+    /// (<see cref="CollectionIndexManager{TId,T}.Register"/> or <see cref="CollectionIndexManager{TId,T}.ReplaceIndex"/>).
+    /// If that fails and the index did not get registered, nothing refers to it any more, so its
+    /// pages are freed and it is disposed.
+    /// </summary>
+    private void PublishFilledIndex(CollectionSecondaryIndex<TId, T> index, Action<CollectionSecondaryIndex<TId, T>> register)
+    {
         try
         {
-            _indexManager.ReplaceIndex(name, fresh);
+            register(index);
         }
         catch
         {
-            // The copy is committed but, unless the swap itself went through, nothing refers to it.
-            if (!ReferenceEquals(_indexManager.GetIndex(name), fresh))
+            if (!ReferenceEquals(_indexManager.GetIndex(index.Name), index))
             {
                 IReadOnlyList<uint> pages = Array.Empty<uint>();
-                try { pages = fresh.CollectAllPages(0); }
+                try { pages = index.CollectAllPages(0); }
                 catch { /* best-effort: never mask the original failure */ }
-                FreeUnregisteredCopy(fresh, pages);
+                FreeUnregisteredIndex(index, pages);
             }
             throw;
         }
     }
 
-    private void FreeUnregisteredCopy(CollectionSecondaryIndex<TId, T> copy, IReadOnlyList<uint> pages)
+    private void FreeUnregisteredIndex(CollectionSecondaryIndex<TId, T> index, IReadOnlyList<uint> pages)
     {
         try
         {
@@ -1653,7 +1677,7 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 _storage.FreePage(pageId);
         }
         catch { /* best-effort: never mask the original failure */ }
-        copy.Dispose();
+        index.Dispose();
     }
 
     private async Task RebuildIndexAsync(CollectionSecondaryIndex<TId, T> index, CancellationToken ct = default, bool skipUnreadableDocuments = true)
