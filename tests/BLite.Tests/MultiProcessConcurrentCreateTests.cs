@@ -113,6 +113,28 @@ public sealed class MultiProcessConcurrentCreateTests : IDisposable
     }
 
     [Fact]
+    public void PagesAnotherEngineAllocatedUnderTheOpenLock_AreNotHandedOutAgain()
+    {
+        var dbPath = Path.Combine(_tempDir, "alloc.db");
+        using var a = new StorageEngine(dbPath, MultiProcess);
+        using var b = new StorageEngine(dbPath, MultiProcess);
+
+        // A grows the file by a block and keeps allocating from it outside the open lock.
+        var fromA = new HashSet<uint> { a.AllocatePage() };
+
+        // B, under the open lock (creating a collection, adding a dictionary key, ...), skips
+        // past A's block and grows the file by another one.
+        var fromB = new List<uint>();
+        using (b.EnterOpenLock())
+            for (int i = 0; i < 4; i++) fromB.Add(b.AllocatePage());
+
+        // A runs past the end of its block into the one B added: it must skip B's block too.
+        for (int i = 0; i < 192; i++) fromA.Add(a.AllocatePage());
+
+        Assert.Empty(fromB.Where(fromA.Contains));
+    }
+
+    [Fact]
     public void DictionaryKeysAddedByAnotherEngine_KeepTheirIds()
     {
         var dbPath = Path.Combine(_tempDir, "dict.db");

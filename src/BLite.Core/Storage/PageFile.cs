@@ -1064,7 +1064,23 @@ public sealed class PageFile : IPageStorage
                 }
             }
 
-            // 2. No free pages, append new one
+            // 2. No free pages, append new one.
+            // With AllowMultiProcessAccess, past the end of the block this instance last sized the
+            // file to, the pages may belong to a block another process added and allocates from
+            // (under the open lock, RefreshAllocationState). Continue past the end of the file.
+            if (_config.AllowMultiProcessAccess
+                && _cryptoFileHeaderSize + (long)(_nextPageId + 1) * _physicalPageSize > _allocationViewLength)
+            {
+                var length = _fileStream.Length;
+                if (length > _allocationViewLength)
+                {
+                    var pages = (uint)((length - _cryptoFileHeaderSize) / _physicalPageSize);
+                    if (pages > _nextPageId)
+                        _nextPageId = pages;
+                    _allocationViewLength = length;
+                }
+            }
+
             var pageId = _nextPageId++;
             
             // Extend file if necessary (EnsureCapacityCore replaces the mapping in-place)
