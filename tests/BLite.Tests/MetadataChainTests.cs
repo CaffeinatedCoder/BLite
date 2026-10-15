@@ -1,6 +1,7 @@
 using BLite.Core;
 using BLite.Core.Retention;
 using BLite.Core.Storage;
+using BLite.Core.Transactions;
 using BLite.Shared;
 
 namespace BLite.Tests;
@@ -359,5 +360,214 @@ public class MetadataChainTests : IDisposable
         storage.DeleteCollectionMetadata("c1");
         Assert.Null(storage.GetCollectionMetadata("c1"));
         Assert.Equal(new[] { "c0", "c2" }, storage.GetAllCollectionsMetadata().Select(m => m.Name).OrderBy(n => n));
+    }
+
+    // ── Readers that do not take the metadata lock ───────────────────────────
+
+    /// <summary>In-memory page storage that runs a callback once, right after the next read of a page.</summary>
+    private sealed class InterceptingPageStorage : IPageStorage
+    {
+        private readonly MemoryPageStorage _inner;
+        private uint _pageId;
+        private Action? _afterRead;
+
+        public InterceptingPageStorage(int pageSize)
+        {
+            _inner = new MemoryPageStorage(pageSize);
+            _inner.Open();
+        }
+
+        public void AfterNextReadOf(uint pageId, Action action)
+        {
+            _pageId = pageId;
+            Volatile.Write(ref _afterRead, action);
+        }
+
+        public void ReadPage(uint pageId, Span<byte> destination)
+        {
+            _inner.ReadPage(pageId, destination);
+            if (pageId == _pageId && Interlocked.Exchange(ref _afterRead, null) is { } action)
+                action();
+        }
+
+        public int PageSize => _inner.PageSize;
+        public uint NextPageId => _inner.NextPageId;
+        public void Open() { }
+        public void ReadPageHeader(uint pageId, Span<byte> destination) => _inner.ReadPageHeader(pageId, destination);
+        public ValueTask ReadPageAsync(uint pageId, Memory<byte> destination, CancellationToken cancellationToken = default)
+            => _inner.ReadPageAsync(pageId, destination, cancellationToken);
+        public void WritePage(uint pageId, ReadOnlySpan<byte> source) => _inner.WritePage(pageId, source);
+        public uint AllocatePage() => _inner.AllocatePage();
+        public void FreePage(uint pageId) => _inner.FreePage(pageId);
+        public void Flush() => _inner.Flush();
+        public Task FlushAsync(CancellationToken cancellationToken = default) => _inner.FlushAsync(cancellationToken);
+        public Task BackupAsync(string destinationPath, CancellationToken cancellationToken = default)
+            => _inner.BackupAsync(destinationPath, cancellationToken);
+        public Task TruncateToMinimumAsync(CancellationToken cancellationToken = default)
+            => _inner.TruncateToMinimumAsync(cancellationToken);
+        public void Dispose() => _inner.Dispose();
+    }
+
+    /// <summary>The live collection names on each page of the chain.</summary>
+    private static List<(uint PageId, List<string> Names)> Layout(StorageEngine storage)
+    {
+        var layout = new List<(uint, List<string>)>();
+        var buffer = new byte[storage.PageSize];
+        uint pageId = 1;
+        while (pageId != 0)
+        {
+            storage.ReadPage(pageId, null, buffer);
+            var header = SlottedPageHeader.ReadFrom(buffer);
+            if (header.PageType != PageType.Collection) break;
+            var names = new List<string>();
+            for (int i = 0; i < header.SlotCount; i++)
+            {
+                var slot = SlotEntry.ReadFrom(buffer.AsSpan(SlottedPageHeader.Size + i * SlotEntry.Size));
+                if ((slot.Flags & SlotFlags.Deleted) != 0) continue;
+                using var reader = new BinaryReader(new MemoryStream(buffer, slot.Offset, slot.Length, false));
+                names.Add(reader.ReadString());
+            }
+            layout.Add((pageId, names));
+            pageId = header.NextOverflowPage;
+        }
+        return layout;
+    }
+
+    /// <summary>
+    /// A chain of three pages whose live records fit in two: all of page 1 but its first record is
+    /// deleted. The next save of that first record compacts the chain: the records of page 2 move
+    /// to page 1 (but its last), page 3's move to page 2, and page 3 is freed.
+    /// </summary>
+    private static (StorageEngine Storage, InterceptingPageStorage Pages, List<(uint PageId, List<string> Names)> Layout)
+        ChainAboutToBeCompacted()
+    {
+        var pages = new InterceptingPageStorage(16384);
+        var storage = new StorageEngine(pages, new MemoryWriteAheadLog());
+        foreach (var name in Names(36))
+        {
+            storage.SaveCollectionMetadata(new CollectionMetadata
+            {
+                Name = name,
+                GeneralRetentionPolicy = new RetentionPolicy { TimestampField = new string('x', 1100) }
+            });
+        }
+
+        var layout = Layout(storage);
+        Assert.Equal(3, layout.Count);
+        foreach (var name in layout[0].Names.Skip(1))
+            storage.DeleteCollectionMetadata(name);
+        return (storage, pages, Layout(storage));
+    }
+
+    [Theory]
+    [InlineData(0)]   // the reader then reads page 2 after the rewrite: the record has left it for page 1
+    [InlineData(1)]   // the reader then follows the old link to page 3, which the compaction freed
+    public void GetCollectionMetadata_FindsARecordThatACompactionMovesBehindTheReader(int compactAfterPage)
+    {
+        var (storage, pages, layout) = ChainAboutToBeCompacted();
+        using var _ = storage;
+        var trigger = layout[0].Names[0];
+        var moved   = layout[compactAfterPage + 1].Names[0];   // moves onto the page the reader has just read
+
+        // A save of another collection compacts the chain while the reader is between two pages.
+        pages.AfterNextReadOf(layout[compactAfterPage].PageId,
+            () => Assert.True(Task.Run(() => storage.GetNextSequence(trigger)).Wait(TimeSpan.FromSeconds(10))));
+        var metadata = storage.GetCollectionMetadata(moved);
+
+        Assert.Equal(2, Layout(storage).Count);   // the compaction ran mid-walk
+        Assert.NotNull(metadata);
+        Assert.Equal(moved, metadata!.Name);
+        Assert.Equal(new string('x', 1100), metadata.GeneralRetentionPolicy!.TimestampField);
+    }
+
+    [Fact]
+    public void GetAllCollectionsMetadata_ListsRecordsThatACompactionMovesBehindTheReader()
+    {
+        var (storage, pages, layout) = ChainAboutToBeCompacted();
+        using var _ = storage;
+        var live = layout.SelectMany(p => p.Names).OrderBy(n => n).ToList();
+
+        // Same race as above, while the reader is between page 1 and page 2. The reader holds the
+        // metadata lock, so the save waits for it (well within the lock timeout) instead of running.
+        Task? compaction = null;
+        pages.AfterNextReadOf(1, () =>
+        {
+            compaction = Task.Run(() => storage.GetNextSequence(layout[0].Names[0]));
+            compaction.Wait(TimeSpan.FromMilliseconds(100));
+        });
+        var all = storage.GetAllCollectionsMetadata();
+        Assert.NotNull(compaction);
+        compaction!.Wait();
+
+        Assert.Equal(live, all.Select(m => m.Name).OrderBy(n => n));
+        Assert.Equal(2, Layout(storage).Count);
+    }
+
+    [Fact]
+    public async Task DeleteOfAMissingCollection_DoesNotWaitForTheLockItHolds()
+    {
+        // DeleteCollectionMetadata looks the record up while holding the metadata lock; a lookup
+        // that misses must not try to take that lock again (it is not reentrant).
+        await SeedAsync(Names(2));
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        storage.DeleteCollectionMetadata("missing");
+        Assert.True(watch.ElapsedMilliseconds < 400, $"took {watch.ElapsedMilliseconds} ms");
+        Assert.Equal(new[] { "c0", "c1" }, storage.GetAllCollectionsMetadata().Select(m => m.Name).OrderBy(n => n));
+    }
+
+    // ── Records too large for a page ─────────────────────────────────────────
+
+    private static int RecordLength(StorageEngine storage, string collection)
+    {
+        var buffer = new byte[storage.PageSize];
+        uint pageId = 1;
+        while (pageId != 0)
+        {
+            storage.ReadPage(pageId, null, buffer);
+            var header = SlottedPageHeader.ReadFrom(buffer);
+            for (int i = 0; i < header.SlotCount; i++)
+            {
+                var slot = SlotEntry.ReadFrom(buffer.AsSpan(SlottedPageHeader.Size + i * SlotEntry.Size));
+                if ((slot.Flags & SlotFlags.Deleted) != 0) continue;
+                using var reader = new BinaryReader(new MemoryStream(buffer, slot.Offset, slot.Length, false));
+                if (reader.ReadString() == collection) return slot.Length;
+            }
+            pageId = header.NextOverflowPage;
+        }
+        throw new InvalidOperationException($"No record for {collection}.");
+    }
+
+    [Fact]
+    public async Task RecordTooLargeForAPage_IsRefusedBeforeAnythingIsWritten()
+    {
+        await SeedAsync(Names(3));
+        using var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+        int max = storage.PageSize - SlottedPageHeader.Size - SlotEntry.Size;
+
+        var meta = storage.GetCollectionMetadata("c1")!;
+        meta.GeneralRetentionPolicy = new RetentionPolicy { TimestampField = new string('t', 200) };
+        storage.SaveCollectionMetadata(meta);
+        int fill = 200 + max - RecordLength(storage, "c1");   // 2-byte length prefix either way
+
+        // The largest record a page holds is stored (on a page of its own)...
+        meta.GeneralRetentionPolicy.TimestampField = new string('t', fill);
+        storage.SaveCollectionMetadata(meta);
+        Assert.Equal(max, RecordLength(storage, "c1"));
+        var before = Inspect(storage);
+        Assert.Equal(2, before.Pages.Count);
+
+        // ...one byte more is refused, and the chain and the stored record stay exactly as they were.
+        meta.GeneralRetentionPolicy.TimestampField = new string('t', fill + 1);
+        var error = Assert.Throws<InvalidOperationException>(() => storage.SaveCollectionMetadata(meta));
+        Assert.Contains("does not fit in a page", error.Message);
+
+        var after = Inspect(storage);
+        Assert.Equal(before.Pages, after.Pages);
+        Assert.Equal(before.Live, after.Live);
+        Assert.Equal(before.Deleted, after.Deleted);
+        Assert.Equal(new string('t', fill), storage.GetCollectionMetadata("c1")!.GeneralRetentionPolicy!.TimestampField);
+        Assert.Equal(3, storage.GetAllCollectionsMetadata().Count);
     }
 }
