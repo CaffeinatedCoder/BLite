@@ -42,6 +42,9 @@ public sealed class WriteAheadLog : IWriteAheadLog
 {
     private readonly string _walPath;
     private FileStream? _walStream;
+
+    /// <summary>Path of the WAL file (diagnostics).</summary>
+    internal string FilePath => _walPath;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private bool _disposed;
     private readonly int _writeTimeoutMs;
@@ -471,19 +474,36 @@ public sealed class WriteAheadLog : IWriteAheadLog
     internal long GetCurrentPositionNoLock() => _walStream?.Position ?? 0;
 
     /// <summary>
-    /// Moves the write position to the current end of the WAL file. In multi-process mode
-    /// another process may have appended to the file since this instance last wrote to it, so
-    /// the position left by this instance's own writes is stale; call this under the
-    /// cross-process writer lock before appending.
+    /// Multi-process: moves the write position to <paramref name="sharedEnd"/>, the end of the
+    /// last batch any process has published (the SHM WAL end), and cuts off whatever lies beyond
+    /// it. Another process may have appended since this instance last wrote, so the position left
+    /// by its own writes is stale. Bytes past the shared end belong to a batch whose writer died
+    /// before publishing it, so that batch was never acknowledged. Appending after them would put
+    /// a torn record in front of this batch, where every reader's replay stops (#198).
+    /// Call under the cross-process writer lock before appending.
     /// </summary>
-    internal void SeekToEnd()
+    /// <remarks>
+    /// Falls back to the end of the file if <paramref name="sharedEnd"/> lies beyond it, or, for an
+    /// encrypted WAL, inside the crypto file header, which only a truncation resets.
+    /// </remarks>
+    internal void SeekToSharedEnd(long sharedEnd)
     {
         if (!_lock.Wait(_writeTimeoutMs))
             throw new TimeoutException("Timed out acquiring WAL write lock.");
         try
         {
-            if (_walStream != null)
-                _walStream.Position = _walStream.Length;
+            if (_walStream == null) return;
+
+            long length = _walStream.Length;
+            if (sharedEnd > length || (_crypto != null && sharedEnd < _crypto.FileHeaderSize))
+            {
+                _walStream.Position = length;
+                return;
+            }
+
+            if (length > sharedEnd)
+                _walStream.SetLength(sharedEnd);
+            _walStream.Position = sharedEnd;
         }
         finally
         {
@@ -715,9 +735,19 @@ public sealed class WriteAheadLog : IWriteAheadLog
     /// write per page wins — for population into the local <c>_walIndex</c> and
     /// <c>_walOffsets</c> (Phase 7 replay).
     /// </summary>
-    internal List<(uint pageId, byte[] data, long walOffset)> ReadCommittedPagesSince(long fromOffset, long toOffset)
+    /// <param name="complete">
+    /// <c>true</c> if the records ended exactly at <paramref name="toOffset"/>. <c>false</c> if the
+    /// scan stopped earlier at a record it could not read (torn, truncated, corrupt or
+    /// undecryptable) or ran past <paramref name="toOffset"/>: the records after that point were not
+    /// read, so the caller must not treat the range as replayed.
+    /// </param>
+    /// <param name="stoppedAt">Where the scan stopped: <paramref name="toOffset"/> if complete.</param>
+    internal List<(uint pageId, byte[] data, long walOffset)> ReadCommittedPagesSince(long fromOffset, long toOffset, out bool complete, out long stoppedAt)
     {
+        complete = true;
+        stoppedAt = toOffset;
         if (_walStream == null || fromOffset >= toOffset) return new List<(uint, byte[], long)>();
+        long scanned = fromOffset;
 
         // Track writes per transaction as (walOffset, data) so we can determine which
         // version of a page is latest (highest walOffset) across concurrent transactions.
@@ -768,6 +798,7 @@ public sealed class WriteAheadLog : IWriteAheadLog
                 }
                 pos += 4 + ciphertextSize;
             }
+            scanned = pos;
         }
         else
         {
@@ -816,8 +847,11 @@ public sealed class WriteAheadLog : IWriteAheadLog
                     default: goto done;
                 }
             }
-            done: ;
+            done:
+            scanned = pos;
         }
+        complete = scanned == toOffset;
+        stoppedAt = scanned;
 
         // Emit one entry per page: the latest committed write (highest walOffset) wins.
         // Iterate all committed transactions' writes in WAL order so that later commits

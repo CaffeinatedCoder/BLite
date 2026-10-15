@@ -31,9 +31,25 @@ public interface IDocumentCollection<TId, T> where T : class
     // ── Insert ────────────────────────────────────────────────────────────────
 
     ValueTask<TId> InsertAsync(T entity, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     ValueTask<TId> InsertAsync(T entity, ITransaction? transaction, CancellationToken ct = default);
 
     ValueTask<List<TId>> InsertBulkAsync(IEnumerable<T> entities, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     ValueTask<List<TId>> InsertBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default);
 
     // ── Read ──────────────────────────────────────────────────────────────────
@@ -72,9 +88,25 @@ public interface IDocumentCollection<TId, T> where T : class
     // ── Update ────────────────────────────────────────────────────────────────
 
     ValueTask<bool> UpdateAsync(T entity, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     ValueTask<bool> UpdateAsync(T entity, ITransaction? transaction, CancellationToken ct = default);
 
     ValueTask<int> UpdateBulkAsync(IEnumerable<T> entities, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     ValueTask<int> UpdateBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default);
 
     // ── Upsert ────────────────────────────────────────────────────────────────
@@ -83,17 +115,43 @@ public interface IDocumentCollection<TId, T> where T : class
     // per document — not a Find followed by a separate Insert/Update call.
 
     ValueTask<UpsertResult<TId>> UpsertAsync(T entity, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>: if the call throws
+    /// <see cref="BLiteValidationException"/> (duplicate key, vector dimension mismatch, document or
+    /// key too large), it wrote nothing and the transaction stays active, so the caller can catch it,
+    /// carry on and commit. Any other failure while writing rolls the transaction back
+    /// (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>), so that a
+    /// half-applied write, with the data and its indexes out of step, can never be committed.
+    /// </remarks>
     ValueTask<UpsertResult<TId>> UpsertAsync(T entity, ITransaction? transaction, CancellationToken ct = default);
 
     ValueTask<List<UpsertResult<TId>>> UpsertBulkAsync(IEnumerable<T> entities, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/> the call is all or nothing: if the first
+    /// document is rejected with <see cref="BLiteValidationException"/> (duplicate key, vector
+    /// dimension mismatch, document or key too large), nothing was written and the transaction stays
+    /// active. Any other failure, including a rejected document after earlier documents of the batch
+    /// were written, rolls the transaction back (<see cref="ITransaction.State"/> becomes
+    /// <see cref="TransactionState.Aborted"/>).
+    /// </remarks>
     ValueTask<List<UpsertResult<TId>>> UpsertBulkAsync(IEnumerable<T> entities, ITransaction? transaction, CancellationToken ct = default);
 
     // ── Delete ────────────────────────────────────────────────────────────────
 
     ValueTask<bool> DeleteAsync(TId id, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     ValueTask<bool> DeleteAsync(TId id, ITransaction? transaction, CancellationToken ct = default);
 
     ValueTask<int> DeleteBulkAsync(IEnumerable<TId> ids, CancellationToken ct = default);
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     ValueTask<int> DeleteBulkAsync(IEnumerable<TId> ids, ITransaction? transaction, CancellationToken ct = default);
 
     // ── Index management ──────────────────────────────────────────────────────
@@ -200,6 +258,11 @@ public interface IDocumentCollection<TId, T> where T : class
     Task<int> TruncateAsync(CancellationToken ct = default);
 
     /// <inheritdoc cref="TruncateAsync(CancellationToken)"/>
+    /// <remarks>
+    /// With a caller-owned <paramref name="transaction"/>, a failure while writing rolls the
+    /// transaction back (<see cref="ITransaction.State"/> becomes <see cref="TransactionState.Aborted"/>),
+    /// so that a half-applied delete can never be committed.
+    /// </remarks>
     Task<int> TruncateAsync(ITransaction? transaction, CancellationToken ct = default);
 
     // ── TimeSeries (local engine only; remote throws NotSupportedException) ───

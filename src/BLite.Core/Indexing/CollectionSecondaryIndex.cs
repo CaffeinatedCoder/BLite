@@ -502,6 +502,44 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
         //     [userKey][realId] are <= this boundary, so they are included.
         //   Exclusive end:   lower composite boundary [userKey][MinId] — all real entries
         //     [userKey][realId] are > this boundary, so they are excluded.
+        var (actualMinKey, actualMaxKey) = CompositeRange(minKey, maxKey, startInclusive, endInclusive);
+        return _btreeIndex.CountRange(actualMinKey, actualMaxKey, transaction?.TransactionId);
+    }
+
+    /// <summary>
+    /// Hands the stored keys of the entries in the range to <paramref name="visitor"/>, in ascending
+    /// order and without allocating per entry; bounds as for <see cref="CountRange"/>. Each key is
+    /// <c>[user key][document id]</c>, so the indexed value is its prefix.
+    /// </summary>
+    internal void ScanKeys<TVisitor>(object? minKey, object? maxKey, bool startInclusive, bool endInclusive, ref TVisitor visitor, ITransaction? transaction = null)
+        where TVisitor : struct, BTreeIndex.IKeyVisitor
+    {
+        if (_btreeIndex == null) return;
+
+        var (actualMinKey, actualMaxKey) = CompositeRange(minKey, maxKey, startInclusive, endInclusive);
+        _btreeIndex.ScanRange(actualMinKey, actualMaxKey, transaction?.TransactionId, ref visitor);
+    }
+
+    /// <summary>
+    /// The stored key of the last entry in the range (bounds as for <see cref="CountRange"/>), read
+    /// from the end of the range; <c>null</c> when the range is empty.
+    /// </summary>
+    internal IndexKey? LastKey(object? minKey, object? maxKey, bool startInclusive, bool endInclusive, ITransaction? transaction = null)
+    {
+        if (_btreeIndex == null) return null;
+
+        var (actualMinKey, actualMaxKey) = CompositeRange(minKey, maxKey, startInclusive, endInclusive);
+        foreach (var entry in _btreeIndex.Range(actualMinKey, actualMaxKey, IndexDirection.Backward, transaction?.TransactionId))
+            return entry.Key;
+        return null;
+    }
+
+    /// <summary>
+    /// The composite B-Tree bounds covering every entry whose user key lies between
+    /// <paramref name="minKey"/> and <paramref name="maxKey"/> (<c>null</c> = unbounded).
+    /// </summary>
+    private (IndexKey Min, IndexKey Max) CompositeRange(object? minKey, object? maxKey, bool startInclusive, bool endInclusive)
+    {
         IndexKey actualMinKey = IndexKey.MinKey;
         IndexKey actualMaxKey = s_maxBoundaryKey;
 
@@ -521,7 +559,7 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             actualMaxKey = CreateCompositeKeyBoundary(userMax, useMinObjectId: !endInclusive);
         }
 
-        return _btreeIndex.CountRange(actualMinKey, actualMaxKey, transaction?.TransactionId);
+        return (actualMinKey, actualMaxKey);
     }
 
     /// <summary>
@@ -593,9 +631,46 @@ public sealed class CollectionSecondaryIndex<TId, T> : IDisposable, ICollectionI
             if (s_fixedSizeId && idPart.Length != ownIdKey.Data.Length)
                 continue;
 
-            throw new InvalidOperationException(
+            throw new BLiteValidationException(
                 $"Duplicate key violation for unique index '{_definition.Name}'");
         }
+    }
+
+    /// <summary>
+    /// Throws <see cref="BLiteValidationException"/> if <paramref name="document"/>'s key could not
+    /// be written to this index: a vector whose length differs from the index dimensions, or a
+    /// B-Tree key larger than a node page. Called before any page is written, so a rejected write
+    /// leaves nothing behind instead of failing halfway through the indexes.
+    /// </summary>
+    internal void ValidateKey(T document)
+    {
+        if (!_definition.TryGetKey(document, out var keyValue) || keyValue == null)
+            return; // null keys are not indexed
+
+        if (_vectorIndex != null)
+        {
+            if (keyValue is float[] singleVector)
+                ValidateVector(singleVector);
+            else if (keyValue is IEnumerable<float[]> vectors)
+                foreach (var v in vectors) ValidateVector(v);
+        }
+        else if (_btreeIndex != null && !keyValue.GetType().IsValueType)
+        {
+            // Value-type keys (numbers, dates, Guid, ObjectId, enums) have a small fixed size;
+            // only strings, byte arrays and the ToString fallback can grow past a page.
+            var keyLength = ConvertToIndexKey(keyValue).Data.Length
+                            + _mapper.ToIndexKey(_mapper.GetId(document)).Data.Length;
+            if (keyLength > _btreeIndex.MaxKeySize)
+                throw new BLiteValidationException(
+                    $"Key of {keyLength} bytes is too large for index '{_definition.Name}' (maximum {_btreeIndex.MaxKeySize} bytes).");
+        }
+    }
+
+    private void ValidateVector(float[] vector)
+    {
+        if (vector.Length != _definition.Dimensions)
+            throw new BLiteValidationException(
+                $"Vector dimension mismatch for index '{_definition.Name}'. Expected {_definition.Dimensions}, got {vector.Length}");
     }
 
     // [user key][one byte]: a range bound between the entries of user key and those of longer values.

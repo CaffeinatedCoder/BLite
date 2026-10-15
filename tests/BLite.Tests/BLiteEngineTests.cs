@@ -101,7 +101,7 @@ public class BLiteEngineTests : IDisposable
             .AddString("name", "Alice")));
         await _engine.CommitAsync();
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        var ex = await Assert.ThrowsAsync<BLiteValidationException>(async () =>
             await col.InsertAsync(col.CreateDocument(["_id", "name"], b => b
                 .AddId((BsonId)1)
                 .AddString("name", "Bob"))));

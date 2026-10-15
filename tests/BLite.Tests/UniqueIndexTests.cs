@@ -40,7 +40,7 @@ public class UniqueIndexTests : IDisposable
         await _db.PeopleV2.CreateIndexAsync(p => p.Name, "idx_name", unique: true);
         await _db.PeopleV2.InsertAsync(new PersonV2 { Name = "dup", Age = 1 });
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        await Assert.ThrowsAsync<BLiteValidationException>(
             () => _db.PeopleV2.InsertAsync(new PersonV2 { Name = "dup", Age = 2 }).AsTask());
 
         // The rejected insert leaves nothing behind.
@@ -58,7 +58,7 @@ public class UniqueIndexTests : IDisposable
         await col.CreateIndexAsync("name", unique: true);
         await col.InsertAsync(col.CreateDocument(["name"], b => b.AddString("name", "dup")));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        await Assert.ThrowsAsync<BLiteValidationException>(
             () => col.InsertAsync(col.CreateDocument(["name"], b => b.AddString("name", "dup"))).AsTask());
     }
 
@@ -72,7 +72,7 @@ public class UniqueIndexTests : IDisposable
         await col.CreateIndexAsync("name", unique: true);
         await col.InsertAsync(col.CreateDocument(["name"], b => b.AddNull("name")));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        await Assert.ThrowsAsync<BLiteValidationException>(
             () => col.InsertAsync(col.CreateDocument(["name"], b => b.AddNull("name"))).AsTask());
     }
 
@@ -86,7 +86,7 @@ public class UniqueIndexTests : IDisposable
         var bob = (await _db.PeopleV2.FindByIdAsync(bobId))!;
         bob.Name = "alice";
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        await Assert.ThrowsAsync<BLiteValidationException>(
             () => _db.PeopleV2.UpdateAsync(bob).AsTask());
 
         // The rejected update leaves the document and its index entry unchanged.
@@ -137,7 +137,7 @@ public class UniqueIndexTests : IDisposable
 
         // Changing the key onto a value another document holds is still rejected.
         second.Name = "carol";
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        await Assert.ThrowsAsync<BLiteValidationException>(
             () => _db.PeopleV2.UpdateAsync(second).AsTask());
         Assert.Equal("dup", (await _db.PeopleV2.FindByIdAsync(secondId))!.Name);
 
@@ -156,7 +156,7 @@ public class UniqueIndexTests : IDisposable
 
         foreach (var name in names)
         {
-            await Assert.ThrowsAsync<InvalidOperationException>(
+            await Assert.ThrowsAsync<BLiteValidationException>(
                 () => _db.PeopleV2.InsertAsync(new PersonV2 { Name = name, Age = 2 }).AsTask());
         }
 
@@ -193,7 +193,7 @@ public class UniqueIndexTests : IDisposable
         await _db.StringEntities.InsertAsync(new StringEntity { Id = "1", Value = "abc" });
         await _db.StringEntities.InsertAsync(new StringEntity { Id = "2", Value = "ab" });
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        await Assert.ThrowsAsync<BLiteValidationException>(
             () => _db.StringEntities.InsertAsync(new StringEntity { Id = "3", Value = "ab" }).AsTask());
 
         Assert.Equal(2, await _db.StringEntities.CountAsync());
@@ -214,7 +214,7 @@ public class UniqueIndexTests : IDisposable
     {
         await _db.PeopleV2.CreateIndexAsync(p => p.Name, "idx_name", unique: true);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => _db.PeopleV2.InsertBulkAsync(
+        await Assert.ThrowsAsync<BLiteValidationException>(() => _db.PeopleV2.InsertBulkAsync(
         [
             new PersonV2 { Name = "x", Age = 1 },
             new PersonV2 { Name = "dup", Age = 2 },

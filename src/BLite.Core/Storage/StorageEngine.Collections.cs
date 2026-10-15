@@ -135,6 +135,34 @@ public sealed partial class StorageEngine
 {
     public CollectionMetadata? GetCollectionMetadata(string name)
     {
+        // Lock-free first: saves only rewrite or move records, so a record this walk finds is the
+        // collection's. A miss proves nothing, though: a concurrent compaction (any save, under
+        // _metadataLock) can move the record onto a page the walk has already read and rewrite or
+        // free the page it was on. Callers take null for "new collection" and save fresh metadata
+        // over the existing record, so a miss, or a walk that runs into a page it cannot parse, is
+        // repeated under the lock.
+        try
+        {
+            var metadata = FindCollectionMetadata(name);
+            if (metadata != null)
+                return metadata;
+        }
+        catch
+        {
+            // Retried under the lock below, where an error is real and propagates.
+        }
+
+        if (!_metadataLock.Wait(_config.LockTimeout.WriteTimeoutMs))
+            throw new TimeoutException("Timed out acquiring metadata lock (GetCollectionMetadata).");
+        try
+        {
+            return FindCollectionMetadata(name);
+        }
+        finally { _metadataLock.Release(); }
+    }
+
+    private CollectionMetadata? FindCollectionMetadata(string name)
+    {
         var buffer = new byte[PageSize];
         uint pageId = 1;
 
@@ -183,6 +211,15 @@ public sealed partial class StorageEngine
     /// older version would misread the list and fail to load the record, so it could not refuse
     /// the collection (see <see cref="CollectionFeatures"/>).
     /// </summary>
+    /// <remarks>
+    /// Format rule: new data goes only in new trailing sections, after the last one read here; new
+    /// per-index data too (as the key formats do), never inline in the index list. The list is read by
+    /// position, with the vector fields as the only per-type extra, so a version that finds bytes it
+    /// does not expect there misreads the rest of the record and fails to parse it.
+    /// <see cref="GetCollectionMetadata"/> then returns <c>null</c>, a dynamic open treats the collection
+    /// as new and saves a fresh record over it, and the required-features refusal
+    /// (<see cref="CollectionFeatures"/>) never runs.
+    /// </remarks>
     private static CollectionMetadata ReadCollectionMetadata(string name, BinaryReader reader)
     {
         var metadata = new CollectionMetadata { Name = name };
@@ -400,6 +437,7 @@ public sealed partial class StorageEngine
         }
 
         var newData = stream.ToArray();
+        // Checked before anything is written or allocated: the stored record stays as it is.
         if (newData.Length + SlotEntry.Size > PageSize - SlottedPageHeader.Size)
             throw new InvalidOperationException(
                 $"Collection metadata for '{metadata.Name}' ({newData.Length} bytes) does not fit in a page.");
@@ -409,14 +447,11 @@ public sealed partial class StorageEngine
             throw new InvalidOperationException("Page 1 is not a collection metadata page.");
         var (foundPage, foundSlot) = FindMetadataRecord(chain, metadata.Name);
 
-        // Never rewrite the record of a collection that requires features this version lacks
-        // (see CollectionFeatures). Checked before every write path, the in-place one included.
-        // Nothing has been written yet.
-        if (foundPage >= 0
-            && TryReadRecord(chain[foundPage].Buffer, ReadSlot(chain[foundPage].Buffer, foundSlot)) is { } stored)
-        {
-            CollectionFeatures.EnsureCanWrite(stored);
-        }
+        // Never rewrite the record of a collection that requires features this version lacks, or
+        // one it cannot parse (see CollectionFeatures). Checked before every write path, the
+        // in-place one included. Nothing has been written yet.
+        if (foundPage >= 0)
+            EnsureCanReplaceRecord(metadata.Name, chain[foundPage].Buffer, foundSlot);
 
         // ── 1. No larger than the stored record: overwrite it where it is ─────
         // A single page write. Covers the frequent saves (sequence values, root page ids) whose
@@ -536,16 +571,26 @@ public sealed partial class StorageEngine
     /// Pages are rewritten front to back and every record lands on its own page or an earlier one,
     /// so all records are on some page after each write. A crash part-way can leave a record on
     /// two pages; the copies are identical, readers take the first, and the next compaction drops
-    /// the other.
+    /// the other. A crash after the last page is rewritten but before the pages past the new end
+    /// are freed leaves those pages unreachable and off the free list: they leak (file space only,
+    /// no records are lost), which is accepted to keep the rewrite free of extra bookkeeping.
     /// </remarks>
     private List<(uint PageId, byte[] Buffer)> CompactMetadataChain(List<(uint PageId, byte[] Buffer)> chain, bool onlyIfShorter)
     {
-        var records = new List<byte[]>();
-        var names   = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        bool anythingToDrop = false;
+        // A single page cannot get shorter. This is the common case: every in-place save asks.
+        if (onlyIfShorter && chain.Count <= 1)
+            return chain;
 
-        foreach (var (_, buffer) in chain)
+        // Plan from the slot tables alone: which records stay, and the page each one lands on.
+        var keep  = new List<(int SourcePage, SlotEntry Slot, int TargetPage)>();
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool anythingToDrop = false;
+        int pageCount = 1;
+        int room = PageSize - SlottedPageHeader.Size;
+
+        for (int p = 0; p < chain.Count; p++)
         {
+            var buffer = chain[p].Buffer;
             var header = SlottedPageHeader.ReadFrom(buffer);
             int liveBytes = 0;
             for (int i = 0; i < header.SlotCount; i++)
@@ -555,46 +600,45 @@ public sealed partial class StorageEngine
 
                 var name = TryReadRecordName(buffer, slot);
                 if (name != null && !names.Add(name)) { anythingToDrop = true; continue; }
-
-                records.Add(buffer.AsSpan(slot.Offset, slot.Length).ToArray());
                 liveBytes += slot.Length;
+
+                // Greedy packing in order needs no more pages than any in-order layout, the current one included.
+                int need = slot.Length + SlotEntry.Size;
+                if (need > room)
+                {
+                    pageCount++;
+                    room = PageSize - SlottedPageHeader.Size;
+                }
+                room -= need;
+                keep.Add((p, slot, pageCount - 1));
             }
             if (PageSize - header.FreeSpaceEnd > liveBytes) anythingToDrop = true;
         }
 
-        // Greedy packing in order needs no more pages than any in-order layout, the current one included.
-        var pages = new List<List<byte[]>> { new() };
-        int room = PageSize - SlottedPageHeader.Size;
-        foreach (var record in records)
-        {
-            int need = record.Length + SlotEntry.Size;
-            if (need > room)
-            {
-                pages.Add(new List<byte[]>());
-                room = PageSize - SlottedPageHeader.Size;
-            }
-            pages[pages.Count - 1].Add(record);
-            room -= need;
-        }
-
-        if (pages.Count >= chain.Count && (onlyIfShorter || !anythingToDrop))
+        if (pageCount >= chain.Count && (onlyIfShorter || !anythingToDrop))
             return chain;
 
-        var result = new List<(uint PageId, byte[] Buffer)>(pages.Count);
-        for (int p = 0; p < pages.Count; p++)
+        // The records are copied out of the buffers loaded before the first write; each page is
+        // rebuilt in a fresh buffer, so those stay intact while the chain is rewritten.
+        var result = new List<(uint PageId, byte[] Buffer)>(pageCount);
+        int k = 0;
+        for (int p = 0; p < pageCount; p++)
         {
             var pageId = chain[p].PageId;
-            var next   = p + 1 < pages.Count ? chain[p + 1].PageId : 0u;
+            var next   = p + 1 < pageCount ? chain[p + 1].PageId : 0u;
             var buffer = new byte[PageSize];
             NewMetadataPage(pageId, next).WriteTo(buffer);
-            foreach (var record in pages[p])
-                AppendRecord(buffer, record);
+            for (; k < keep.Count && keep[k].TargetPage == p; k++)
+            {
+                var (source, slot, _) = keep[k];
+                AppendRecord(buffer, chain[source].Buffer.AsSpan(slot.Offset, slot.Length));
+            }
             WritePageImmediate(pageId, buffer);
             result.Add((pageId, buffer));
         }
 
         // Page 1 is always kept; the pages after the new end of the chain are no longer reachable.
-        for (int p = pages.Count; p < chain.Count; p++)
+        for (int p = pageCount; p < chain.Count; p++)
             FreePage(chain[p].PageId);
 
         return result;
@@ -612,7 +656,7 @@ public sealed partial class StorageEngine
     };
 
     /// <summary>Adds <paramref name="record"/> as a new slot; the caller checked that it fits.</summary>
-    private static void AppendRecord(byte[] page, byte[] record)
+    private static void AppendRecord(byte[] page, ReadOnlySpan<byte> record)
     {
         var header = SlottedPageHeader.ReadFrom(page);
         int offset = header.FreeSpaceEnd - record.Length;
@@ -657,19 +701,40 @@ public sealed partial class StorageEngine
         }
     }
 
-    /// <summary>Parses the collection record in <paramref name="slot"/>, or returns <c>null</c> if it is malformed.</summary>
-    private static CollectionMetadata? TryReadRecord(byte[] page, SlotEntry slot)
+    /// <summary>
+    /// Throws unless this version may overwrite or drop the stored record of collection
+    /// <paramref name="name"/> in slot <paramref name="slotIndex"/>: the record must parse, and every
+    /// feature it requires must be known (see <see cref="CollectionFeatures"/>). A record that does not
+    /// parse is refused too, since its features cannot be checked.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The record cannot be parsed, or requires features this version lacks.</exception>
+    private static void EnsureCanReplaceRecord(string name, byte[] page, int slotIndex)
     {
+        var slot = ReadSlot(page, slotIndex);
+        CollectionMetadata stored;
         try
         {
             using var ms     = new MemoryStream(page, slot.Offset, slot.Length, false);
             using var reader = new BinaryReader(ms);
-            return ReadCollectionMetadata(reader.ReadString(), reader);
+            stored = ReadCollectionMetadata(reader.ReadString(), reader);
         }
-        catch
+        catch (Exception ex)
         {
-            return null;
+            throw CollectionFeatures.UnreadableRecord(name, ex);
         }
+        CollectionFeatures.EnsureCanWrite(stored);
+    }
+
+    /// <summary>
+    /// Like <see cref="EnsureCanReplaceRecord"/>, for the first live record of collection
+    /// <paramref name="name"/> (the one <see cref="SaveCollectionMetadata"/> replaces), if there is one.
+    /// </summary>
+    private void EnsureCanReplaceStoredRecord(string name)
+    {
+        var chain = LoadMetadataChain();
+        var (page, slot) = FindMetadataRecord(chain, name);
+        if (page >= 0)
+            EnsureCanReplaceRecord(name, chain[page].Buffer, slot);
     }
 
     /// <summary>
@@ -683,10 +748,9 @@ public sealed partial class StorageEngine
             throw new TimeoutException("Timed out acquiring metadata lock (DeleteCollectionMetadata).");
         try
         {
-        // Never drop the record of a collection that requires features this version lacks
-        // (see CollectionFeatures).
-        if (GetCollectionMetadata(name) is { } stored)
-            CollectionFeatures.EnsureCanWrite(stored);
+        // Never drop the record of a collection that requires features this version lacks, or one
+        // it cannot parse (see CollectionFeatures).
+        EnsureCanReplaceStoredRecord(name);
 
         var buffer = new byte[PageSize];
         uint pageId = 1;
@@ -731,6 +795,12 @@ public sealed partial class StorageEngine
 
     public IReadOnlyList<CollectionMetadata> GetAllCollectionsMetadata()
     {
+        // Under the lock: a concurrent compaction can move records onto a page this walk has
+        // already read, and unlike a single lookup the result would not show that they are missing.
+        if (!_metadataLock.Wait(_config.LockTimeout.WriteTimeoutMs))
+            throw new TimeoutException("Timed out acquiring metadata lock (GetAllCollectionsMetadata).");
+        try
+        {
         var result = new List<CollectionMetadata>();
         // One entry per collection: the first copy, as GetCollectionMetadata returns it (a crash
         // while the chain was compacted can leave a second one; see CompactMetadataChain).
@@ -772,6 +842,8 @@ public sealed partial class StorageEngine
         }
 
         return result;
+        } // end try
+        finally { _metadataLock.Release(); }
     }
 
     /// <summary>

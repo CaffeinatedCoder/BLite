@@ -265,6 +265,47 @@ namespace BLite.SourceGenerators.Helpers
         }
 
         /// <summary>
+        /// True when every accessor of <paramref name="property"/> is compiler-implemented
+        /// (<c>{ get; set; }</c>, <c>{ get; init; }</c>, <c>{ get; private set; }</c>), so the getter
+        /// returns exactly the value last assigned. False for accessors with a body, including ones
+        /// using the <c>field</c> keyword, for partial and abstract properties, and for record
+        /// positional parameters.
+        /// </summary>
+        public static bool IsAutoProperty(IPropertySymbol property)
+        {
+            if (property.IsAbstract || property.IsExtern)
+                return false;
+
+            if (property.DeclaringSyntaxReferences.IsEmpty)
+            {
+                // Compiled assembly: auto-implemented accessors carry [CompilerGenerated]. A private
+                // setter may be invisible here (SetMethod == null); the getter decides then.
+                return IsCompilerGenerated(property.GetMethod)
+                    && (property.SetMethod == null || IsCompilerGenerated(property.SetMethod));
+            }
+
+            foreach (var reference in property.DeclaringSyntaxReferences)
+            {
+                if (reference.GetSyntax() is not PropertyDeclarationSyntax declaration
+                    || declaration.ExpressionBody != null
+                    || declaration.AccessorList == null
+                    || declaration.Modifiers.Any(SyntaxKind.PartialKeyword))
+                    return false;
+
+                foreach (var accessor in declaration.AccessorList.Accessors)
+                {
+                    if (accessor.Body != null || accessor.ExpressionBody != null)
+                        return false;
+                }
+            }
+            return true;
+
+            static bool IsCompilerGenerated(IMethodSymbol? accessor)
+                => accessor != null && accessor.GetAttributes().Any(a =>
+                    a.AttributeClass?.ToDisplayString() == "System.Runtime.CompilerServices.CompilerGeneratedAttribute");
+        }
+
+        /// <summary>
         /// Returns true when <paramref name="type"/> is (or implements) <c>IDictionary&lt;TKey, TValue&gt;</c>.
         /// Populates <paramref name="keyType"/> and <paramref name="valueType"/> with the two type arguments.
         /// </summary>
