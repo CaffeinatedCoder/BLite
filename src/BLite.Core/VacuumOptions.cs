@@ -41,7 +41,7 @@ public sealed class VacuumOptions
     /// the existing index is kept. Index handles obtained earlier (for example from
     /// <c>GetIndexAsync</c> or <c>CreateIndexAsync</c>) refer to the replaced tree afterwards and
     /// must be fetched again. A query already running on the old tree while it is replaced may read
-    /// pages that are being freed. Spatial indexes are not rebuilt.
+    /// pages that are being freed. Spatial (R-tree) indexes are rebuilt the same way.
     /// </para>
     /// </summary>
     public bool RebuildIndexes { get; init; } = false;
