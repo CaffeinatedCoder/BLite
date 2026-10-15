@@ -209,6 +209,22 @@ public class LinqAggregateTests : IDisposable
     }
 
     [Fact]
+    public async Task FilterBoundOfAnotherType_IsNotUsedAsAKeyRange()
+    {
+        // The optimizer keeps the constant's type, so these bounds are a double and a long against
+        // the int Count index; encoded as keys they would bound the wrong range.
+        using var db = new AggregateDbContext(_dbPath);
+        for (int i = 0; i < 20; i++)
+            await db.Readings.InsertAsync(new Reading { Id = new ObjectId(i + 1, 0), Count = i, Total = i });
+
+        var entities = db.Readings.AsQueryable().ToList();
+        var q = db.Readings.AsQueryable();
+        Assert.Equal(entities.Where(r => r.Count < 9.5).Max(r => r.Count), q.Where(r => r.Count < 9.5).Max(r => r.Count));
+        Assert.Equal(entities.Where(r => r.Count > 4L).Sum(r => r.Count), q.Where(r => r.Count > 4L).Sum(r => r.Count));
+        Assert.Equal(entities.Where(r => r.Count > 4).Sum(r => r.Count), q.Where(r => r.Count > 4).Sum(r => r.Count));
+    }
+
+    [Fact]
     public async Task IndexKeySums_ThatCannotOverflow_AreTakenFromTheKeys()
     {
         // The positive values sum to exactly int.MaxValue and the negative ones to exactly
