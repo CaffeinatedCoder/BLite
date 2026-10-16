@@ -1,4 +1,5 @@
 using System.Collections;
+using Xunit.Abstractions;
 
 namespace BLite.Tests.Oracles;
 
@@ -6,9 +7,11 @@ namespace BLite.Tests.Oracles;
 public sealed record Candidate(string Name, string Family, string Issue);
 
 /// <summary>
-/// The known candidates of an oracle test. A listed row is not skipped: while it disagrees it fails
-/// with its family label, so triage tells a known candidate from a new one; once it agrees it fails
-/// with "candidate fixed", so the entry is removed in the fix's PR and the list never goes stale.
+/// The known candidates of an oracle test. While a listed row disagrees: with an empty
+/// <see cref="Candidate.Issue"/> it fails with its family label, so a candidate is never quarantined
+/// before it is filed; with an issue it passes and reports <c>SKIPPED</c> with the label and the issue
+/// through the test output (xunit 2 has no dynamic skip). Once a listed row agrees it fails with
+/// "candidate fixed", so the entry is removed in the fix's PR and the list never goes stale.
 /// </summary>
 public sealed class Candidates : IEnumerable<Candidate>
 {
@@ -21,9 +24,10 @@ public sealed class Candidates : IEnumerable<Candidate>
             _entries.Add(name, new Candidate(name, family, issue));
     }
 
-    /// <summary>Passes a row that agrees and is not listed; fails every other row.</summary>
+    /// <summary>Passes a row that agrees and is not listed, or that disagrees and is listed with an issue; fails every other row.</summary>
     /// <param name="failure">The disagreement, or null when the row agrees with its oracle.</param>
-    public void Verify(string name, string? failure)
+    /// <param name="output">Receives the <c>SKIPPED</c> line of a listed row with an issue.</param>
+    public void Verify(string name, string? failure, ITestOutputHelper output)
     {
         var known = _entries.TryGetValue(name, out var c);
         if (failure == null)
@@ -31,7 +35,9 @@ public sealed class Candidates : IEnumerable<Candidate>
             Assert.False(known, $"candidate fixed: remove the entry for '{name}'");
             return;
         }
-        Assert.Fail(known ? $"[known candidate: {c!.Family}{(c.Issue.Length > 0 ? $", {c.Issue}" : "")}] {failure}" : failure);
+        if (!known) Assert.Fail(failure);
+        if (c!.Issue.Length == 0) Assert.Fail($"[known candidate: {c.Family}] {failure}");
+        output.WriteLine($"SKIPPED [known candidate: {c.Family}, {c.Issue}] {failure}");
     }
 
     /// <summary>Fails when an entry names no row of the test, e.g. after a row was renamed.</summary>

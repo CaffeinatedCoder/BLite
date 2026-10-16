@@ -5,6 +5,7 @@ using BLite.Core.Query;
 using BLite.Core.Storage;
 using BLite.Core.Transactions;
 using BLite.Shared;
+using Xunit.Abstractions;
 
 namespace BLite.Tests.Oracles;
 
@@ -28,6 +29,10 @@ namespace BLite.Tests.Oracles;
 /// </remarks>
 public class StoreModelTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public StoreModelTests(ITestOutputHelper output) => _output = output;
+
     private const int Steps = 300;
     private const int IdPool = 120;
     private static readonly string[] s_codes = Enumerable.Range(0, 40).Select(i => $"c{i:00}").ToArray();
@@ -57,7 +62,7 @@ public class StoreModelTests
         var failure = await Replay(ops, multiProcess);
         if (failure == null)
         {
-            s_candidates.Verify(label, null);
+            s_candidates.Verify(label, null, _output);
             return;
         }
 
@@ -67,7 +72,7 @@ public class StoreModelTests
         sb.AppendLine($"Shortest failing sequence found ({shrunk.Ops.Count} of {failure.Step + 1} steps), failing at its step {shrunk.Failure.Step + 1}: {shrunk.Failure.Message}");
         for (int i = 0; i < shrunk.Ops.Count; i++)
             sb.AppendLine($"  {i + 1,3}. {shrunk.Ops[i]}");
-        s_candidates.Verify(label, sb.ToString());
+        s_candidates.Verify(label, sb.ToString(), _output);
     }
 
     // ── Operations ────────────────────────────────────────────────────────────

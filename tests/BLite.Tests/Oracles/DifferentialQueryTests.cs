@@ -3,6 +3,7 @@ using System.Text;
 using BLite.Bson;
 using BLite.Core.Query;
 using BLite.Shared;
+using Xunit.Abstractions;
 
 namespace BLite.Tests.Oracles;
 
@@ -21,8 +22,9 @@ namespace BLite.Tests.Oracles;
 public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixture>
 {
     private readonly Fixture _f;
+    private readonly ITestOutputHelper _output;
 
-    public DifferentialQueryTests(Fixture fixture) => _f = fixture;
+    public DifferentialQueryTests(Fixture fixture, ITestOutputHelper output) => (_f, _output) = (fixture, output);
 
     // ── Fixture ───────────────────────────────────────────────────────────────
 
@@ -128,7 +130,8 @@ public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixtu
     /// <summary>
     /// Rows that disagree on upstream 0450b97, by family, with the hypothesis the disagreement
     /// suggests and the issue that tracks it (empty until filed). See <see cref="Candidates"/>:
-    /// a listed row fails with its family label, and fails again once fixed until its entry is removed.
+    /// a listed row fails with its family label until its issue is filed, is reported as skipped
+    /// while the issue is open, and fails again once fixed until its entry is removed.
     /// </summary>
     private static readonly Candidates s_candidates = new()
     {
@@ -574,7 +577,7 @@ public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixtu
         }
 
         s_candidates.Verify(name, errors.Count == 0 ? null
-            : $"seed {_f.Seed}: query '{name}' disagrees with LINQ-to-Objects:\n  " + string.Join("\n  ", errors));
+            : $"seed {_f.Seed}: query '{name}' disagrees with LINQ-to-Objects:\n  " + string.Join("\n  ", errors), _output);
     }
 
     /// <summary>The value the query produced, or the exception it threw (both are compared).</summary>
