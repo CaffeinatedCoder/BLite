@@ -60,7 +60,7 @@ dotnet test
 
 ### Oracle tests
 
-An oracle test checks BLite against an independent answer instead of hand-written expectations: `DifferentialQueryTests` runs ~330 query shapes on an indexed collection, an unindexed one and LINQ-to-Objects; `StoreModelTests` replays random writes, transactions, checkpoints, backups and reopens against an in-memory model. They live in `tests/BLite.Tests/Oracles/`.
+An oracle test checks BLite against an independent answer instead of hand-written expectations: `DifferentialQueryTests` runs ~330 query shapes on an indexed collection, an unindexed one and LINQ-to-Objects; `StoreModelTests` replays random writes, transactions, checkpoints, backups and reopens against an in-memory model. They live in `tests/BLite.Tests/Oracles/`; [docs/ORACLE_TESTS.md](docs/ORACLE_TESTS.md) describes them, their seeds and the candidate registry.
 
 - **Adding one**: put `<Name>Tests.cs` under `Oracles/` (entities in `BLite.Shared`), seeded and deterministic, with the seed and the failing row's name in every failure message.
 - **Every oracle test ships a seed**: `Oracles/Seeds/<Name>Tests.<defect>.patch`, a change to `src/` only (a revert of a past fix, or a hand-made defect) that the test was shown to catch by applying it locally. Describe the defect and the failures it causes above the diff. `OracleSeedsTests` checks in CI that each oracle has a seed and that every seed still applies; `dotnet run tools/oracle-seeds.cs` re-proves locally that each one is caught. Refresh a seed when a refactor strands it.
