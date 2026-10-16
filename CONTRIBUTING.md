@@ -64,7 +64,7 @@ An oracle test checks BLite against an independent answer instead of hand-writte
 
 - **Adding one**: put `<Name>Tests.cs` under `Oracles/` (entities in `BLite.Shared`), seeded and deterministic, with the seed and the failing row's name in every failure message.
 - **Every oracle test ships a seed**: `Oracles/Seeds/<Name>Tests.<defect>.patch`, a change to `src/` only (a revert of a past fix, or a hand-made defect) that the test was shown to catch by applying it locally. Describe the defect and the failures it causes above the diff. `OracleSeedsTests` checks in CI that each oracle has a seed and that every seed still applies; `dotnet run tools/oracle-seeds.cs` re-proves locally that each one is caught. Refresh a seed when a refactor strands it.
-- **Known candidates**: a row that disagrees and is not fixed yet goes into the test's `Candidates` registry with its family label and issue. It still fails, labelled `[known candidate: ...]`. When the fix lands the row passes and fails with `candidate fixed: remove the entry for '<name>'`: remove the entry in the fix's PR.
+- **Known candidates**: a row that disagrees and is not fixed yet goes into the test's `Candidates` registry with its family label and the issue that tracks it. While its `Issue` is empty the row keeps failing, labelled `[known candidate: <family>]`; once the issue is filled in the row passes and writes `SKIPPED [known candidate: <family>, <issue>]` to the test output, which is the only trace a run shows because xunit 2 has no dynamic skip. When the fix lands the row agrees and fails with `candidate fixed: remove the entry for '<name>'`: remove the entry in the fix's PR.
 
 ### Commit trailers
 

@@ -19,6 +19,20 @@ empty); neither is about null keys, `!=` or signed zero. #212 (keys not prefix-f
 Affected versions below are read from `git describe --contains` of the commit that introduced each
 code path; the tests were only run on `0450b97`.
 
+**Registry entries.** Each draft is one family of `s_candidates` in
+`tests/BLite.Tests/Oracles/DifferentialQueryTests.cs`; its second argument is the issue and is empty
+until filed. Once an issue exists, put its number there (for example `"#250"`) and the family's rows
+are reported as skipped instead of failing:
+
+| Draft | Registry family label | Rows |
+|---|---|---|
+| 1 | `null equality on an indexed property finds nothing` | 9 |
+| 2 | `!= excludes null values` | 2 |
+| 3 | `-0.0 is not found by an equality on an indexed double` | 2 |
+| 4 | `indexed top-N window skips documents with a null key` | 1 |
+
+Drafts 1 and 4 share a root cause; if they are filed as one issue, both entries get the same number.
+
 ---
 
 ## 1. `== null` on an indexed nullable property of a typed collection finds nothing
