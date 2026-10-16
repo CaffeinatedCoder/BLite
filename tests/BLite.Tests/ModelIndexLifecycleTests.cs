@@ -1,0 +1,332 @@
+using System.Diagnostics;
+using BLite.Bson;
+using BLite.Core;
+using BLite.Core.Collections;
+using BLite.Core.Indexing;
+using BLite.Core.Metadata;
+using BLite.Core.Storage;
+
+namespace BLite.Tests;
+
+/// <summary>
+/// Lifecycle of model-declared indexes (<c>HasIndex</c> / <c>HasVectorIndex</c> / ...) across app
+/// versions and processes:
+/// <list type="bullet">
+/// <item>#191: a declared index whose stored definition differs (unique flag, key selector under an
+/// explicit name, vector dimensions / metric) is dropped and rebuilt from the documents on open,
+/// through the backfill path of #175, so a rebuild that fails saves nothing. An index the model no
+/// longer declares is reported, never dropped.</item>
+/// <item>#192: two processes opening a model with a new index at the same time end up sharing one
+/// index, and saving the metadata from one process keeps the indexes another process added.</item>
+/// </list>
+/// The "processes" are separate engine instances on the same files within this process, as in
+/// <see cref="MultiProcessConcurrentCreateTests"/>.
+/// </summary>
+public sealed class ModelIndexLifecycleTests : IDisposable
+{
+    private const string Collection = "lifecycle_docs";
+    private static readonly PageFileConfig MultiProcess = PageFileConfig.Default with { AllowMultiProcessAccess = true };
+
+    private readonly string _dbPath;
+    private readonly WarningCollector _warnings = new(Collection);
+
+    public ModelIndexLifecycleTests()
+    {
+        _dbPath = Path.Combine(Path.GetTempPath(), $"idx_lifecycle_{Guid.NewGuid():N}.db");
+        Trace.Listeners.Add(_warnings);
+    }
+
+    public void Dispose()
+    {
+        Trace.Listeners.Remove(_warnings);
+        foreach (var f in new[] { _dbPath, Path.ChangeExtension(_dbPath, ".wal"), Path.ChangeExtension(_dbPath, ".wal-shm") })
+            try { if (File.Exists(f)) File.Delete(f); } catch { /* best-effort */ }
+    }
+
+    private static LifecycleDoc Doc(int i, string? email = null) => new()
+    {
+        Name = $"n{i}", Email = email ?? $"e{i}@x", Age = i % 10, Score = i % 7, Embedding = [i, i % 3, i % 5],
+    };
+
+    private async Task SeedAsync(PageFileConfig? config = null)
+    {
+        using var v1 = new LcBaseContext(_dbPath, config ?? PageFileConfig.Default);
+        for (int i = 0; i < 50; i++)
+            await v1.Docs.InsertAsync(Doc(i));
+    }
+
+    private IndexMetadata Stored(StorageEngine storage, string name)
+        => Assert.Single(storage.GetCollectionMetadata(Collection)!.Indexes, i => i.Name == name);
+
+    // ── #191: changed definitions ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task ChangedUniqueFlag_RebuildsTheIndexAsUnique()
+    {
+        await SeedAsync();
+
+        using var v2 = new LcUniqueContext(_dbPath);
+
+        Assert.True(Assert.Single(v2.Docs.GetIndexes(), i => i.Name == "idx_email").IsUnique);
+        Assert.True(Stored(v2.Storage, "idx_email").IsUnique);
+        Assert.Contains(_warnings.Messages, m => m.Contains("idx_email") && m.Contains("unique"));
+
+        // The rebuilt index is enforced right away and still covers the existing documents.
+        await Assert.ThrowsAnyAsync<Exception>(async () => await v2.Docs.InsertAsync(new LifecycleDoc { Name = "dup", Email = "e7@x" }));
+        Assert.Equal("n7", Assert.Single(await v2.Docs.QueryIndexAsync("idx_email", "e7@x", "e7@x").ToListAsync()).Name);
+    }
+
+    [Fact]
+    public async Task ChangedSelectorUnderExplicitName_RebuildsTheIndexOnTheNewProperty()
+    {
+        await SeedAsync();
+        uint oldRoot;
+        using (var v1 = new LcBaseContext(_dbPath))
+            oldRoot = Stored(v1.Storage, "idx_email").RootPageId;
+
+        using var v2 = new LcSelectorContext(_dbPath);
+
+        var stored = Stored(v2.Storage, "idx_email");
+        Assert.Equal(new[] { "Name" }, stored.PropertyPaths);
+        Assert.NotEqual(oldRoot, stored.RootPageId);
+        Assert.Equal(new[] { "Name" }, Assert.Single(v2.Docs.GetIndexes(), i => i.Name == "idx_email").PropertyPaths);
+        Assert.Equal("e7@x", Assert.Single(await v2.Docs.QueryIndexAsync("idx_email", "n7", "n7").ToListAsync()).Email);
+        Assert.Contains(_warnings.Messages, m => m.Contains("idx_email") && m.Contains("Email") && m.Contains("Name"));
+    }
+
+    [Fact]
+    public async Task ChangedVectorMetric_RebuildsTheVectorIndex()
+    {
+        await SeedAsync();
+
+        using var v2 = new LcVectorMetricContext(_dbPath);
+
+        Assert.Equal(VectorMetric.L2, Stored(v2.Storage, "idx_vec").Metric);
+        Assert.Equal(VectorMetric.L2, v2.Docs.IndexManager.GetIndex("idx_vec")!.Definition.Metric);
+        var nearest = await v2.Docs.VectorSearchAsync("idx_vec", [23f, 2f, 3f], 1).ToListAsync();
+        Assert.Equal("n23", Assert.Single(nearest).Name);
+        Assert.Contains(_warnings.Messages, m => m.Contains("idx_vec") && m.Contains("L2"));
+    }
+
+    [Fact]
+    public async Task ChangedVectorDimensions_ThatCannotBeRebuilt_FailTheOpen_AndKeepTheOldIndex()
+    {
+        await SeedAsync();
+        uint oldRoot;
+        using (var v1 = new LcBaseContext(_dbPath))
+            oldRoot = Stored(v1.Storage, "idx_vec").RootPageId;
+
+        // The stored embeddings have 3 dimensions; the new definition expects 4.
+        var sizes = new List<long>();
+        for (int open = 0; open < 3; open++)
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() => new LcVectorDimensionsContext(_dbPath));
+            Assert.Contains("idx_vec", ex.Message);
+            Assert.Contains("Nothing was saved", ex.Message);
+            sizes.Add(new FileInfo(_dbPath).Length);
+        }
+        // The failed rebuilds free their pages: repeated opens do not grow the file.
+        Assert.All(sizes.Skip(1), size => Assert.Equal(sizes[0], size));
+
+        // The previous definition stays in place, intact and usable.
+        using var v1Again = new LcBaseContext(_dbPath);
+        var stored = Stored(v1Again.Storage, "idx_vec");
+        Assert.Equal(oldRoot, stored.RootPageId);
+        Assert.Equal(3, stored.Dimensions);
+        var nearest = await v1Again.Docs.VectorSearchAsync("idx_vec", [23f, 2f, 3f], 1).ToListAsync();
+        Assert.Equal("n23", Assert.Single(nearest).Name);
+    }
+
+    [Fact]
+    public async Task UnchangedDefinition_IsNotRebuilt()
+    {
+        await SeedAsync();
+        var roots = new Dictionary<string, uint>();
+        using (var v1 = new LcBaseContext(_dbPath))
+            foreach (var idx in v1.Storage.GetCollectionMetadata(Collection)!.Indexes)
+                roots[idx.Name] = idx.RootPageId;
+        Assert.Equal(3, roots.Count);
+
+        using var again = new LcBaseContext(_dbPath);
+
+        // A rebuild allocates a new root, so unchanged roots prove the indexes were kept as they were.
+        foreach (var idx in again.Storage.GetCollectionMetadata(Collection)!.Indexes)
+            Assert.Equal(roots[idx.Name], idx.RootPageId);
+        Assert.Empty(_warnings.Messages);
+    }
+
+    // ── #191: indexes the model no longer declares ────────────────────────────
+
+    [Fact]
+    public async Task ChangedSelectorUnderGeneratedName_AddsTheNewIndex_AndReportsTheOldOne()
+    {
+        await SeedAsync();
+
+        using var v2 = new LcGeneratedSelectorContext(_dbPath);
+
+        // The new index is built and filled; the old one is kept and reported, not dropped.
+        var names = v2.Docs.GetIndexes().Select(i => i.Name).ToList();
+        Assert.Contains("idx_Score", names);
+        Assert.Contains("idx_Age", names);
+        Assert.Equal(7, (await v2.Docs.QueryIndexAsync("idx_Score", 3, 3).ToListAsync()).Count);
+        Assert.Equal(5, (await v2.Docs.QueryIndexAsync("idx_Age", 3, 3).ToListAsync()).Count);
+        var warning = Assert.Single(_warnings.Messages.Distinct(), m => m.Contains("'idx_Age'"));
+        Assert.Contains("does not declare", warning);
+        Assert.DoesNotContain(_warnings.Messages, m => m.Contains("'idx_Score'") || m.Contains("'idx_email'") || m.Contains("'idx_vec'"));
+    }
+
+    [Fact]
+    public async Task IndexNoLongerDeclared_IsReportedAndKept_AndStillMaintained()
+    {
+        await SeedAsync();
+
+        using (var v0 = new LcNoIndexContext(_dbPath))
+        {
+            Assert.Equal(3, v0.Docs.GetIndexes().Count());
+            Assert.Equal(3, v0.Storage.GetCollectionMetadata(Collection)!.Indexes.Count);
+            foreach (var name in new[] { "idx_email", "idx_vec", "idx_Age" })
+                Assert.Contains(_warnings.Messages, m => m.Contains($"'{name}'") && m.Contains("does not declare"));
+
+            await v0.Docs.InsertAsync(Doc(100, "late@x"));
+        }
+
+        // Written while undeclared, found through the index afterwards.
+        using var v1 = new LcBaseContext(_dbPath);
+        Assert.Equal("n100", Assert.Single(await v1.Docs.QueryIndexAsync("idx_email", "late@x", "late@x").ToListAsync()).Name);
+    }
+
+    // ── #192: two processes ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task TwoProcessesOpeningAModelWithNewIndexes_ShareOneIndex()
+    {
+        for (int round = 0; round < 3; round++)
+        {
+            foreach (var f in new[] { _dbPath, Path.ChangeExtension(_dbPath, ".wal"), Path.ChangeExtension(_dbPath, ".wal-shm") })
+                if (File.Exists(f)) File.Delete(f);
+            using (var v0 = new LcNoIndexContext(_dbPath, MultiProcess))
+                for (int i = 0; i < 200; i++)
+                    await v0.Docs.InsertAsync(Doc(i));
+
+            // Both open the model that declares the three indexes at the same moment.
+            var contexts = new LcBaseContext[2];
+            var failures = new List<Exception>();
+            using (var start = new Barrier(2))
+            {
+                var threads = Enumerable.Range(0, 2).Select(i => new Thread(() =>
+                {
+                    start.SignalAndWait();
+                    try { contexts[i] = new LcBaseContext(_dbPath, MultiProcess); }
+                    catch (Exception ex) { lock (failures) failures.Add(ex); }
+                })).ToArray();
+                foreach (var t in threads) t.Start();
+                foreach (var t in threads) Assert.True(t.Join(TimeSpan.FromMinutes(1)), $"round {round}: an opener hung");
+            }
+            Assert.True(failures.Count == 0, $"round {round}: {string.Join("\n\n", failures)}");
+
+            var (a, b) = (contexts[0], contexts[1]);
+            try
+            {
+                // Exactly one index per name, and both processes maintain that one.
+                var stored = a.Storage.GetCollectionMetadata(Collection)!.Indexes;
+                Assert.Equal(3, stored.Count);
+                foreach (var idx in stored)
+                {
+                    Assert.Equal(idx.RootPageId, a.Docs.IndexManager.GetIndex(idx.Name)!.RootPageId);
+                    Assert.Equal(idx.RootPageId, b.Docs.IndexManager.GetIndex(idx.Name)!.RootPageId);
+                }
+
+                await a.Docs.InsertAsync(Doc(1000, $"a{round}@x"));
+                await b.Docs.InsertAsync(Doc(1001, $"b{round}@x"));
+            }
+            finally
+            {
+                a.Dispose();
+                b.Dispose();
+            }
+
+            // Both processes' later writes reach the persisted index.
+            using var c = new LcBaseContext(_dbPath, MultiProcess);
+            Assert.Equal("n1000", Assert.Single(await c.Docs.QueryIndexAsync("idx_email", $"a{round}@x", $"a{round}@x").ToListAsync()).Name);
+            Assert.Equal("n1001", Assert.Single(await c.Docs.QueryIndexAsync("idx_email", $"b{round}@x", $"b{round}@x").ToListAsync()).Name);
+            Assert.Equal(21, (await c.Docs.QueryIndexAsync("idx_Age", 0, 0).ToListAsync()).Count);
+        }
+    }
+
+    [Fact]
+    public async Task SavingMetadataFromOneProcess_KeepsTheIndexAnotherProcessAdded()
+    {
+        await SeedAsync(MultiProcess);
+
+        using (var a = new LcNoIndexContext(_dbPath, MultiProcess))
+        using (var b = new LcNoIndexContext(_dbPath, MultiProcess))
+        {
+            // B adds an index that A has never seen; A then saves its own metadata.
+            await b.Docs.CreateIndexAsync(x => x.Name, "idx_name_b");
+            await a.Docs.CreateIndexAsync(x => x.Score, "idx_score_a");
+
+            var stored = a.Storage.GetCollectionMetadata(Collection)!.Indexes.Select(i => i.Name).ToList();
+            Assert.Contains("idx_name_b", stored);
+            Assert.Contains("idx_score_a", stored);
+
+            // A adopted B's index, so A's writes reach it too.
+            Assert.Contains(a.Docs.GetIndexes(), i => i.Name == "idx_name_b");
+            await a.Docs.InsertAsync(Doc(500));
+        }
+
+        using var c = new LcNoIndexContext(_dbPath, MultiProcess);
+        Assert.Equal(5, c.Docs.GetIndexes().Count()); // the three of the seeding model plus the two added at runtime
+        Assert.Equal("e500@x", Assert.Single(await c.Docs.QueryIndexAsync("idx_name_b", "n500", "n500").ToListAsync()).Email);
+    }
+
+    /// <summary>
+    /// Two collections of the same type on one engine (two contexts sharing it, or session
+    /// collections) each have their own index manager. Saving their metadata at the same time
+    /// must keep both indexes: read, merge and write run under the engine's metadata lock, not
+    /// only the write (#192 review).
+    /// </summary>
+    [Fact]
+    public async Task TwoManagersOnOneEngine_SavingAtOnce_KeepBothIndexes()
+    {
+        await SeedAsync();
+
+        for (int round = 0; round < 10; round++)
+        {
+            var engine = new StorageEngine(_dbPath, PageFileConfig.Default);
+            var a = new LcNoIndexContext(engine);
+            var b = new LcNoIndexContext(engine);
+            try
+            {
+                using var start = new Barrier(2);
+                var ta = Task.Run(async () => { start.SignalAndWait(); await a.Docs.CreateIndexAsync(x => x.Name, $"idx_a{round}"); });
+                var tb = Task.Run(async () => { start.SignalAndWait(); await b.Docs.CreateIndexAsync(x => x.Score, $"idx_b{round}"); });
+                await Task.WhenAll(ta, tb);
+
+                var names = engine.GetCollectionMetadata(Collection)!.Indexes.Select(i => i.Name).ToList();
+                Assert.Contains($"idx_a{round}", names);
+                Assert.Contains($"idx_b{round}", names);
+            }
+            finally
+            {
+                // Either context disposes the shared engine.
+                a.Dispose();
+                b.Dispose();
+            }
+        }
+    }
+
+    private sealed class WarningCollector(string collection) : TraceListener
+    {
+        private readonly List<string> _messages = new();
+
+        public List<string> Messages { get { lock (_messages) return _messages.ToList(); } }
+
+        public override void Write(string? message) { }
+
+        public override void WriteLine(string? message)
+        {
+            if (message != null && message.Contains($"'{collection}'"))
+                lock (_messages) _messages.Add(message);
+        }
+    }
+}
