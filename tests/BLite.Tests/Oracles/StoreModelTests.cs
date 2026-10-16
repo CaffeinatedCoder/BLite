@@ -39,15 +39,27 @@ public class StoreModelTests
         { 1, true }, { 2, true }, { 3, true },
     };
 
+    /// <summary>Runs known to fail, by <see cref="Label"/>, see <see cref="Candidates"/>. None on upstream 0450b97.</summary>
+    private static readonly Candidates s_candidates = new();
+
+    private static string Label(int seed, bool multiProcess) => $"seed {seed}, multiProcess={multiProcess}";
+
+    [Fact]
+    public void Candidates_NameExistingRuns() => s_candidates.AssertAllIn(Seeds.Select(r => Label((int)r[0], (bool)r[1])));
+
     [Theory]
     [MemberData(nameof(Seeds))]
     public async Task RandomOperations_MatchTheModel(int seed, bool multiProcess)
     {
         var ops = Generate(seed, Steps);
-        var label = $"seed {seed}, multiProcess={multiProcess}";
+        var label = Label(seed, multiProcess);
 
         var failure = await Replay(ops, multiProcess);
-        if (failure == null) return;
+        if (failure == null)
+        {
+            s_candidates.Verify(label, null);
+            return;
+        }
 
         var shrunk = await Shrink(ops.Take(failure.Step + 1).ToList(), multiProcess, TimeSpan.FromSeconds(45));
         var sb = new StringBuilder();
@@ -55,7 +67,7 @@ public class StoreModelTests
         sb.AppendLine($"Shortest failing sequence found ({shrunk.Ops.Count} of {failure.Step + 1} steps), failing at its step {shrunk.Failure.Step + 1}: {shrunk.Failure.Message}");
         for (int i = 0; i < shrunk.Ops.Count; i++)
             sb.AppendLine($"  {i + 1,3}. {shrunk.Ops[i]}");
-        Assert.Fail(sb.ToString());
+        s_candidates.Verify(label, sb.ToString());
     }
 
     // ── Operations ────────────────────────────────────────────────────────────

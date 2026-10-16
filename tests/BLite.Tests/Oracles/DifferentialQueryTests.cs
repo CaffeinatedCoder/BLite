@@ -127,32 +127,27 @@ public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixtu
 
     /// <summary>
     /// Rows that disagree on upstream 0450b97, by family, with the hypothesis the disagreement
-    /// suggests. They are not skipped: the failure message names the family so that triage can
-    /// tell a known candidate from a new one. Remove an entry once its fix lands.
+    /// suggests and the issue that tracks it (empty until filed). See <see cref="Candidates"/>:
+    /// a listed row fails with its family label, and fails again once fixed until its entry is removed.
     /// </summary>
-    private static readonly Dictionary<string, string> s_candidates = new()
+    private static readonly Candidates s_candidates = new()
     {
         // Family 1: documents whose indexed property is null are not written to the index, but
         // the planner answers `== null` from the index's null bucket, so they are never found.
-        ["nick == null"] = "null equality on an indexed property finds nothing",
-        ["maybe == null"] = "null equality on an indexed property finds nothing",
-        ["maybe == captured null int?"] = "null equality on an indexed property finds nothing",
-        ["Count(nick == null)"] = "null equality on an indexed property finds nothing",
-        ["Count(maybe == null)"] = "null equality on an indexed property finds nothing",
-        ["nick == null and flag"] = "null equality on an indexed property finds nothing",
-        ["nick == null or nick == a"] = "null equality on an indexed property finds nothing",
-        ["maybe in list with null"] = "null equality on an indexed property finds nothing",
-        ["Where(maybe == null).First()"] = "null equality on an indexed property finds nothing",
+        { "null equality on an indexed property finds nothing", "",
+            "nick == null", "maybe == null", "maybe == captured null int?", "Count(nick == null)", "Count(maybe == null)",
+            "nick == null and flag", "nick == null or nick == a", "maybe in list with null", "Where(maybe == null).First()" },
         // Family 2: `property != constant` does not match documents whose property is null
         // (LINQ: null != 5 is true); indexed and unindexed collections agree with each other.
-        ["maybe != 5"] = "!= excludes null values",
-        ["nick != ab"] = "!= excludes null values",
+        { "!= excludes null values", "",
+            "maybe != 5", "nick != ab" },
         // Family 3: -0.0 and 0.0 are equal in LINQ but encode as different index keys.
-        ["ratio == 0.0"] = "-0.0 is not found by an equality on an indexed double",
-        ["Count(ratio == 0.0)"] = "-0.0 is not found by an equality on an indexed double",
+        { "-0.0 is not found by an equality on an indexed double", "",
+            "ratio == 0.0", "Count(ratio == 0.0)" },
         // Family 4: the index-served OrderBy(x).Take(n) window has no null-keyed documents,
         // which LINQ orders first.
-        ["orderby maybe take 20 (nulls)"] = "indexed top-N window skips documents with a null key",
+        { "indexed top-N window skips documents with a null key", "",
+            "orderby maybe take 20 (nulls)" },
     };
 
     // ── Catalogue ─────────────────────────────────────────────────────────────
@@ -557,6 +552,9 @@ public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixtu
         Assert.Equal(_f.Docs.Count, _f.Plain.Docs.AsQueryable().Count());
     }
 
+    [Fact]
+    public void Candidates_NameExistingQueries() => s_candidates.AssertAllIn(s_cases.Keys);
+
     [Theory]
     [MemberData(nameof(Cases))]
     public async Task Query_AgreesWithLinqToObjects(string name)
@@ -575,9 +573,8 @@ public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixtu
             if (asyncError != null) errors.Add($"{engine}/async: {asyncError}");
         }
 
-        var known = s_candidates.TryGetValue(name, out var hypothesis) ? $" [known candidate: {hypothesis}]" : "";
-        Assert.True(errors.Count == 0,
-            $"seed {_f.Seed}: query '{name}' disagrees with LINQ-to-Objects{known}:\n  " + string.Join("\n  ", errors));
+        s_candidates.Verify(name, errors.Count == 0 ? null
+            : $"seed {_f.Seed}: query '{name}' disagrees with LINQ-to-Objects:\n  " + string.Join("\n  ", errors));
     }
 
     /// <summary>The value the query produced, or the exception it threw (both are compared).</summary>
