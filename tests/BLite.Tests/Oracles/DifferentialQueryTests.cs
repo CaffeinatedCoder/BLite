@@ -137,19 +137,19 @@ public class DifferentialQueryTests : IClassFixture<DifferentialQueryTests.Fixtu
     {
         // Family 1: documents whose indexed property is null are not written to the index, but
         // the planner answers `== null` from the index's null bucket, so they are never found.
-        { "null equality on an indexed property finds nothing", "",
+        { "null equality on an indexed property finds nothing", "#247",
             "nick == null", "maybe == null", "maybe == captured null int?", "Count(nick == null)", "Count(maybe == null)",
             "nick == null and flag", "nick == null or nick == a", "maybe in list with null", "Where(maybe == null).First()" },
         // Family 2: `property != constant` does not match documents whose property is null
         // (LINQ: null != 5 is true); indexed and unindexed collections agree with each other.
-        { "!= excludes null values", "",
+        { "!= excludes null values", "#248",
             "maybe != 5", "nick != ab" },
         // Family 3: -0.0 and 0.0 are equal in LINQ but encode as different index keys.
-        { "-0.0 is not found by an equality on an indexed double", "",
+        { "-0.0 is not found by an equality on an indexed double", "#249",
             "ratio == 0.0", "Count(ratio == 0.0)" },
         // Family 4: the index-served OrderBy(x).Take(n) window has no null-keyed documents,
         // which LINQ orders first.
-        { "indexed top-N window skips documents with a null key", "",
+        { "indexed top-N window skips documents with a null key", "#247",
             "orderby maybe take 20 (nulls)" },
     };
 

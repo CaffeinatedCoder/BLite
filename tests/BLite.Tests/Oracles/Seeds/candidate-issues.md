@@ -1,6 +1,6 @@
 # Candidate issues from the differential LINQ test
 
-Status: **drafts, not filed.** Triage of the 14 rows that `DifferentialQueryTests` reports as
+Status: **filed 2026-10-17 as #247 (drafts 1 and 4), #248 (draft 2) and #249 (draft 3).** Triage of the 14 rows that `DifferentialQueryTests` reports as
 disagreeing with LINQ-to-Objects on upstream `0450b97` (v5.2.3). Each family has a standalone
 repro below (three or four documents, the unindexed collection as control) and a hypothesis
 checked against the code.
