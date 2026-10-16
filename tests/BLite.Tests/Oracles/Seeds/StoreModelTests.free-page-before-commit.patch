@@ -1,4 +1,4 @@
-Seeded defect for tests/BLite.Tests/StoreModelTests.cs
+Seeded defect for tests/BLite.Tests/Oracles/StoreModelTests.cs
 
 Hand-made: StorageEngine.FreePageOnCommit frees the page at once instead of queueing it until
 the transaction commits (the defect of #233, fixed in 4d3e6b9). An update or delete of a
@@ -13,7 +13,7 @@ multi-process mode FreePage queues every page). Each shrinks to 4 steps, e.g. se
     4. Backup
   the backup: document 74: payload differs at index 16187: expected 18000 chars of "l", got "............"
 
-Reproduce: git apply --ignore-whitespace tests/BLite.Tests/Seeds/StoreModelTests.free-page-before-commit.patch && dotnet test tests/BLite.Tests --filter FullyQualifiedName~StoreModelTests
+Reproduce: git apply --ignore-whitespace tests/BLite.Tests/Oracles/Seeds/StoreModelTests.free-page-before-commit.patch && dotnet test tests/BLite.Tests --filter FullyQualifiedName~StoreModelTests
 Restore:   git checkout -- src
 
 The source file uses CRLF line endings; apply with --ignore-whitespace if the patch was

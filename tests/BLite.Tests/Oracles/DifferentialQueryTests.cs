@@ -4,7 +4,7 @@ using BLite.Bson;
 using BLite.Core.Query;
 using BLite.Shared;
 
-namespace BLite.Tests;
+namespace BLite.Tests.Oracles;
 
 /// <summary>
 /// Differential test of the LINQ provider: every query in the catalogue runs over the same

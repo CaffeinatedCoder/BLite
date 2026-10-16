@@ -6,7 +6,7 @@ using BLite.Core.Storage;
 using BLite.Core.Transactions;
 using BLite.Shared;
 
-namespace BLite.Tests;
+namespace BLite.Tests.Oracles;
 
 /// <summary>
 /// Model-based test of a typed collection: a seeded random sequence of Insert, Update, Delete,

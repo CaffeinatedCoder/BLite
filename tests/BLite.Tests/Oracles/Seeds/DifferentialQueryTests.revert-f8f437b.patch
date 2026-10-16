@@ -1,4 +1,4 @@
-Seeded defect for tests/BLite.Tests/DifferentialQueryTests.cs
+Seeded defect for tests/BLite.Tests/Oracles/DifferentialQueryTests.cs
 
 This is `git revert --no-commit f8f437b` restricted to src/ (the fix for #206: typed string
 index bounds matched every longer value starting with the searched one, so Name == "p7" also
