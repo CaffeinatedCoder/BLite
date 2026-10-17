@@ -1,5 +1,6 @@
-Status: **not filed yet**; the Issue column is empty, so every registered row keeps failing with
-`[known candidate: BW<n>, no issue filed yet]` until it is. Triage of what
+Status: **filed** on 2026-10-17: BW1 as #289, BW2, BW3, BW4 and BW7 together as #290 (one cause,
+a blocking wait on the single-threaded browser runtime), BW5 as #291, BW6 as #292, BW8 and BW9
+together as #293 (the package and its API); the registry's Issue column links each row. Triage of what
 `tests/BLite.Wasm.BrowserTests` reports on `test/wasm-browser-harness` (upstream `0450b97`,
 v5.2.3), headless Chromium 153 (Playwright 1.63), .NET 10.0.13 `browser-wasm` runtime, on
 2026-10-17. Nine candidates, the same in all four publish variants (`trimmed`, `fulltrim`,
@@ -25,24 +26,24 @@ removed what it names.
 
 | Id | Kind | Row | Match | Issue | Summary |
 |---|---|---|---|---|---|
-| BW1 | always | `Committed_write_survives_reload IndexedDb/commit-only` | `Expected marker m1 after reload, found ''` | | a committed write is gone after a reload; the WAL replays and is truncated, the collection is empty |
-| BW1 | always | `Committed_write_survives_reload IndexedDb/dispose` | `Expected marker m1 after reload, found ''` | | the same with the engine disposed before the reload |
-| BW1 | always | `Committed_write_survives_reload Opfs/commit-only` | `Expected marker m1 after reload, found ''` | | the same on OPFS |
-| BW1 | always | `Committed_write_survives_reload Opfs/dispose` | `Expected marker m1 after reload, found ''` | | |
-| BW1 | always | `Typed_write_survives_reload IndexedDb/checkpoint=False/indexed=False` | `Expected t1 after reload, found ''` | | the same through a typed context and SaveChangesAsync |
-| BW1 | always | `Typed_write_survives_reload Opfs/checkpoint=False/indexed=False` | `Expected t1 after reload, found ''` | | |
-| BW1 | sometimes | `Large_database_open_time_and_memory IndexedDb/5MB` | `but the reopened database holds 0` | | CheckpointAsync returns in 0 ms while a background checkpoint runs; 5 MB then reopens empty in half the runs |
-| BW1 | sometimes | `Large_database_open_time_and_memory Opfs/5MB` | `but the reopened database holds 0` | | |
-| BW2 | always | `Typed_context_with_async_linq InMemory/indexed=True` | `Cannot build index 'idx_Value'` | | a typed context with a declared index cannot open: the index fill blocks on a thread-pool task |
-| BW2 | always | `Typed_write_survives_reload IndexedDb/checkpoint=True/indexed=True` | `Cannot build index 'idx_Value'` | | the same on IndexedDB |
-| BW3 | always | `Typed_sync_linq_operator InMemory/*` | `Cannot wait on monitors on this runtime` | | every synchronous LINQ terminal operator throws PlatformNotSupportedException |
-| BW3 | always | `Blql_sync_operator InMemory/tolist` | `Cannot wait on monitors on this runtime` | | BLQL ToList throws the same; Count, FirstOrDefault and Any pass only because nothing yields |
-| BW4 | always | `Dispose_returns_promptly` | `Dispose blocked the browser thread for` | | every Dispose waits 5 s for a writer task that can only run on the waiting thread |
-| BW5 | always | `Two_tabs_writing_the_same_database_keep_both_writes IndexedDb` | `A fresh tab should see both writes, found 'b'` | | two tabs on one database: the first tab's checkpointed write is lost without an error |
-| BW5 | always | `Two_tabs_writing_the_same_database_keep_both_writes Opfs` | `Access Handles cannot be created if there is another open Access Handle` | | on OPFS the second tab cannot open the database |
-| BW6 | always | `Large_database_open_time_and_memory IndexedDb/50MB` | `System.OutOfMemoryException: Out of memory` | | a 50 MB database cannot be reopened: the WAL is read as one JSON string of base64 records |
-| BW6 | always | `Large_database_open_time_and_memory Opfs/50MB` | `System.OutOfMemoryException: Out of memory` | | |
-| BW7 | always | `IsAvailable_before_any_other_call IndexedDb` | `ES6 module ./blite-indexeddb.mjs was not imported yet` | | IsAvailable() as the first call kills the .NET runtime: its module is not imported yet |
-| BW7 | always | `IsAvailable_before_any_other_call Opfs` | `ES6 module ./blite-opfs-bridge.mjs was not imported yet` | | |
-| BW8 | always | `Package_ships_the_js_modules` | `ships none of the JS modules the interop imports` | | the NuGet package contains only the assembly, none of the four .mjs modules |
-| BW9 | always | `Typed_context_opens_through_the_public_storage_types Opfs` | `IndexedDB not open for` | | no typed-context factory; on OPFS the public types alone cannot open the WAL |
+| BW1 | always | `Committed_write_survives_reload IndexedDb/commit-only` | `Expected marker m1 after reload, found ''` | #289 | a committed write is gone after a reload; the WAL replays and is truncated, the collection is empty |
+| BW1 | always | `Committed_write_survives_reload IndexedDb/dispose` | `Expected marker m1 after reload, found ''` | #289 | the same with the engine disposed before the reload |
+| BW1 | always | `Committed_write_survives_reload Opfs/commit-only` | `Expected marker m1 after reload, found ''` | #289 | the same on OPFS |
+| BW1 | always | `Committed_write_survives_reload Opfs/dispose` | `Expected marker m1 after reload, found ''` | #289 | |
+| BW1 | always | `Typed_write_survives_reload IndexedDb/checkpoint=False/indexed=False` | `Expected t1 after reload, found ''` | #289 | the same through a typed context and SaveChangesAsync |
+| BW1 | always | `Typed_write_survives_reload Opfs/checkpoint=False/indexed=False` | `Expected t1 after reload, found ''` | #289 | |
+| BW1 | sometimes | `Large_database_open_time_and_memory IndexedDb/5MB` | `but the reopened database holds 0` | #289 | CheckpointAsync returns in 0 ms while a background checkpoint runs; 5 MB then reopens empty in half the runs |
+| BW1 | sometimes | `Large_database_open_time_and_memory Opfs/5MB` | `but the reopened database holds 0` | #289 | |
+| BW2 | always | `Typed_context_with_async_linq InMemory/indexed=True` | `Cannot build index 'idx_Value'` | #290 | a typed context with a declared index cannot open: the index fill blocks on a thread-pool task |
+| BW2 | always | `Typed_write_survives_reload IndexedDb/checkpoint=True/indexed=True` | `Cannot build index 'idx_Value'` | #290 | the same on IndexedDB |
+| BW3 | always | `Typed_sync_linq_operator InMemory/*` | `Cannot wait on monitors on this runtime` | #290 | every synchronous LINQ terminal operator throws PlatformNotSupportedException |
+| BW3 | always | `Blql_sync_operator InMemory/tolist` | `Cannot wait on monitors on this runtime` | #290 | BLQL ToList throws the same; Count, FirstOrDefault and Any pass only because nothing yields |
+| BW4 | always | `Dispose_returns_promptly` | `Dispose blocked the browser thread for` | #290 | every Dispose waits 5 s for a writer task that can only run on the waiting thread |
+| BW5 | always | `Two_tabs_writing_the_same_database_keep_both_writes IndexedDb` | `A fresh tab should see both writes, found 'b'` | #291 | two tabs on one database: the first tab's checkpointed write is lost without an error |
+| BW5 | always | `Two_tabs_writing_the_same_database_keep_both_writes Opfs` | `Access Handles cannot be created if there is another open Access Handle` | #291 | on OPFS the second tab cannot open the database |
+| BW6 | always | `Large_database_open_time_and_memory IndexedDb/50MB` | `System.OutOfMemoryException: Out of memory` | #292 | a 50 MB database cannot be reopened: the WAL is read as one JSON string of base64 records |
+| BW6 | always | `Large_database_open_time_and_memory Opfs/50MB` | `System.OutOfMemoryException: Out of memory` | #292 | |
+| BW7 | always | `IsAvailable_before_any_other_call IndexedDb` | `ES6 module ./blite-indexeddb.mjs was not imported yet` | #290 | IsAvailable() as the first call kills the .NET runtime: its module is not imported yet |
+| BW7 | always | `IsAvailable_before_any_other_call Opfs` | `ES6 module ./blite-opfs-bridge.mjs was not imported yet` | #290 | |
+| BW8 | always | `Package_ships_the_js_modules` | `ships none of the JS modules the interop imports` | #293 | the NuGet package contains only the assembly, none of the four .mjs modules |
+| BW9 | always | `Typed_context_opens_through_the_public_storage_types Opfs` | `IndexedDB not open for` | #293 | no typed-context factory; on OPFS the public types alone cannot open the WAL |
