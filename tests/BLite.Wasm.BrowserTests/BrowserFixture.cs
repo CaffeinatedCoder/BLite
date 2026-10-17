@@ -72,12 +72,56 @@ public sealed class BrowserFixture : IAsyncLifetime
         if (Browser != null) await Browser.CloseAsync();
         _playwright?.Dispose();
         if (_server != null) await _server.DisposeAsync();
+        WriteSummary();
     }
 
     public void Record(object row)
     {
         lock (this)
             File.AppendAllText(ReportPath, JsonSerializer.Serialize(row) + Environment.NewLine);
+    }
+
+    private readonly List<(string Row, string Status, Candidate? Candidate, string? Message)> _rows = new();
+
+    /// <summary>
+    /// One line per test row: <c>pass</c>, <c>fail</c>, <c>known</c> (a registered
+    /// candidate with an issue) or <c>fixed</c> (a registered row that passed).
+    /// </summary>
+    public void RecordRow(string row, string status, Candidate? candidate, string? message)
+    {
+        lock (this) _rows.Add((row, status, candidate, message));
+        Record(new
+        {
+            browser = BrowserName,
+            variant = Variant,
+            row,
+            status,
+            candidate = candidate?.Id,
+            issue = candidate?.Issue,
+            message
+        });
+    }
+
+    /// <summary>
+    /// <c>wasm-browser-&lt;browser&gt;-&lt;variant&gt;.summary.txt</c> next to the report: the
+    /// counts per status and one line per row that is not a plain pass.
+    /// </summary>
+    private void WriteSummary()
+    {
+        List<(string Row, string Status, Candidate? Candidate, string? Message)> rows;
+        lock (this) rows = _rows.ToList();
+        if (rows.Count == 0) return;
+        var counts = string.Join(", ", new[] { "pass", "known", "fail", "fixed" }
+            .Select(s => $"{s} {rows.Count(r => r.Status == s)}"));
+        var lines = new List<string>
+        {
+            $"BLite.Wasm browser tests: {BrowserName}, {Variant}: {rows.Count} rows: {counts}"
+        };
+        foreach (var r in rows.Where(r => r.Status != "pass").OrderBy(r => r.Status, StringComparer.Ordinal).ThenBy(r => r.Row, StringComparer.Ordinal))
+            lines.Add(r.Status.ToUpperInvariant().PadRight(8) + r.Row
+                + (r.Candidate != null ? $" [known candidate: {r.Candidate.Id}, {(string.IsNullOrEmpty(r.Candidate.Issue) ? "no issue" : r.Candidate.Issue)}]" : "")
+                + (r.Message != null ? ": " + r.Message : ""));
+        File.WriteAllLines(Path.ChangeExtension(ReportPath, ".summary.txt"), lines);
     }
 
     private async Task<string> PublishAsync()

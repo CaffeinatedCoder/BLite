@@ -241,6 +241,37 @@ public static class Scenarios
         data["count"] = (await CountAsync(engine)).ToString();
     });
 
+    /// <summary>Times Dispose of an engine on its own, apart from the work before it.</summary>
+    [JSInvokable]
+    public static Task<string> DisposeTiming(string backend, string db) => Run(nameof(DisposeTiming), async data =>
+    {
+        var sw = Stopwatch.StartNew();
+        var engine = await BLiteWasm.CreateAsync(db, ParseBackend(backend));
+        await engine.InsertAsync(Collection, Doc(engine, "d1", 1));
+        data["workMs"] = sw.Elapsed.TotalMilliseconds.ToString("F0");
+        sw.Restart();
+        engine.Dispose();
+        data["disposeMs"] = sw.Elapsed.TotalMilliseconds.ToString("F0");
+    });
+
+    /// <summary>
+    /// A typed context over a persistent backend assembled from the public storage
+    /// types alone (page storage, WAL, StorageEngine, RecoverAsync), with no help from
+    /// BLiteWasm's internal interop: insert, SaveChanges, count.
+    /// </summary>
+    [JSInvokable]
+    public static Task<string> TypedOpenPublic(string backend, string db) => Run(nameof(TypedOpenPublic), async data =>
+    {
+        var (ctx, storage) = await OpenTypedAsync(backend, db, indexed: false, publicTypesOnly: true);
+        using (storage)
+        using (ctx)
+        {
+            await ctx.Items.InsertAsync(new HarnessItem { Name = "p1", Value = 1 });
+            await ctx.SaveChangesAsync();
+            data["count"] = (await ctx.Items.CountAsync()).ToString();
+        }
+    });
+
     // ── Durability across reloads ─────────────────────────────────────────────
 
     /// <summary>
@@ -444,9 +475,10 @@ public static class Scenarios
 
     /// <summary>
     /// BLiteWasm only returns a dynamic BLiteEngine, so a typed context has to assemble
-    /// the same backend by hand through the public storage types.
+    /// the same backend by hand through the public storage types. For OPFS that needs a
+    /// workaround (see below); <paramref name="publicTypesOnly"/> leaves it out.
     /// </summary>
-    private static async Task<(ITypedHarness Context, StorageEngine Storage)> OpenTypedAsync(string backend, string db, bool indexed)
+    private static async Task<(ITypedHarness Context, StorageEngine Storage)> OpenTypedAsync(string backend, string db, bool indexed, bool publicTypesOnly = false)
     {
         IPageStorage pages;
         IWriteAheadLog wal;
@@ -465,7 +497,8 @@ public static class Scenarios
                 // IndexedDbWriteAheadLog.OpenAsync needs its IndexedDB database to be open
                 // already; BLiteWasm does that through the internal IndexedDbInterop.OpenAsync.
                 // The only public way is to open an IndexedDbPageStorage of the same name.
-                await new IndexedDbPageStorage(db + "-wal", 16384).OpenAsync();
+                if (!publicTypesOnly)
+                    await new IndexedDbPageStorage(db + "-wal", 16384).OpenAsync();
                 var opfsWal = new IndexedDbWriteAheadLog(db + "-wal");
                 await opfsWal.OpenAsync();
                 (pages, wal) = (opfsPages, opfsWal);
