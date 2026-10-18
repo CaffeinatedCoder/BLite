@@ -60,15 +60,23 @@ public readonly struct LockTimeout : IEquatable<LockTimeout>
     public static LockTimeout Immediate => new() { ReadTimeoutMs = 0, WriteTimeoutMs = 0, MaxConcurrentWriters = 0 };
 
     /// <summary>
-    /// Balanced default: 500 ms write timeout, 500 ms read timeout,
-    /// 96 max concurrent writers.
+    /// Balanced default: 5 s write timeout, 5 s read timeout, 96 max concurrent writers.
     /// <para>
-    /// 500 ms is long enough for commits under normal load (observed p99 well under 500 ms)
-    /// but short enough to fail-fast when the engine is saturated rather than leaving
-    /// threads blocked for seconds, starving the thread-pool.
+    /// A writer waits for other writers' I/O, not only for their CPU work: an auto-committing
+    /// write holds the collection lock (in single-file mode, typed collections share one lock for
+    /// the whole file) until its commit is in the WAL, and a checkpoint holds the page-file write
+    /// lock while it syncs the data file. Writers queued behind each other wait for several such
+    /// writes, and a disk can stall for hundreds of milliseconds. 5 s matches the WAL's own lock
+    /// timeout, so a <see cref="TimeoutException"/> means a writer that is stuck (a deadlock or a
+    /// hung disk), not one that is slow.
+    /// </para>
+    /// <para>
+    /// The asynchronous write paths wait with <see cref="System.Threading.SemaphoreSlim.WaitAsync(int)"/>,
+    /// which blocks no thread while waiting. Use <see cref="Immediate"/> for fail-fast
+    /// (<c>SQLITE_BUSY</c>) behaviour, or <see cref="From"/> for other values.
     /// </para>
     /// </summary>
-    public static LockTimeout Default => new() { ReadTimeoutMs = 500, WriteTimeoutMs = 500, MaxConcurrentWriters = 96 };
+    public static LockTimeout Default => new() { ReadTimeoutMs = 5_000, WriteTimeoutMs = 5_000, MaxConcurrentWriters = 96 };
 
     /// <summary>
     /// Creates a <see cref="LockTimeout"/> from explicit millisecond values.

@@ -46,7 +46,8 @@ public readonly struct PageFileConfig
     /// Lock acquisition timeouts for read and write operations.
     /// Controls how long the engine waits for a contended lock before throwing
     /// <see cref="System.TimeoutException"/> (analogous to SQLite's <c>SQLITE_BUSY</c>).
-    /// Defaults to <see cref="LockTimeout.Default"/> (500 ms read / 500 ms write).
+    /// The <see cref="Default"/>, <see cref="Small"/>, <see cref="Large"/> and <see cref="Server"/>
+    /// presets use <see cref="LockTimeout.Default"/> (5 s read / 5 s write).
     /// Use <see cref="LockTimeout.Immediate"/> for fail-fast behaviour.
     /// </summary>
     public LockTimeout LockTimeout { get; init; }

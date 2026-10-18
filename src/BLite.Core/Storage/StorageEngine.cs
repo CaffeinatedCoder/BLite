@@ -483,7 +483,7 @@ public sealed partial class StorageEngine : IDisposable
         // its truncation and frees fail, leaking the pages for good. Wait for it to finish (#209).
         //
         // The wait lasts as long as that checkpoint, not a lock timeout: on a loaded CI runner one
-        // took longer than WriteTimeoutMs (500 ms) and was cut short while releasing the pages. It
+        // took longer than WriteTimeoutMs (then 500 ms) and was cut short while releasing the pages. It
         // cannot hang: every lock the checkpoint takes (commit lock, cross-process writer lock,
         // page file locks) is waited for with its own timeout, its I/O is finite (the WAL images,
         // one flush, the truncation, one free per queued page), it waits for nothing Dispose

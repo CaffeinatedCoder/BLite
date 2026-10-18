@@ -334,9 +334,8 @@ public class IndexPageReleaseTests : IDisposable
     [Fact]
     public async Task Dispose_WaitsForThePendingFreeCheckpoint_LongerThanTheLockTimeout()
     {
-        var storage = new StorageEngine(_dbPath, PageFileConfig.Default);
+        var storage = new StorageEngine(_dbPath, PageFileConfig.Default with { LockTimeout = LockTimeout.From(500, 500) });
         var timeout = storage.LockTimeout.WriteTimeoutMs;
-        Assert.InRange(timeout, 1, 1000);
         var checkpoint = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         typeof(StorageEngine).GetField("_pendingFreeCheckpointTask", Flags)!.SetValue(storage, checkpoint.Task);
 
