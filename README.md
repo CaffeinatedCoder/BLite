@@ -928,7 +928,7 @@ try
 }
 catch
 {
-    session.Rollback(); // or disposed automatically
+    await session.RollbackAsync(); // or disposed automatically
     throw;
 }
 
