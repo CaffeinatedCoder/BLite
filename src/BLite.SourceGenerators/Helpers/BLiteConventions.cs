@@ -9,8 +9,6 @@ namespace BLite.SourceGenerators.Helpers
         // ── DbContext discovery ────────────────────────────────────────────────
         /// <summary>Base class name that marks a user class as a BLite DbContext.</summary>
         public const string DocumentDbContextBaseName = "DocumentDbContext";
-        /// <summary>Suffix expected on DbContext class names to filter candidates early.</summary>
-        public const string DbContextClassSuffix = "Context";
         /// <summary>File suffix used to skip already-generated files.</summary>
         public const string GeneratedFileSuffix = ".g.cs";
 
