@@ -370,13 +370,21 @@ public readonly struct BsonValue : IEquatable<BsonValue>
         if (_type != other._type) return false;
         return _type switch
         {
-            BsonType.Int32 or BsonType.Int64 or BsonType.Double or BsonType.Boolean or BsonType.DateTime
-                => _numericValue == other._numericValue,
+            // Int32 and Boolean are stored as exact small doubles; `==` is exact for them.
+            BsonType.Int32 or BsonType.Boolean => _numericValue == other._numericValue,
+            // Int64, DateTime and DateTimeOffset are stored as the *bits* of a long reinterpreted as a
+            // double (see FromInt64). Those bits must be compared as a long, never as a double: every
+            // long in [-(2^52 - 1), -1] (and every pre-1970 instant) is a NaN bit pattern, and a NaN is
+            // not `==` to itself; 0 and long.MinValue are +0.0 and -0.0, which are `==`.
+            BsonType.Int64 or BsonType.DateTime => StoredBits == other.StoredBits,
             // Unlike DateTimeOffset.Equals (instant-only), the offset is treated as significant here:
             // it's the whole reason this type exists, so two values landing on the same instant but
             // written with a different offset are NOT the same BsonValue. Keeps this consistent with
-            // GetHashCode, which already combines both _numericValue and _refValue (the boxed offset).
-            BsonType.DateTimeOffset => _numericValue == other._numericValue && (short)_refValue! == (short)other._refValue!,
+            // GetHashCode, which combines both the instant bits and _refValue (the boxed offset).
+            BsonType.DateTimeOffset => StoredBits == other.StoredBits && (short)_refValue! == (short)other._refValue!,
+            // Double is the one type that really holds a double. double.Equals, not `==`: a NaN equals
+            // a NaN and -0.0 equals +0.0, so a value equals itself and agrees with double.GetHashCode.
+            BsonType.Double => _numericValue.Equals(other._numericValue),
             BsonType.String => string.Equals((string?)_refValue, (string?)other._refValue, StringComparison.Ordinal),
             BsonType.ObjectId => Equals(_refValue, other._refValue),
             BsonType.Null => true,
@@ -384,8 +392,18 @@ public readonly struct BsonValue : IEquatable<BsonValue>
         };
     }
 
+    /// <summary>The long whose bits <c>_numericValue</c> carries (Int64, DateTime, DateTimeOffset).</summary>
+    private long StoredBits => BitConverter.DoubleToInt64Bits(_numericValue);
+
     public override bool Equals(object? obj) => obj is BsonValue other && Equals(other);
-    public override int GetHashCode() => HashCode.Combine(_type, _numericValue, _refValue);
+
+    public override int GetHashCode() => _type switch
+    {
+        // Hash the long, not the double: double.GetHashCode folds every NaN bit pattern into one
+        // value, so hashing the double would send every negative long into a single bucket.
+        BsonType.Int64 or BsonType.DateTime or BsonType.DateTimeOffset => HashCode.Combine(_type, StoredBits, _refValue),
+        _ => HashCode.Combine(_type, _numericValue, _refValue)
+    };
 
     public static bool operator ==(BsonValue left, BsonValue right) => left.Equals(right);
     public static bool operator !=(BsonValue left, BsonValue right) => !left.Equals(right);

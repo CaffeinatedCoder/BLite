@@ -644,4 +644,149 @@ public class BsonValueTests
     }
 
     #endregion
+
+    #region Equality of bit-stored values (#306)
+
+    // Int64, DateTime and DateTimeOffset are stored as the bits of a long reinterpreted as a
+    // double. Comparing those bits as doubles made every negative long (a NaN pattern) unequal
+    // to itself and 0 equal to long.MinValue (+0.0 vs -0.0). See EntglDb/BLite#306.
+
+    private static readonly long[] s_edgeLongs =
+    {
+        0L, 1L, -1L, -2L, -5L, 42L, long.MinValue, long.MaxValue,
+        (1L << 52) - 1, -((1L << 52) - 1), (1L << 53) - 1, (1L << 53), (1L << 53) + 1,
+        -(1L << 53) - 1, int.MinValue, int.MaxValue, -62135596800000L /* DateTime.MinValue ms */
+    };
+
+    public static TheoryData<long> EdgeLongs
+    {
+        get { var data = new TheoryData<long>(); foreach (var v in s_edgeLongs) data.Add(v); return data; }
+    }
+
+    [Theory]
+    [MemberData(nameof(EdgeLongs))]
+    public void FromInt64_Equality_IsReflexive_AndConsistentWithHashCode(long value)
+    {
+        var a = BsonValue.FromInt64(value);
+        var b = BsonValue.FromInt64(value);
+
+        Assert.True(a.Equals(b), $"FromInt64({value}) must equal itself");
+        Assert.True(a == b);
+        Assert.False(a != b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+    }
+
+    [Fact]
+    public void FromInt64_DistinctValues_AreNotEqual()
+    {
+        var values = s_edgeLongs;
+        for (int i = 0; i < values.Length; i++)
+            for (int j = 0; j < values.Length; j++)
+            {
+                var equal = BsonValue.FromInt64(values[i]) == BsonValue.FromInt64(values[j]);
+                Assert.True(equal == (values[i] == values[j]),
+                    $"FromInt64({values[i]}) == FromInt64({values[j]}) returned {equal}");
+            }
+    }
+
+    [Fact]
+    public void FromInt64_Zero_IsNotEqualTo_MinValue()
+    {
+        // 0 and long.MinValue are the bit patterns of +0.0 and -0.0, which compare == as doubles.
+        Assert.NotEqual(BsonValue.FromInt64(0), BsonValue.FromInt64(long.MinValue));
+        Assert.False(BsonValue.FromInt64(0) == BsonValue.FromInt64(long.MinValue));
+    }
+
+    [Fact]
+    public void FromInt64_NegativeValues_DedupeInHashSet_AndGroupBy()
+    {
+        var set = new HashSet<BsonValue> { BsonValue.FromInt64(-1), BsonValue.FromInt64(-1), BsonValue.FromInt64(-1) };
+        Assert.Single(set);
+
+        var groups = new[] { BsonValue.FromInt64(-5), BsonValue.FromInt64(-5), BsonValue.FromInt64(7), BsonValue.FromInt64(7) }
+            .GroupBy(v => v).Count();
+        Assert.Equal(2, groups);
+
+        var dict = new Dictionary<BsonValue, int>();
+        for (int i = 0; i < 3; i++) dict[BsonValue.FromInt64(-1000)] = i;
+        Assert.Single(dict);
+        Assert.Equal(2, dict[BsonValue.FromInt64(-1000)]);
+    }
+
+    [Fact]
+    public void FromInt64_NegativeValues_HashDifferently()
+    {
+        // double.GetHashCode folds every NaN bit pattern into one value; hashing the long must not.
+        var hashes = Enumerable.Range(1, 1000).Select(i => BsonValue.FromInt64(-i).GetHashCode()).Distinct().Count();
+        Assert.True(hashes > 900, $"1000 distinct negative longs produced only {hashes} distinct hash codes");
+    }
+
+    public static TheoryData<DateTime> EdgeDates => new()
+    {
+        new DateTime(1969, 7, 20, 20, 17, 0, DateTimeKind.Utc),      // pre-1970: negative Unix time
+        new DateTime(1969, 12, 31, 23, 59, 59, 999, DateTimeKind.Utc), // -1 ms
+        new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+        DateTime.UnixEpoch,
+        new DateTime(2038, 1, 19, 3, 14, 8, DateTimeKind.Utc),       // past the 32-bit boundary
+        new DateTime(2200, 6, 15, 12, 0, 0, DateTimeKind.Utc),
+        new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+    };
+
+    [Theory]
+    [MemberData(nameof(EdgeDates))]
+    public void FromDateTime_Equality_IsReflexive_AndConsistentWithHashCode(DateTime value)
+    {
+        var a = BsonValue.FromDateTime(value);
+        var b = BsonValue.FromDateTime(value);
+
+        Assert.True(a == b, $"FromDateTime({value:O}) must equal itself");
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+        Assert.NotEqual(a, BsonValue.FromDateTime(value.AddMilliseconds(1)));
+    }
+
+    [Theory]
+    [MemberData(nameof(EdgeDates))]
+    public void FromDateTimeOffset_Equality_IsReflexive_AndConsistentWithHashCode(DateTime utc)
+    {
+        var o = new DateTimeOffset(utc).ToOffset(TimeSpan.FromHours(2));
+        var a = BsonValue.FromDateTimeOffset(o);
+        var b = BsonValue.FromDateTimeOffset(o);
+
+        Assert.True(a == b, $"FromDateTimeOffset({o:O}) must equal itself");
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+        Assert.NotEqual(a, BsonValue.FromDateTimeOffset(o.AddMilliseconds(1)));
+        // Same instant, other offset: still a different BsonValue (the offset is significant).
+        Assert.NotEqual(a, BsonValue.FromDateTimeOffset(o.ToOffset(TimeSpan.FromHours(3))));
+    }
+
+    [Fact]
+    public void FromDateTime_Pre1970_DedupesInHashSet()
+    {
+        var d = new DateTime(1969, 7, 20, 20, 17, 0, DateTimeKind.Utc);
+        var set = new HashSet<BsonValue> { BsonValue.FromDateTime(d), BsonValue.FromDateTime(d) };
+        Assert.Single(set);
+    }
+
+    [Fact]
+    public void FromDouble_NaN_EqualsItself_AndZerosAreEqual()
+    {
+        // A value must equal itself to be usable as a dictionary key; double.Equals semantics.
+        Assert.True(BsonValue.FromDouble(double.NaN) == BsonValue.FromDouble(double.NaN));
+        Assert.Equal(BsonValue.FromDouble(double.NaN).GetHashCode(), BsonValue.FromDouble(-double.NaN).GetHashCode());
+        Assert.True(BsonValue.FromDouble(0.0) == BsonValue.FromDouble(-0.0));
+        Assert.Equal(BsonValue.FromDouble(0.0).GetHashCode(), BsonValue.FromDouble(-0.0).GetHashCode());
+        Assert.NotEqual(BsonValue.FromDouble(1.0), BsonValue.FromDouble(1.0000001));
+    }
+
+    [Fact]
+    public void Equality_StillDistinguishesTypes()
+    {
+        // The same bits under another type are another value.
+        Assert.NotEqual(BsonValue.FromInt64(1), BsonValue.FromInt32(1));
+        Assert.NotEqual(BsonValue.FromInt64(0), BsonValue.FromDouble(0.0));
+        Assert.NotEqual(BsonValue.FromDateTime(DateTime.UnixEpoch), BsonValue.FromInt64(0));
+        Assert.NotEqual(BsonValue.FromDateTimeOffset(new DateTimeOffset(DateTime.UnixEpoch)), BsonValue.FromDateTime(DateTime.UnixEpoch));
+    }
+
+    #endregion
 }
