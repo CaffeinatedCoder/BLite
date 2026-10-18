@@ -489,13 +489,18 @@ public readonly struct BLiteDiagnostic
             }
         }
         
+        /// <summary>
+        /// Syntactic pre-filter: any class with a base list. Whether it really derives from
+        /// <c>DocumentDbContext</c> is decided semantically in <see cref="GetDbContextInfo"/>.
+        /// The class name is deliberately not part of the filter: a context may be called
+        /// anything (<c>Shop</c>, <c>AppDb</c>), and a name filter would skip it silently (#300).
+        /// </summary>
         private static bool IsPotentialDbContext(SyntaxNode node)
         {
             if (node.SyntaxTree.FilePath.EndsWith(BLiteConventions.GeneratedFileSuffix)) return false;
 
             return node is ClassDeclarationSyntax classDecl &&
-                   classDecl.BaseList != null && 
-                   classDecl.Identifier.Text.EndsWith(BLiteConventions.DbContextClassSuffix);
+                   classDecl.BaseList != null;
         }
 
         // ── Interceptor helpers ───────────────────────────────────────────────────
