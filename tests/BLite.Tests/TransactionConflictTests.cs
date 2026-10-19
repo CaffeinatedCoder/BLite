@@ -390,6 +390,73 @@ public class TransactionConflictTests : IDisposable
     }
 
     [Fact]
+    public async Task Multi_process_an_open_transaction_conflicts_with_a_commit_of_the_other_process()
+    {
+        // Two engines on the same files stand in for two processes.
+        var path = DbPath("multi-process");
+        var config = PageFileConfig.Default with { AllowMultiProcessAccess = true };
+        using var a = new StorageEngine(path, config);
+        using var b = new StorageEngine(path, config);
+        var page = a.AllocatePage();
+        await CommitPageAsync(a, page, 0x01);
+
+        using var ta = a.BeginTransaction();
+        Assert.Equal(0x01, ReadPage(a, page, ta.TransactionId));
+        await CommitPageAsync(b, page, 0x02);           // B commits the page A's transaction read
+        a.WritePage(page, ta.TransactionId, Filled(a.PageSize, 0x03));
+
+        await Assert.ThrowsAsync<BLiteTransactionConflictException>(async () => await ta.CommitAsync());
+        Assert.Equal(TransactionState.Aborted, ta.State);
+        using (var check = b.BeginTransaction())
+            Assert.Equal(0x02, ReadPage(b, page, check.TransactionId));
+
+        // Run again: it reads B's commit first and goes through.
+        using (var retry = a.BeginTransaction())
+        {
+            Assert.Equal(0x02, ReadPage(a, page, retry.TransactionId));
+            a.WritePage(page, retry.TransactionId, Filled(a.PageSize, 0x03));
+            await retry.CommitAsync();
+        }
+        using (var check = b.BeginTransaction())
+            Assert.Equal(0x03, ReadPage(b, page, check.TransactionId));
+    }
+
+    [Fact]
+    public async Task Collection_per_file_mode_shares_one_write_lock_per_collection()
+    {
+        var path = DbPath("per-file");
+        using var engine = new BLiteEngine(path, PageFileConfig.Server(path) with { LockTimeout = LockTimeout.From(30_000, 30_000) });
+        Assert.Same(engine.Storage.GetCollectionWriteLock("orders"), engine.Storage.GetCollectionWriteLock("ORDERS"));
+        Assert.NotSame(engine.Storage.GetCollectionWriteLock("orders"), engine.Storage.GetCollectionWriteLock("events"));
+
+        // Every session builds its own DynamicCollection: with a lock per instance their
+        // auto-commit inserts ran concurrently on the same pages and were lost.
+        engine.RegisterKeys(["n"]);
+        for (int run = 0; run < 5; run++)
+        {
+            await Task.WhenAll(Enumerable.Range(0, 10).Select(async i =>
+            {
+                using var session = engine.OpenSession();
+                await session.InsertAsync("orders", engine.CreateDocument(["n"], x => x.AddInt32("n", i)));
+            }));
+        }
+        Assert.Equal(50, await engine.GetOrCreateCollection("orders").CountAsync());
+
+        // Open transactions on one collection still never both commit over each other.
+        var col = engine.GetOrCreateCollection("orders");
+        var t1 = engine.BeginTransaction();
+        var t2 = engine.BeginTransaction();
+        var a = await col.InsertAsync(engine.CreateDocument(["n"], x => x.AddInt32("n", 100)), t1);
+        var b = await col.InsertAsync(engine.CreateDocument(["n"], x => x.AddInt32("n", 200)), t2);
+        await t1.CommitAsync();
+        bool conflict = await CommitSecondAsync(t2);
+        Assert.NotNull(await col.FindByIdAsync(a));
+        Assert.Equal(!conflict, await col.FindByIdAsync(b) is not null);
+        Assert.Equal(conflict ? 51 : 52, await col.CountAsync());
+        t1.Dispose(); t2.Dispose();
+    }
+
+    [Fact]
     public async Task Prepare_votes_no_for_a_transaction_whose_commit_would_be_rejected()
     {
         using var db = new TestDbContext(DbPath("prepare"));
@@ -431,5 +498,26 @@ public class TransactionConflictTests : IDisposable
 
         await db.Users.InsertAsync(new User { Name = "after" });
         Assert.Equal(3, await db.Users.CountAsync());
+    }
+
+    private static async Task CommitPageAsync(StorageEngine engine, uint pageId, byte value)
+    {
+        using var tx = engine.BeginTransaction();
+        engine.WritePage(pageId, tx.TransactionId, Filled(engine.PageSize, value));
+        await tx.CommitAsync();
+    }
+
+    private static byte ReadPage(StorageEngine engine, uint pageId, ulong transactionId)
+    {
+        var buffer = new byte[engine.PageSize];
+        engine.ReadPage(pageId, transactionId, buffer);
+        return buffer[0];
+    }
+
+    private static byte[] Filled(int size, byte value)
+    {
+        var data = new byte[size];
+        Array.Fill(data, value);
+        return data;
     }
 }
