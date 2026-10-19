@@ -803,14 +803,14 @@ await foreach (var d in orders.ScanAsync(reader =>
 })) { ... }
 
 // B-Tree range query on a secondary index
-var recent = orders.QueryIndex("idx_placed_at", minDate, maxDate);
+await foreach (var d in orders.QueryIndexAsync("idx_placed_at", minDate, maxDate)) { ... }
 
 // Vector similarity search
-var similar = orders.VectorSearch("idx_embedding", queryVector, k: 10);
+await foreach (var d in orders.VectorSearchAsync("idx_embedding", queryVector, k: 10)) { ... }
 
 // Geospatial proximity / bounding box
-var nearby = orders.Near("idx_location", (45.46, 9.18), radiusKm: 5.0);
-var inArea  = orders.Within("idx_location", (45.0, 9.0), (46.0, 10.0));
+await foreach (var d in orders.NearAsync("idx_location", (45.46, 9.18), radiusKm: 5.0)) { ... }
+await foreach (var d in orders.WithinAsync("idx_location", (45.0, 9.0), (46.0, 10.0))) { ... }
 
 // Count
 int total = await orders.CountAsync(ct);
