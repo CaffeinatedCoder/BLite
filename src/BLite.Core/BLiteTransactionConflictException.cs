@@ -17,8 +17,13 @@ namespace BLite.Core;
 /// <para>
 /// Conflicts are detected per page, not per document: two transactions that change different
 /// documents stored on the same data page, or whose index entries share a B-Tree leaf, conflict too.
-/// Writes made without an explicit transaction commit on their own and retry nothing; they can only
-/// make a caller's open transaction fail, never be lost to it.
+/// A write method called without a transaction (<c>InsertAsync(document)</c>, <c>UpdateAsync</c>,
+/// <c>DeleteAsync</c>, their bulk and upsert variants, <c>TruncateAsync</c> of a typed collection, and
+/// the <c>BLiteSession</c> methods) commits on its own. When a transaction that committed first changed
+/// one of its pages, it runs again in a new transaction while it still holds the collection lock, and
+/// throws this exception only if all of its attempts (10) were rejected. Other operations that commit a
+/// transaction of their own (index creation, <c>VacuumAsync</c>, retention and time-series pruning,
+/// <c>DynamicCollection.TruncateAsync</c>) do not retry and can throw it; run them again.
 /// </para>
 /// <para>
 /// Derives from <see cref="InvalidOperationException"/>, so code that already catches that type

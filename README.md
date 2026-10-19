@@ -393,7 +393,7 @@ using var dynSub = engine.GetOrCreateCollection("orders").Watch()
 ### 🛡️ Transactions & ACID
 - **Atomic**: Multi-document transactions.
 - **Durable**: WAL ensures data safety even in power loss.
-- **Isolated**: Read committed: a transaction sees its own writes and what other transactions have committed. Two transactions that change the same page cannot both commit: the first one wins, the second one's `CommitAsync` throws `BLiteTransactionConflictException` and rolls it back, so run it again in a new transaction.
+- **Isolated**: Read committed: a transaction sees its own writes and what other transactions have committed. Two transactions that change the same page cannot both commit: the first one wins, the second one's `CommitAsync` throws `BLiteTransactionConflictException` and rolls it back, so run it again in a new transaction. A write made without a transaction (`InsertAsync(doc)`, `UpdateAsync`, `DeleteAsync`, …) commits on its own and, when a transaction committed one of its pages first, runs again by itself; it throws `BLiteTransactionConflictException` only after 10 rejected attempts. Index creation, `VacuumAsync` and retention commit without retrying and can throw it too.
 - **Thread-Safe**: Protected with `SemaphoreSlim` to prevent race conditions in concurrent scenarios.
 - **Async-Only**: All CRUD operations on `DocumentCollection<TId, T>` and `DynamicCollection` are exclusively async/await — no blocking synchronous methods. Eliminates accidental blocking calls on thread-pool threads.
 - **Implicit Transactions**: Use `SaveChangesAsync()` for automatic transaction management.

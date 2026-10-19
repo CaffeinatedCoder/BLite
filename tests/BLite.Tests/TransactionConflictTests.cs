@@ -1,5 +1,6 @@
 using BLite.Bson;
 using BLite.Core;
+using BLite.Core.Storage;
 using BLite.Core.Transactions;
 using BLite.Shared;
 
@@ -278,5 +279,82 @@ public class TransactionConflictTests : IDisposable
         })).ToArray();
         await Task.WhenAll(writers);
         Assert.Equal(100, await db.Users.CountAsync());
+    }
+
+    // ── Review of #310 ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>A long lock timeout: these tests race writers on purpose and must not fail on #303.</summary>
+    private static readonly PageFileConfig LoadTolerant = PageFileConfig.Default with { LockTimeout = LockTimeout.From(30_000, 30_000) };
+
+    [Fact]
+    public async Task Typed_auto_commit_inserts_racing_explicit_transactions_retry_instead_of_throwing()
+    {
+        // An explicit commit does not take the collection lock, so it can land between an
+        // auto-commit insert's reads and its commit. That insert is rejected and must run again,
+        // not throw BLiteTransactionConflictException to a caller who never opened a transaction.
+        using var db = new TestDbContext(DbPath("typed-auto-vs-explicit"), LoadTolerant);
+        await db.Users.InsertAsync(new User { Name = "seed" });
+
+        var autoIds = new System.Collections.Concurrent.ConcurrentBag<ObjectId>();
+        var explicitIds = new System.Collections.Concurrent.ConcurrentBag<ObjectId>();
+        var autoWriters = Enumerable.Range(0, 3).Select(w => Task.Run(async () =>
+        {
+            for (int i = 0; i < 100; i++)
+            {
+                var user = new User { Name = $"auto-{w}-{i}" };
+                await db.Users.InsertAsync(user);
+                autoIds.Add(user.Id);
+            }
+        }));
+        var explicitWriters = Enumerable.Range(0, 3).Select(w => Task.Run(async () =>
+        {
+            for (int i = 0; i < 100; i++)
+            {
+                using var t = db.BeginTransaction();
+                var user = new User { Name = $"explicit-{w}-{i}" };
+                await db.Users.InsertAsync(user, t);
+                if (!await CommitSecondAsync(t))
+                    explicitIds.Add(user.Id);
+            }
+        }));
+        await Task.WhenAll(autoWriters.Concat(explicitWriters));
+
+        Assert.Equal(300, autoIds.Count);
+        foreach (var id in autoIds.Concat(explicitIds))
+            Assert.NotNull(await db.Users.FindByIdAsync(id));
+        Assert.Equal(1 + 300 + explicitIds.Count, await db.Users.CountAsync());
+    }
+
+    [Fact]
+    public async Task Dynamic_auto_commit_inserts_racing_explicit_transactions_retry_instead_of_throwing()
+    {
+        using var engine = new BLiteEngine(DbPath("dynamic-auto-vs-explicit"), LoadTolerant);
+        engine.RegisterKeys(["n"]);
+        var col = engine.GetOrCreateCollection("items");
+        await col.InsertAsync(engine.CreateDocument(["n"], b => b.AddInt32("n", -1)));
+
+        var autoIds = new System.Collections.Concurrent.ConcurrentBag<BsonId>();
+        var explicitIds = new System.Collections.Concurrent.ConcurrentBag<BsonId>();
+        var autoWriters = Enumerable.Range(0, 3).Select(w => Task.Run(async () =>
+        {
+            for (int i = 0; i < 100; i++)
+                autoIds.Add(await col.InsertAsync(engine.CreateDocument(["n"], b => b.AddInt32("n", i))));
+        }));
+        var explicitWriters = Enumerable.Range(0, 3).Select(w => Task.Run(async () =>
+        {
+            for (int i = 0; i < 100; i++)
+            {
+                using var t = engine.BeginTransaction();
+                var id = await col.InsertAsync(engine.CreateDocument(["n"], b => b.AddInt32("n", i)), t);
+                if (!await CommitSecondAsync(t))
+                    explicitIds.Add(id);
+            }
+        }));
+        await Task.WhenAll(autoWriters.Concat(explicitWriters));
+
+        Assert.Equal(300, autoIds.Count);
+        foreach (var id in autoIds.Concat(explicitIds))
+            Assert.NotNull(await col.FindByIdAsync(id));
+        Assert.Equal(1 + 300 + explicitIds.Count, await col.CountAsync());
     }
 }
