@@ -181,6 +181,13 @@ public sealed partial class StorageEngine
             {
                 if (commit.Pages == null || commit.Pages.IsEmpty)
                     continue;
+                // Other processes' commits could not be replayed: the page versions do not include
+                // them, so no commit that writes pages can be checked. Rejected, to be retried.
+                if (wal != null && !caughtUp)
+                {
+                    (conflicts ??= new()).Add(commit, BLiteTransactionConflictException.SharedWalNotReplayed(commit.TransactionId, commit.Pages.Keys.First()));
+                    continue;
+                }
                 if (FindConflict(commit.TransactionId, commit.Pages, writtenInBatch) is uint conflictPage)
                 {
                     (conflicts ??= new()).Add(commit, new BLiteTransactionConflictException(commit.TransactionId, conflictPage));

@@ -26,6 +26,11 @@ namespace BLite.Core;
 /// <c>DynamicCollection.TruncateAsync</c>) do not retry and can throw it; run them again.
 /// </para>
 /// <para>
+/// In multi-process mode (<c>PageFileConfig.AllowMultiProcessAccess</c>) a commit that writes pages is
+/// also rejected with this exception when the commits of other processes in the shared WAL could not
+/// be read, so that it cannot be checked against them.
+/// </para>
+/// <para>
 /// Derives from <see cref="InvalidOperationException"/>, so code that already catches that type
 /// for commit failures keeps working.
 /// </para>
@@ -33,17 +38,33 @@ namespace BLite.Core;
 public class BLiteTransactionConflictException : InvalidOperationException
 {
     /// <summary>Creates the exception for <paramref name="transactionId"/> and the first conflicting page.</summary>
-    public BLiteTransactionConflictException(ulong transactionId, uint pageId)
-        : base($"Transaction {transactionId} conflicts with a transaction that committed first: page {pageId} " +
+    internal BLiteTransactionConflictException(ulong transactionId, uint pageId)
+        : this(transactionId, pageId,
+               $"Transaction {transactionId} conflicts with a transaction that committed first: page {pageId} " +
                "was changed by both. The transaction was rolled back; run it again to retry.")
+    {
+    }
+
+    private BLiteTransactionConflictException(ulong transactionId, uint pageId, string message)
+        : base(message)
     {
         TransactionId = transactionId;
         PageId = pageId;
     }
 
+    /// <summary>
+    /// Creates the exception for a commit that writes <paramref name="pageId"/> (its first page) while
+    /// this engine could not replay what other processes committed to the shared WAL.
+    /// </summary>
+    internal static BLiteTransactionConflictException SharedWalNotReplayed(ulong transactionId, uint pageId)
+        => new(transactionId, pageId,
+               $"Transaction {transactionId} was not committed: the commits of other processes in the shared WAL " +
+               $"could not be read, so its pages (first: page {pageId}) cannot be checked against them. " +
+               "The transaction was rolled back; run it again to retry.");
+
     /// <summary>The transaction that was rolled back.</summary>
     public ulong TransactionId { get; }
 
-    /// <summary>The first page found that both transactions changed.</summary>
+    /// <summary>The first page found that both transactions changed, or the first page of a commit that could not be checked.</summary>
     public uint PageId { get; }
 }

@@ -78,7 +78,8 @@ public sealed partial class StorageEngine
     /// <summary>
     /// Returns the first page of <paramref name="pages"/> that another commit has published since
     /// <paramref name="transactionId"/> first saw it, or that <paramref name="writtenEarlierInBatch"/>
-    /// holds; <c>null</c> if there is none. Called under <c>_commitLock</c>.
+    /// holds; <c>null</c> if there is none. Called under <c>_commitLock</c>, except for the vote of
+    /// <see cref="WouldConflict"/>.
     /// </summary>
     private uint? FindConflict(ulong transactionId, ConcurrentDictionary<uint, byte[]> pages, HashSet<uint>? writtenEarlierInBatch)
     {
@@ -143,6 +144,14 @@ public sealed partial class StorageEngine
         if (pages != null && FindConflict(transactionId, pages, null) is uint pageId)
             throw new BLiteTransactionConflictException(transactionId, pageId);
     }
+
+    /// <summary>
+    /// True if a commit of <paramref name="transactionId"/> would be rejected now. Without
+    /// <c>_commitLock</c>, so only a vote for two-phase commit: a commit can still land before the
+    /// commit record, and <see cref="MarkTransactionCommittedAsync"/> checks again under the lock.
+    /// </summary>
+    private bool WouldConflict(ulong transactionId)
+        => _walCache.TryGetValue(transactionId, out var pages) && FindConflict(transactionId, pages, null) != null;
 
     /// <summary>Number of active transactions with recorded page versions (diagnostics and tests).</summary>
     internal int TrackedTransactionCount => _baseVersions.Count;

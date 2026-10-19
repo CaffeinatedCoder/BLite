@@ -334,6 +334,13 @@ public sealed partial class StorageEngine
         {
             await CommitTransactionAsync(transaction.TransactionId, ct);
         }
+        catch (BLiteTransactionConflictException)
+        {
+            // Nothing was written (#304): roll back, as Transaction.CommitAsync does, so that its
+            // pages, base versions and the free-space index changes are not left behind.
+            await transaction.RollbackAsync().ConfigureAwait(false);
+            throw;
+        }
         finally
         {
             // Always clean up, even if the commit throws (timeout, etc.).
@@ -365,6 +372,10 @@ public sealed partial class StorageEngine
         ThrowIfMultiProcessAccess(nameof(PrepareTransactionAsync));
         try
         {
+            // A commit that would be rejected as a conflict (#304) votes no and writes nothing.
+            if (WouldConflict(transactionId))
+                return false;
+
             await _wal.WriteBeginRecordAsync(transactionId);
 
             foreach (var walEntry in _walCache[transactionId])
@@ -388,6 +399,10 @@ public sealed partial class StorageEngine
         ThrowIfMultiProcessAccess(nameof(PrepareTransactionAsync));
         try
         {
+            // A commit that would be rejected as a conflict (#304) votes no and writes nothing.
+            if (WouldConflict(transactionId))
+                return false;
+
             await _wal.WriteBeginRecordAsync(transactionId, ct);
 
             if (_walCache.TryGetValue(transactionId, out var changes))

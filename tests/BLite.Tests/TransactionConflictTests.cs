@@ -388,4 +388,48 @@ public class TransactionConflictTests : IDisposable
         await t1.CommitAsync();
         await Assert.ThrowsAsync<BLiteTransactionConflictException>(async () => await t2.CommitAsync());
     }
+
+    [Fact]
+    public async Task Prepare_votes_no_for_a_transaction_whose_commit_would_be_rejected()
+    {
+        using var db = new TestDbContext(DbPath("prepare"));
+        await db.Users.InsertAsync(new User { Name = "seed" });
+
+        var t1 = db.BeginTransaction();
+        var t2 = db.BeginTransaction();
+        await db.Users.InsertAsync(new User { Name = "from-t1" }, t1);
+        await db.Users.InsertAsync(new User { Name = "from-t2" }, t2);
+        await t1.CommitAsync();
+
+        // Same data page and primary leaf as in A_rejected_transaction_leaves_no_trace_and_can_be_retried.
+        Assert.False(await t2.PrepareAsync());
+        await t2.RollbackAsync();
+        Assert.Equal(2, await db.Users.CountAsync());
+        t1.Dispose(); t2.Dispose();
+    }
+
+    [Fact]
+    public async Task A_conflict_in_the_engine_commit_overload_leaves_nothing_behind()
+    {
+        using var db = new TestDbContext(DbPath("engine-commit"));
+        await db.Users.InsertAsync(new User { Name = "seed" });
+        var storage = db.Storage;
+
+        // Committed through StorageEngine.CommitTransactionAsync(Transaction), not Transaction.CommitAsync.
+        var t1 = (Transaction)db.BeginTransaction();
+        var t2 = (Transaction)db.BeginTransaction();
+        await db.Users.InsertAsync(new User { Name = "from-t1" }, t1);
+        var loser = new User { Name = "from-t2" };
+        await db.Users.InsertAsync(loser, t2);
+        await storage.CommitTransactionAsync(t1);
+
+        await Assert.ThrowsAsync<BLiteTransactionConflictException>(() => storage.CommitTransactionAsync(t2));
+        Assert.Equal(TransactionState.Aborted, t2.State);
+        Assert.Equal(0, storage.TrackedTransactionCount);   // no base versions left
+        Assert.Equal(0, storage.ActiveTransactionCount);    // no uncommitted pages left
+        Assert.Null(await db.Users.FindByIdAsync(loser.Id));
+
+        await db.Users.InsertAsync(new User { Name = "after" });
+        Assert.Equal(3, await db.Users.CountAsync());
+    }
 }
