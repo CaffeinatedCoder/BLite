@@ -776,7 +776,7 @@ BsonId id = await orders.InsertAsync(doc, ct);
 List<BsonId> ids = await orders.InsertBulkAsync([doc1, doc2, doc3], ct);
 ```
 
-> A schema-less document must fit in one page: `DynamicCollection.MaxDocumentSize` bytes of BSON (about 16 KB with the default page size); a larger one is rejected with `BLiteValidationException`. A typed `DocumentCollection` stores larger documents across overflow pages, and the schema-less API reads those, so a typed collection with large documents can be read, queried and shown in BLite Studio, but not copied by `BLiteMigration`.
+> A schema-less document must fit in one page: about 16 KB of BSON with the default page size; a larger one is rejected with `BLiteValidationException`. A typed `DocumentCollection` stores larger documents across overflow pages, and the schema-less API reads those, so a typed collection with large documents can be read, queried and shown in BLite Studio, but not copied by `BLiteMigration`.
 
 ### Read
 

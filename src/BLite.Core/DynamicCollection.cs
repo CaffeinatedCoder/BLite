@@ -60,7 +60,7 @@ public sealed class DynamicCollection : IDisposable
     /// documents across overflow pages, and this collection reads those (#301); it does not
     /// write them, so such a document cannot be copied into a <c>DynamicCollection</c>.
     /// </summary>
-    public int MaxDocumentSize { get; }
+    internal int MaxDocumentSize { get; }
     private uint _currentDataPage;
     private bool _isTimeSeries;
 
