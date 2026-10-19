@@ -107,9 +107,14 @@ public sealed class BLiteSession : ITransactionHolder, IDisposable
     /// <see cref="TransactionState.Aborted"/> and its rollback handlers have run. A failure of that
     /// work is thrown to the caller. Does nothing when no transaction is active.
     /// </summary>
-    public ValueTask RollbackAsync()
+    /// <param name="ct">
+    /// Checked before the rollback starts: a cancelled token throws <see cref="OperationCanceledException"/>
+    /// and leaves the transaction active. A rollback that has started is not cancelled.
+    /// </param>
+    public ValueTask RollbackAsync(CancellationToken ct = default)
     {
         ThrowIfDisposed();
+        ct.ThrowIfCancellationRequested();
         var transaction = CurrentTransaction;
         if (transaction == null)
             return default;

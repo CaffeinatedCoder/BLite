@@ -220,6 +220,22 @@ public class BLiteSessionTests : IDisposable
         Assert.Equal(BLite.Core.Transactions.TransactionState.Aborted, txn.State);
     }
 
+    [Fact]
+    public async Task RollbackAsync_CancelledToken_Throws_AndLeavesTheTransactionActive()
+    {
+        using var session = _engine.OpenSession();
+        var txn = session.BeginTransaction();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => session.RollbackAsync(cts.Token).AsTask());
+
+        Assert.Same(txn, session.CurrentTransaction);
+        Assert.Equal(BLite.Core.Transactions.TransactionState.Active, txn.State);
+        await session.RollbackAsync();
+        Assert.Equal(BLite.Core.Transactions.TransactionState.Aborted, txn.State);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 3. CRUD via sessions — Insert / FindById / UpdateAsync / Delete
     // ─────────────────────────────────────────────────────────────────────────
