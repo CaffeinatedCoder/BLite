@@ -1960,14 +1960,39 @@ public sealed class DynamicCollection : IDisposable
         _secondaryIndexes[name] = entry;
 
         var transaction = _storage.BeginTransaction(IsolationLevel.ReadCommitted);
-        foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+        try
         {
-            var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
-            if (doc != null) IndexInsert(entry, doc, e.Location, transaction);
-        }
-        await transaction.CommitAsync();
+            foreach (var e in _primaryIndex.Range(IndexKey.MinKey, IndexKey.MaxKey, IndexDirection.Forward, transaction.TransactionId))
+            {
+                var doc = ReadDocumentAt(e.Location, transaction.TransactionId);
+                if (doc != null) IndexInsert(entry, doc, e.Location, transaction);
+            }
+            await transaction.CommitAsync();
 
-        PersistIndexMetadata();
+            PersistIndexMetadata();
+        }
+        catch
+        {
+            // A fill that fails (a duplicate value under a unique index) leaves no index behind, so
+            // queries keep scanning and the caller can fix the data and retry (#271). The tree's
+            // pages are collected through the transaction before it rolls back: pages added by
+            // splits are linked only from nodes written in it (#211), as in VacuumAsync.
+            if (_secondaryIndexes.TryGetValue(name, out var registered) && ReferenceEquals(registered, entry))
+                _secondaryIndexes.Remove(name);
+
+            IReadOnlyList<uint> pages = Array.Empty<uint>();
+            try { pages = CollectIndexPages(entry, transaction.TransactionId); }
+            catch { /* best-effort: never mask the original failure */ }
+
+            if (transaction.State == TransactionState.Active)
+            {
+                try { await transaction.RollbackAsync(); }
+                catch { /* best-effort: never mask the original failure */ }
+            }
+
+            FreePagesBestEffort(pages);
+            throw;
+        }
     }
 
     /// <summary>
@@ -2813,6 +2838,10 @@ public sealed class DynamicCollection : IDisposable
         Guid g => new IndexKey(g),
         double d => new IndexKey(BitConverter.GetBytes(d)),
         BsonId bid => new IndexKey(bid.ToBytes()),
+        // Keyed like the stored values (BsonValueToIndexKey): the instant in Unix milliseconds, a
+        // DateTime converted to UTC the way the BSON writer converts it (#270).
+        DateTime dt => new IndexKey(new DateTimeOffset(dt.ToUniversalTime()).ToUnixTimeMilliseconds()),
+        DateTimeOffset dto => new IndexKey(dto.ToUnixTimeMilliseconds()),
         _ => throw new ArgumentException($"Cannot create IndexKey from type {value.GetType().Name}")
     };
 

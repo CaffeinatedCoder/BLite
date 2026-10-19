@@ -222,6 +222,25 @@ public class IndexPageReleaseTests : IDisposable
         await AssertCyclesAreBoundedAsync(engine.Storage, () => engine.CheckpointAsync(), CycleAsync);
     }
 
+    [Fact]
+    public async Task FailedUniqueCreateIndexCycles_Dynamic_DoNotGrowTheFile()
+    {
+        using var engine = new BLiteEngine(_dbPath);
+        var col = engine.GetOrCreateCollection("docs");
+        // 1000 distinct codes, then a duplicate of the first: the fill writes a tree of several
+        // leaves before it fails (#271), so the split pages must be freed too (#211).
+        await col.InsertBulkAsync(Enumerable.Range(0, 1001).Select(i => col.CreateDocument(
+            ["code", "payload"], b => b.AddInt32("code", i % 1000).AddString("payload", $"data-{i:D6}"))));
+
+        async Task CycleAsync()
+        {
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => col.CreateIndexAsync("code", "idx_code", unique: true));
+            Assert.Empty(col.ListIndexes());
+        }
+
+        await AssertCyclesAreBoundedAsync(engine.Storage, () => engine.CheckpointAsync(), CycleAsync);
+    }
+
     /// <summary>
     /// Runs a priming block of cycles that frees more pages than the pending-free threshold (4 MB:
     /// 256 pages of 16 KB; a tree of 1000 keys is a handful of pages), releases them all, then a
@@ -355,7 +374,7 @@ public class IndexPageReleaseTests : IDisposable
     [Fact]
     public async Task DynamicCollection_DropIndex_WaitsForTheCollectionLock()
     {
-        using var engine = new BLiteEngine(_dbPath);
+        using var engine = new BLiteEngine(_dbPath, LoadTolerant);
         var col = engine.GetOrCreateCollection("docs");
         await InsertIndexableDocsAsync(col, 100);
         await col.CreateIndexAsync("value", "idx_value");
@@ -387,7 +406,7 @@ public class IndexPageReleaseTests : IDisposable
     [Fact]
     public async Task DynamicCollection_DropIndex_WhileInserting_KeepsCollectionAndOtherIndexConsistent()
     {
-        using var engine = new BLiteEngine(_dbPath);
+        using var engine = new BLiteEngine(_dbPath, LoadTolerant);
         var col = engine.GetOrCreateCollection("docs");
         await InsertIndexableDocsAsync(col, 500);
         await col.CreateIndexAsync("value", "idx_value");
@@ -419,6 +438,11 @@ public class IndexPageReleaseTests : IDisposable
     // ======================================================================
     //  Helpers
     // ======================================================================
+
+    // The concurrency tests check ordering and consistency, not lock latency: on a loaded CI
+    // runner the 500 ms default lets a writer time out behind its peers, which says nothing
+    // about the behaviour under test.
+    private static readonly PageFileConfig LoadTolerant = PageFileConfig.Default with { LockTimeout = LockTimeout.From(30_000, 30_000) };
 
     private static readonly System.Reflection.BindingFlags Flags =
         System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
