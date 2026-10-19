@@ -357,4 +357,35 @@ public class TransactionConflictTests : IDisposable
             Assert.NotNull(await col.FindByIdAsync(id));
         Assert.Equal(1 + 300 + explicitIds.Count, await col.CountAsync());
     }
+
+    [Fact]
+    public async Task Page_versions_are_pruned_once_no_open_transaction_needs_them()
+    {
+        // Before, the prune ran while the committing transactions were still registered, so it
+        // never found the map unused: after enough commits it only grew.
+        using var storage = new StorageEngine(DbPath("prune"), PageFileConfig.Small);
+        var pages = Enumerable.Range(0, StorageEngine.PageVersionPruneThreshold + 1000).Select(_ => storage.AllocatePage()).ToArray();
+        var data = new byte[storage.PageSize];
+        foreach (var chunk in pages.Chunk(500))
+        {
+            using var t = storage.BeginTransaction();
+            foreach (var page in chunk)
+                storage.WritePage(page, t.TransactionId, data);
+            await t.CommitAsync();
+        }
+
+        Assert.InRange(storage.TrackedPageVersionCount, 1, StorageEngine.PageVersionPruneThreshold);
+        Assert.Equal(0, storage.TrackedTransactionCount);
+
+        // Conflicts are still detected on the pages whose versions were forgotten.
+        var buffer = new byte[storage.PageSize];
+        using var t1 = storage.BeginTransaction();
+        using var t2 = storage.BeginTransaction();
+        storage.ReadPage(pages[0], t1.TransactionId, buffer);
+        storage.ReadPage(pages[0], t2.TransactionId, buffer);
+        storage.WritePage(pages[0], t1.TransactionId, data);
+        storage.WritePage(pages[0], t2.TransactionId, data);
+        await t1.CommitAsync();
+        await Assert.ThrowsAsync<BLiteTransactionConflictException>(async () => await t2.CommitAsync());
+    }
 }

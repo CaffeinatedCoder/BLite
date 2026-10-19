@@ -273,7 +273,12 @@ public sealed partial class StorageEngine
             foreach (var commit in batch)
             {
                 if (conflicts == null || !conflicts.ContainsKey(commit))
+                {
                     FreePagesOfCommittedTransaction(commit.TransactionId);
+                    // Its base versions are no longer needed. Left until its waiter reaches
+                    // CompleteTransaction, they would keep the prune below from ever running (#304).
+                    _baseVersions.TryRemove(commit.TransactionId, out _);
+                }
             }
 
             TryPrunePageVersions();

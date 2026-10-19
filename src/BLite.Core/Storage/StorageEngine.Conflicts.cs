@@ -40,7 +40,7 @@ public sealed partial class StorageEngine
     private readonly ConcurrentDictionary<ulong, ConcurrentDictionary<uint, long>> _baseVersions = new();
 
     /// <summary>Number of page versions above which a commit tries to forget them.</summary>
-    private const int PageVersionPruneThreshold = 4096;
+    internal const int PageVersionPruneThreshold = 4096;
 
     private long GetPageVersion(uint pageId)
     {
@@ -146,4 +146,7 @@ public sealed partial class StorageEngine
 
     /// <summary>Number of active transactions with recorded page versions (diagnostics and tests).</summary>
     internal int TrackedTransactionCount => _baseVersions.Count;
+
+    /// <summary>Number of pages with a version above the floor (diagnostics and tests).</summary>
+    internal int TrackedPageVersionCount => _pageVersions.Count;
 }
