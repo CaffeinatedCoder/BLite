@@ -6,7 +6,7 @@ This repository is `CaffeinatedCoder/BLite`, a fork of `EntglDb/BLite`, which is
 
 - Role on upstream: outside collaborator with the **Read** role (downgraded from Write around 2026-10-18). Pull only: no push, no labels, no milestones, no assignees, no pins.
 - Fork `main` mirrors `upstream/main`. The only additions are this file and `CLAUDE.md`.
-- **Observation pause.** From 2026-10-19, no new issues or PRs on upstream until the fork owner lifts the pause. Responding to review requests on already open PRs is allowed.
+- **Observation pause lifted.** The pause of 2026-10-19 was lifted on 2026-10-28, after the maintainer planned v5.4.0 (milestone 5, `roadmap/v5/RELEASE_5.4.0.md`) around this fork's fixes. New bug issues and fix PRs are allowed within the rules below. Before starting a milestone issue, say so in one line on the issue: the maintainer also implements milestone items.
 
 ## What happened, briefly
 
@@ -61,7 +61,7 @@ Branches mirrored from upstream on 2026-10-19 before they could be deleted there
 | `fix/wal-fsync-on-commit` | old head of #280, changes requested |
 | `fix/247-null-keys-index-plans` | old head of #253, changes requested |
 
-Use: rebase onto each upstream release, run, and when a failure is a real defect, file it upstream as one plain bug issue once the pause is lifted. The oracles themselves stay here.
+Use: rebase onto each upstream release, run, and when a failure is a real defect, file it upstream as one plain bug issue. The oracles themselves stay here.
 
 ## Open upstream work as of 2026-10-19
 
